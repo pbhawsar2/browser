@@ -1,0 +1,289 @@
+/* Explorer UI stylesheet — unified with Photos & video-player companion styling
+ * (#080C14 obsidian, #0C121E header, #131C2C control cards, #38BDF8 cyan,
+ *  #34D399 emerald, #F87171 coral), scaled +5% cleanly for 16.1" 1080p displays.
+ */
+
+window,
+.browser-root {
+  background-color: #080C14;
+  color: #F8FAFC;
+  font-family: "Adwaita Sans", sans-serif;
+}
+
+.top-bezel {
+  background-color: rgba(12, 18, 30, 0.97);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  padding: 5px 10px;
+  min-height: 44px;
+}
+
+.top-bezel-inner {
+  min-height: 34px;
+}
+
+/* All top-bar icon buttons share exact card shape & luminance with WinCtrlButton. */
+button.nav-btn,
+menubutton.nav-menu > button {
+  background-image: none;
+  background-color: #131C2C;
+  border: 1px solid #334155;
+  box-shadow: none;
+  outline: none;
+  border-radius: 7px;
+  min-width: 34px;
+  min-height: 32px;
+  padding: 0;
+  margin: 0;
+  color: #E2E8F0;
+  -gtk-icon-size: 18px;
+  transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+
+button.nav-btn:hover:not(:disabled),
+menubutton.nav-menu > button:hover:not(:disabled) {
+  background-color: #18273F;
+  border-color: rgba(56, 189, 248, 0.65);
+  color: #FFFFFF;
+}
+
+button.nav-btn:active:not(:disabled) {
+  background-color: #0B111E;
+  border-color: #38BDF8;
+  color: #7DD3FC;
+}
+
+button.nav-btn:disabled {
+  background-color: #0F1623;
+  border-color: rgba(51, 65, 85, 0.55);
+  color: rgba(148, 163, 184, 0.48);
+}
+
+entry.url-bar {
+  background-color: #111827;
+  border: 1px solid #334155;
+  border-radius: 9px;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #F8FAFC;
+  font-size: 10.6pt;
+  font-weight: 500;
+  caret-color: #38BDF8;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+entry.url-bar:focus-within {
+  background-color: #131E33;
+  border-color: rgba(56, 189, 248, 0.72);
+}
+
+entry.url-bar > image.left {
+  color: #94A3B8;
+  margin-right: 7px;
+  -gtk-icon-size: 17px;
+}
+
+entry.url-bar placeholder {
+  color: #94A3B8;
+}
+
+.load-progress {
+  margin: 0 8px;
+}
+
+.load-progress trough {
+  min-height: 2px;
+  background-color: transparent;
+  border: none;
+}
+
+.load-progress progress {
+  min-height: 2px;
+  background-color: #38BDF8;
+}
+
+/* Target inner <button> inside GtkMenuButton so pill shape & font apply cleanly. */
+menubutton.power-pill > button {
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+  border-radius: 999px;
+  min-height: 32px;
+  padding: 0 13px;
+  margin: 0;
+  font-size: 9.2pt;
+  font-weight: 600;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+menubutton.power-pill.zero-fan > button {
+  background-color: rgba(52, 211, 153, 0.14);
+  border: 1px solid rgba(52, 211, 153, 0.46);
+  color: #6EE7B7;
+}
+
+menubutton.power-pill.zero-fan > button:hover {
+  background-color: rgba(52, 211, 153, 0.24);
+  color: #A7F3D0;
+}
+
+menubutton.power-pill.ac-turbo > button {
+  background-color: rgba(56, 189, 248, 0.14);
+  border: 1px solid rgba(56, 189, 248, 0.48);
+  color: #7DD3FC;
+}
+
+menubutton.power-pill.ac-turbo > button:hover {
+  background-color: rgba(56, 189, 248, 0.24);
+  color: #BAE6FD;
+}
+
+button.win-ctrl {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  min-width: 36px;
+  min-height: 34px;
+}
+
+/* Sleek horizontal tab bar (visible only when 2+ tabs are open; zero left panel). */
+.tab-bar {
+  background-color: #090E19;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 4px 10px;
+  min-height: 38px;
+}
+
+.tab-strip {
+  padding: 0;
+}
+
+.tab-pill {
+  background-color: #111827;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  min-height: 30px;
+  padding: 0 5px 0 11px;
+  transition: background-color 110ms ease, border-color 110ms ease;
+}
+
+.tab-pill:hover {
+  background-color: #162238;
+  border-color: rgba(148, 163, 184, 0.28);
+}
+
+.tab-pill.active-tab {
+  background-color: #18273F;
+  border-color: rgba(56, 189, 248, 0.56);
+}
+
+button.tab-select-btn,
+button.tab-select-btn:hover,
+button.tab-select-btn:active {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0 4px 0 0;
+  min-height: 28px;
+}
+
+.tab-title {
+  color: #CBD5E1;
+  font-size: 10.2pt;
+  font-weight: 500;
+}
+
+.tab-pill.active-tab .tab-title {
+  color: #F8FAFC;
+  font-weight: 600;
+}
+
+.app-header-title {
+  color: #F8FAFC;
+  font-size: 10.6pt;
+  font-weight: 600;
+}
+
+button.tab-close {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 6px;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  margin: 0;
+  color: #CBD5E1;
+  -gtk-icon-size: 17px;
+}
+
+.tab-pill.active-tab button.tab-close {
+  color: #F1F5F9;
+}
+
+button.tab-close:hover {
+  background-color: rgba(248, 113, 113, 0.28);
+  color: #FECACA;
+}
+
+.find-bar {
+  background-color: #0E1524;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 5px 10px;
+}
+
+.find-entry {
+  min-height: 30px;
+  background-color: #131C2E;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 7px;
+  padding: 0 10px;
+  color: #F8FAFC;
+  font-size: 9.8pt;
+}
+
+.find-entry:focus-within {
+  border-color: #38BDF8;
+}
+
+.find-count {
+  color: #94A3B8;
+  font-size: 9pt;
+  min-width: 52px;
+}
+
+.hud-popover contents {
+  background-color: #0E1524;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  padding: 12px;
+  color: #E2E8F0;
+}
+
+.hud-title {
+  font-size: 10.4pt;
+  font-weight: 700;
+  color: #F8FAFC;
+}
+
+.hud-mono {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 8.8pt;
+  color: #94A3B8;
+}
+
+.hud-card {
+  background-color: #131C2E;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 9px;
+  padding: 8px 10px;
+}
+
+.webapp-icon-preview {
+  border-radius: 14px;
+  background-color: #131C2E;
+}

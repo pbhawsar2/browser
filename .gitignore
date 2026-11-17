@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Editor / OS clutter
+*.swp
+*.swo
+*~
+.DS_Store
+*.orig
+*.rej
+*.bak

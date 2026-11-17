@@ -1,0 +1,20 @@
+[package]
+name = "explorer"
+version = "0.2.0"
+edition = "2024"
+description = "Fast, clean, hardware-tuned web browser for Linux Wayland"
+
+[dependencies]
+gtk4 = { version = "0.11.5", features = ["v4_24"] }
+libadwaita = { version = "0.9.2", features = ["v1_10", "gtk_v4_24"] }
+webkit6 = { version = "0.6.1", features = ["v2_52", "gtk_v4_18"] }
+soup3 = "0.9"
+mimalloc = "0.1.52"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=Explorer
+Comment=Fast, clean, hardware-accelerated browser
+Exec=/home/piyush/.local/bin/explorer %u
+Icon=io.explorer.Browser
+StartupWMClass=io.explorer.Browser
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true

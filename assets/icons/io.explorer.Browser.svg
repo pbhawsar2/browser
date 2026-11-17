@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Deep Sapphire / Cosmic Ocean Globe -->
+    <radialGradient id="globeBase" cx="38%" cy="32%" r="68%" fx="34%" fy="26%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="34%" stop-color="#0284C7"/>
+      <stop offset="70%" stop-color="#1E3A8A"/>
+      <stop offset="100%" stop-color="#090F24"/>
+    </radialGradient>
+
+    <radialGradient id="globeRim" cx="50%" cy="50%" r="50%">
+      <stop offset="76%" stop-color="#38BDF8" stop-opacity="0"/>
+      <stop offset="93%" stop-color="#7DD3FC" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#E0F2FE" stop-opacity="0.52"/>
+    </radialGradient>
+
+    <!-- Primary Sweeping Flame-Gold -> Coral-Magenta Wrap -->
+    <linearGradient id="auroraSweep" x1="12%" y1="18%" x2="88%" y2="86%">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="28%" stop-color="#FB923C"/>
+      <stop offset="64%" stop-color="#F43F5E"/>
+      <stop offset="100%" stop-color="#9333EA"/>
+    </linearGradient>
+
+    <!-- Smooth Upper-Right Highlight Crest -->
+    <linearGradient id="auroraHighlight" x1="15%" y1="20%" x2="72%" y2="82%">
+      <stop offset="0%" stop-color="#FEF08A"/>
+      <stop offset="48%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#EC4899" stop-opacity="0.90"/>
+    </linearGradient>
+
+    <linearGradient id="tealWave" x1="88%" y1="18%" x2="24%" y2="84%">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="55%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+
+    <!-- Compass Needle Clean 4-Facet Diamond -->
+    <linearGradient id="needleNLeft" x1="10%" y1="0%" x2="90%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E0F2FE"/>
+    </linearGradient>
+    <linearGradient id="needleNRight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#BAE6FD"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="needleSLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E40AF"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+
+    <filter id="dropShadow" x="-14%" y="-14%" width="128%" height="128%">
+      <feDropShadow dx="0" dy="10" stdDeviation="13" flood-color="#030712" flood-opacity="0.54"/>
+    </filter>
+    <filter id="layerShadow" x="-18%" y="-18%" width="136%" height="136%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="globeClip">
+      <circle cx="256" cy="256" r="196"/>
+    </clipPath>
+  </defs>
+
+  <!-- Outer Sapphire Ocean Sphere -->
+  <g filter="url(#dropShadow)">
+    <circle cx="256" cy="256" r="196" fill="url(#globeBase)"/>
+  </g>
+
+  <!-- Interior Subtle Waves & Gloss inside Sphere -->
+  <g clip-path="url(#globeClip)">
+    <path d="M52,320 C128,256 226,348 334,274 C404,226 446,162 478,108 L490,486 L42,486 Z"
+          fill="url(#tealWave)" opacity="0.34"/>
+    <path d="M40,214 C132,164 218,224 318,162 C386,120 432,74 470,40 L470,224 C394,278 292,260 198,296 C126,324 72,368 42,412 Z"
+          fill="#38BDF8" opacity="0.16"/>
+    <ellipse cx="204" cy="146" rx="126" ry="70" transform="rotate(-24 204 146)" fill="#FFFFFF" opacity="0.13"/>
+  </g>
+
+  <circle cx="256" cy="256" r="196" fill="url(#globeRim)"/>
+
+  <!-- Seamless Sweeping Warm-Gold -> Coral-Violet Orbit Crescent -->
+  <g filter="url(#layerShadow)">
+    <path d="M312,62
+             C418,90 482,196 456,308
+             C430,420 322,492 206,474
+             C94,456 22,356 36,244
+             C46,164 98,96 168,66
+             C122,110 100,174 112,240
+             C128,328 210,390 298,378
+             C374,368 426,300 422,222
+             C418,154 374,94 312,62 Z"
+          fill="url(#auroraSweep)"/>
+    <path d="M168,66
+             C102,108 62,184 74,268
+             C88,368 176,440 278,434
+             C364,428 430,368 448,286
+             C424,354 358,398 282,394
+             C192,388 120,316 112,226
+             C106,162 128,104 168,66 Z"
+          fill="url(#auroraHighlight)" opacity="0.86"/>
+  </g>
+
+  <!-- Crisp Faceted Explorer Compass Star -->
+  <g filter="url(#layerShadow)" transform="translate(256 244) rotate(36)">
+    <circle cx="0" cy="0" r="88" fill="none" stroke="#E0F2FE" stroke-opacity="0.34" stroke-width="5"/>
+    <polygon points="0,-108 -28,0 0,0" fill="url(#needleNLeft)"/>
+    <polygon points="0,-108 28,0 0,0" fill="url(#needleNRight)"/>
+    <polygon points="0,108 -28,0 0,0" fill="url(#needleSLeft)"/>
+    <polygon points="0,108 28,0 0,0" fill="#0B1226"/>
+    <circle cx="0" cy="0" r="15" fill="#FFFFFF"/>
+    <circle cx="0" cy="0" r="7.5" fill="#0284C7"/>
+  </g>
+</svg>
