@@ -15,7 +15,7 @@ use webkit6::{NetworkSession, Settings, UserContentManager, WebView};
 
 pub use hardware::{detect_igpu_render_node, is_on_battery_boot, probe_va_capabilities};
 pub use power::PowerSupervisor;
-pub use webkit_engine::EXPLORER_USER_AGENT;
+pub use webkit_engine::{Prefetcher, EXPLORER_USER_AGENT};
 
 /// Returns `true` when the user opted out of hardware/engine optimizations.
 pub fn is_disabled() -> bool {
@@ -43,9 +43,19 @@ impl EngineTuning {
         content_blocker::build_user_content_manager(filter_dir, hw_only_video, battery_mode)
     }
 
-    pub fn attach_webview(web_view: &WebView, url_entry: &Entry, session: &NetworkSession) {
+    /// Per-tab hooks (scroll scaling + link-hover DNS prefetch).
+    pub fn attach_webview(web_view: &WebView, prefetch: &Prefetcher) {
         webkit_engine::attach_scroll_tuner(web_view);
-        webkit_engine::attach_speculative_preconnect(web_view, url_entry, session);
+        webkit_engine::attach_link_hover_preconnect(web_view, prefetch);
+    }
+
+    /// Window-level omnibar DNS prefetch hook; call once per `Entry`.
+    pub fn attach_omnibar(url_entry: &Entry, prefetch: &Prefetcher) {
+        webkit_engine::attach_omnibar_preconnect(url_entry, prefetch);
+    }
+
+    pub fn make_prefetcher(session: &NetworkSession) -> Prefetcher {
+        webkit_engine::make_prefetcher(session)
     }
 
     pub fn prewarm_network(session: &NetworkSession) {

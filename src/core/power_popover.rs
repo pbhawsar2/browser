@@ -240,21 +240,20 @@ impl PowerHudUi {
             supervisor.va_caps().summary(),
         ));
 
-        let power_src = if supervisor.on_battery_raw() {
+        let src_label = if supervisor.on_battery_raw() {
             let batt_w = t
                 .batt_watts
                 .or(t.pkg_watts)
                 .map(|w| format!(" · {w:.1}W"))
                 .unwrap_or_default();
-            if supervisor.ac_turbo_override() {
-                format!("Battery{batt_w} (Turbo Override)")
-            } else {
-                format!("Battery{batt_w} · Zero-Fan")
-            }
+            format!("Battery{batt_w}")
         } else {
-            "AC Power · AC Turbo".to_string()
+            "AC Power".to_string()
         };
-        self.power_lbl.set_text(&format!("Power: {power_src}"));
+        let mode_label = if supervisor.is_battery_mode() { "Zero-Fan" } else { "AC Turbo" };
+        let manual = if supervisor.manual_turbo().is_some() { " (Manual)" } else { "" };
+        self.power_lbl
+            .set_text(&format!("Power: {src_label} · {mode_label}{manual}"));
 
         self.updating_ui.set(true);
         hw_sw.set_active(supervisor.hw_only_video());

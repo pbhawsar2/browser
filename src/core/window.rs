@@ -29,11 +29,13 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use webkit6::prelude::*;
 use webkit6::{
-    CacheModel, CookiePersistentStorage, LoadEvent, NetworkSession, Settings, SnapshotOptions,
-    SnapshotRegion, UserContentManager, WebContext, WebView,
+    CacheModel, CookiePersistentStorage, GeolocationPermissionRequest, LoadEvent, NetworkSession,
+    NotificationPermissionRequest, Settings, SnapshotOptions, SnapshotRegion,
+    UserContentManager, UserMediaPermissionRequest, WebContext, WebProcessTerminationReason,
+    WebView,
 };
 
 const DEFAULT_PAGE_ZOOM: f64 = 1.05;
@@ -76,6 +78,7 @@ struct BrowserState {
     network_session: NetworkSession,
     ucm: UserContentManager,
     supervisor: PowerSupervisor,
+    prefetcher: tuning::Prefetcher,
     url_entry: Entry,
     app_title_lbl: Label,
     back_btn: Button,
@@ -259,10 +262,13 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
     let web_context = WebContext::default().unwrap_or_else(WebContext::new);
     web_context.set_cache_model(CacheModel::WebBrowser);
     web_context.set_spell_checking_enabled(std::env::var_os("EXPLORER_NO_SPELLCHECK").is_none());
-    if let Some(ext_dir) = find_webext_dir() {
-        web_context.set_web_process_extensions_directory(&ext_dir.to_string_lossy());
+    // `EXPLORER_DISABLE_TUNING=1` must fully bypass the tuning WebProcess extension too.
+    if !tuning::is_disabled() {
+        if let Some(ext_dir) = find_webext_dir() {
+            web_context.set_web_process_extensions_directory(&ext_dir.to_string_lossy());
+        }
+        supervisor.push_extension_policy(&web_context);
     }
-    supervisor.push_extension_policy(&web_context);
 
     let ucm = EngineTuning::build_content_manager(
         &filters_dir,
@@ -464,6 +470,9 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
     root_box.append(&stack);
     window.set_content(Some(&root_box));
 
+    let prefetcher = EngineTuning::make_prefetcher(&network_session);
+    EngineTuning::attach_omnibar(&url_entry, &prefetcher);
+
     let state = BrowserState {
         window: window.clone(),
         is_app_mode,
@@ -473,6 +482,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
         network_session,
         ucm,
         supervisor,
+        prefetcher,
         url_entry,
         app_title_lbl,
         back_btn,
@@ -516,10 +526,6 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
         }
     } else {
         state.open_new_tab(None, true);
-    }
-
-    if !is_app_mode && std::env::var_os("EXPLORER_NO_SESSION").is_none() {
-        let _ = fs::write(state.profile_dir.join("running.lock"), format!("{}\n", std::process::id()));
     }
 
     if !is_app_mode {
@@ -657,8 +663,9 @@ impl BrowserState {
         let wv = builder.build();
         wv.set_zoom_level(configured_default_zoom());
 
-        EngineTuning::attach_webview(&wv, &self.url_entry, &self.network_session);
+        EngineTuning::attach_webview(&wv, &self.prefetcher);
         self.find_bar.attach_webview_signals(&wv);
+        self.attach_recovery_and_permissions(&wv);
 
         let sup = self.supervisor.clone();
         let st_msg = self.clone();
@@ -675,6 +682,76 @@ impl BrowserState {
         });
 
         wv
+    }
+
+    /// WebProcess crash recovery (B2) and user-visible permission prompts (B10).
+    fn attach_recovery_and_permissions(&self, wv: &WebView) {
+        // Reload a tab whose WebProcess died instead of leaving a blank, frozen page.
+        // A 5 s guard prevents a tight reload loop if a page crashes the renderer on every load.
+        let last_recovery: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
+        let st = self.clone();
+        wv.connect_web_process_terminated(move |view, reason| {
+            if matches!(reason, WebProcessTerminationReason::TerminatedByApi) || st.closing.get() {
+                return;
+            }
+            let now = Instant::now();
+            if last_recovery
+                .get()
+                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(5))
+            {
+                return;
+            }
+            last_recovery.set(Some(now));
+            eprintln!("Explorer: WebProcess terminated ({reason:?}); recovering tab");
+            let uri = view.uri().map(|u| u.to_string()).unwrap_or_default();
+            if uri.is_empty() || navigation::is_internal_url(&uri) {
+                st.load_start_page_into(view);
+            } else {
+                view.reload();
+            }
+        });
+
+        // WebKitGTK denies geolocation / camera / microphone / notifications silently when
+        // no handler exists; ask the user instead. Other request types keep WebKit defaults.
+        let window = self.window.clone();
+        wv.connect_permission_request(move |view, request| {
+            let what = if request.is::<GeolocationPermissionRequest>() {
+                "know your location".to_string()
+            } else if let Some(m) = request.downcast_ref::<UserMediaPermissionRequest>() {
+                match (m.is_for_audio_device(), m.is_for_video_device()) {
+                    (true, true) => "use your camera and microphone".to_string(),
+                    (true, false) => "use your microphone".to_string(),
+                    (false, true) => "use your camera".to_string(),
+                    (false, false) => "share your screen".to_string(),
+                }
+            } else if request.is::<NotificationPermissionRequest>() {
+                "show notifications".to_string()
+            } else {
+                return false;
+            };
+            let host = view
+                .uri()
+                .and_then(|u| glib::Uri::parse(&u, glib::UriFlags::NONE).ok())
+                .and_then(|u| u.host().map(|h| h.to_string()))
+                .unwrap_or_else(|| "This site".to_string());
+            let dialog = gtk4::AlertDialog::builder()
+                .message(format!("{host} wants to {what}"))
+                .detail("Allow only if you trust this site.")
+                .buttons(["Block", "Allow"])
+                .cancel_button(0)
+                .default_button(0)
+                .modal(true)
+                .build();
+            let req = request.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |res| {
+                if matches!(res, Ok(1)) {
+                    req.allow();
+                } else {
+                    req.deny();
+                }
+            });
+            true
+        });
     }
 
     fn load_start_page_into(&self, wv: &WebView) {
@@ -1287,7 +1364,6 @@ fn wire_power_and_lifecycle(
             if !s.is_app_mode {
                 ACTIVE_CONTROLLER.with(|c| *c.borrow_mut() = None);
             }
-            let _ = fs::remove_file(s.profile_dir.join("running.lock"));
             *s.spare_tab.borrow_mut() = None;
             s.supervisor.release_all();
             glib::Propagation::Proceed
@@ -1402,13 +1478,17 @@ fn load_session(profile_dir: &Path) -> Option<(Vec<String>, usize)> {
         .and_then(|n| n.trim().parse::<usize>().ok())
         .unwrap_or(0);
 
-    let tabs_part = raw.split("\"tabs\":[").nth(1)?.split(']').next()?;
+    // Scan string-aware until the first *unquoted* `]`; URLs may legally contain `]`.
+    let tabs_part = raw.split("\"tabs\":[").nth(1)?;
     let mut urls = Vec::new();
     let mut cur = String::new();
     let mut in_str = false;
     let mut esc = false;
     for ch in tabs_part.chars() {
         if !in_str {
+            if ch == ']' {
+                break;
+            }
             if ch == '"' {
                 in_str = true;
                 cur.clear();
@@ -1433,5 +1513,33 @@ fn load_session(profile_dir: &Path) -> Option<(Vec<String>, usize)> {
         None
     } else {
         Some((urls, active))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_profile(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("explorer_session_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn session_roundtrip_preserves_urls_containing_brackets_and_quotes() {
+        let dir = temp_profile("brackets");
+        let urls = vec![
+            "https://example.com/a".to_string(),
+            "https://example.com/?q=[1,2]&x=a]b".to_string(),
+            "https://example.com/\"quoted\"\\path".to_string(),
+            "https://example.org/last".to_string(),
+        ];
+        save_session(&dir, &urls, 2);
+        let (loaded, active) = load_session(&dir).expect("session must load");
+        assert_eq!(loaded, urls);
+        assert_eq!(active, 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

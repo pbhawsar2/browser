@@ -123,6 +123,11 @@ pub fn probe_va_capabilities(render_node: &str) -> VaCapabilities {
         ..Default::default()
     };
 
+    // Upstream-parity mode performs no libva probing at all.
+    if super::is_disabled() {
+        return caps;
+    }
+
     let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(render_node) else {
         return caps;
     };

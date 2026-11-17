@@ -72,8 +72,9 @@ pub fn apply_startup_env(on_battery: bool) {
     set_env_default("JSC_useConcurrentGC", "1");
     set_env_default("JSC_useCodeCache", "1");
 
-    // Keep NVIDIA Optimus dGPU suspended unless explicitly requested via EXPLORER_ALLOW_DGPU.
-    if on_battery || std::env::var_os("EXPLORER_ALLOW_DGPU").is_none() {
+    // Keep NVIDIA Optimus dGPU suspended unless explicitly requested via EXPLORER_ALLOW_DGPU
+    // (an explicit opt-in is honored on battery too).
+    if super::power::dgpu_isolation_requested() {
         // Guard AMD VA-API against probing `/usr/lib64/dri/nvidia_drv_video.so` on renderD129
         // during GStreamer VA plugin discovery (which wakes the RTX 3050 Ti to `active`).
         if let Some(node_name) = Path::new(&igpu_node).file_name().and_then(|s| s.to_str()) {
@@ -282,54 +283,55 @@ pub fn prewarm_startup_hosts(session: &NetworkSession) {
     }
 }
 
-/// Attaches link-hover and debounced omnibar DNS speculative preconnects.
-pub fn attach_speculative_preconnect(
-    web_view: &WebView,
-    url_entry: &Entry,
-    session: &NetworkSession,
-) {
+/// Shared, de-duplicating DNS prefetcher (one per browser window, not one per tab).
+pub type Prefetcher = Rc<dyn Fn(Vec<String>)>;
+
+pub fn make_prefetcher(session: &NetworkSession) -> Prefetcher {
+    let session = session.clone();
+    let seen: Rc<RefCell<HashMap<String, Instant>>> = Rc::new(RefCell::new(HashMap::new()));
+    Rc::new(move |hosts: Vec<String>| {
+        let now = Instant::now();
+        let mut map = seen.borrow_mut();
+        if map.len() > 256 {
+            map.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(120));
+        }
+        for h in hosts {
+            let stale = map
+                .get(&h)
+                .is_none_or(|ts| now.duration_since(*ts) > Duration::from_secs(60));
+            if stale {
+                map.insert(h.clone(), now);
+                session.prefetch_dns(&h);
+            }
+        }
+    })
+}
+
+/// Hovering any link resolves its host (and unwrapped redirect target) in advance.
+pub fn attach_link_hover_preconnect(web_view: &WebView, prefetch: &Prefetcher) {
     if super::is_disabled() {
         return;
     }
-
-    let seen_hosts: Rc<RefCell<HashMap<String, Instant>>> = Rc::new(RefCell::new(HashMap::new()));
-    let prefetch_hosts = {
-        let session = session.clone();
-        let seen = seen_hosts.clone();
-        move |hosts: Vec<String>| {
-            let now = Instant::now();
-            let mut map = seen.borrow_mut();
-            if map.len() > 256 {
-                map.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(120));
-            }
-            for h in hosts {
-                let stale = map
-                    .get(&h)
-                    .is_none_or(|ts| now.duration_since(*ts) > Duration::from_secs(60));
-                if stale {
-                    map.insert(h.clone(), now);
-                    session.prefetch_dns(&h);
-                }
+    let prefetch = prefetch.clone();
+    web_view.connect_mouse_target_changed(move |_, hit, _| {
+        if hit.context_is_link()
+            && let Some(uri) = hit.link_uri()
+        {
+            let hosts = extract_prefetch_hosts(&uri);
+            if !hosts.is_empty() {
+                prefetch(hosts);
             }
         }
-    };
+    });
+}
 
-    // Hovering any link resolves its host (and unwrapped redirect target) in advance.
-    {
-        let prefetch = prefetch_hosts.clone();
-        web_view.connect_mouse_target_changed(move |_, hit, _| {
-            if hit.context_is_link()
-                && let Some(uri) = hit.link_uri()
-            {
-                let hosts = extract_prefetch_hosts(&uri);
-                if !hosts.is_empty() {
-                    prefetch(hosts);
-                }
-            }
-        });
+/// Typing domain names in the omnibar pre-warms DNS after a short 110 ms debounce.
+/// Must be attached exactly once per `Entry` (not per tab) to avoid handler accumulation.
+pub fn attach_omnibar_preconnect(url_entry: &Entry, prefetch: &Prefetcher) {
+    if super::is_disabled() {
+        return;
     }
-
-    // Typing domain names in the omnibar pre-warms DNS after a short 110 ms debounce.
+    let prefetch = prefetch.clone();
     let pending_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     url_entry.connect_changed(move |entry| {
         if !entry.has_focus() {
@@ -342,7 +344,7 @@ pub fn attach_speculative_preconnect(
         if text.len() < 4 || text.contains(char::is_whitespace) || !text.contains('.') {
             return;
         }
-        let prefetch = prefetch_hosts.clone();
+        let prefetch = prefetch.clone();
         let pending_cb = pending_source.clone();
         let src = glib::timeout_add_local_once(Duration::from_millis(110), move || {
             *pending_cb.borrow_mut() = None;

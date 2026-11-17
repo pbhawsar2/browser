@@ -703,7 +703,36 @@ fn decode_data_uri(rest: &str) -> Option<glib::Bytes> {
     if meta.ends_with(";base64") {
         base64_decode(payload).map(glib::Bytes::from_owned)
     } else {
-        Some(glib::Bytes::from_owned(payload.as_bytes().to_vec()))
+        // RFC 2397: non-base64 payloads are percent-encoded (e.g. inline SVG icons).
+        Some(glib::Bytes::from_owned(percent_decode(payload)))
+    }
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
+    let b = input.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -762,6 +791,18 @@ mod tests {
         uninstall_webapp_from(&listed[0], &apps, &icons).expect("uninstall failed");
         assert!(list_installed_webapps_in(&apps, &icons).is_empty());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn data_uri_non_base64_payload_is_percent_decoded() {
+        let svg = decode_data_uri("image/svg+xml,%3Csvg%20xmlns%3D%22x%22%3E%3C%2Fsvg%3E").unwrap();
+        assert_eq!(&*svg, b"<svg xmlns=\"x\"></svg>");
+        // Malformed / truncated escapes are passed through untouched.
+        assert_eq!(percent_decode("100%"), b"100%");
+        assert_eq!(percent_decode("a%zzb%4"), b"a%zzb%4");
+        // Base64 path is unchanged.
+        let b64 = decode_data_uri("image/png;base64,aGk=").unwrap();
+        assert_eq!(&*b64, b"hi");
     }
 
     #[test]

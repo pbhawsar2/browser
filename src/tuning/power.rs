@@ -49,12 +49,25 @@ pub struct PowerSupervisor {
     inner: Rc<SupervisorInner>,
 }
 
+/// Effective power policy: a manual HUD choice wins, otherwise follow the power source.
+pub fn effective_battery_mode(on_battery: bool, manual_turbo: Option<bool>) -> bool {
+    match manual_turbo {
+        Some(turbo) => !turbo,
+        None => on_battery,
+    }
+}
+
+/// The discrete GPU stays isolated unless the user explicitly opts in via `EXPLORER_ALLOW_DGPU`.
+pub fn dgpu_isolation_requested() -> bool {
+    std::env::var_os("EXPLORER_ALLOW_DGPU").is_none()
+}
+
 #[derive(Debug)]
 struct SupervisorInner {
     on_battery: Cell<bool>,
     cinema_60hz: Cell<bool>,
     hw_only_video: Cell<bool>,
-    ac_turbo_override: Cell<bool>,
+    manual_turbo: Cell<Option<bool>>,
     ppd_cookie: Cell<Option<u32>>,
     ppd_pending: Cell<bool>,
     last_hz: Cell<Option<u32>>,
@@ -80,12 +93,14 @@ impl PowerSupervisor {
     pub fn new(on_battery: bool, va_caps: VaCapabilities) -> Self {
         let mut sensors = SensorPaths::discover();
         let telemetry = sensors.sample();
+        // Only block AV1 when this GPU cannot hardware-decode it (software dav1d is a battery/fan hog).
+        let hw_only_video = !va_caps.av1;
         Self {
             inner: Rc::new(SupervisorInner {
                 on_battery: Cell::new(on_battery),
                 cinema_60hz: Cell::new(false),
-                hw_only_video: Cell::new(true),
-                ac_turbo_override: Cell::new(false),
+                hw_only_video: Cell::new(hw_only_video),
+                manual_turbo: Cell::new(None),
                 ppd_cookie: Cell::new(None),
                 ppd_pending: Cell::new(false),
                 last_hz: Cell::new(None),
@@ -98,7 +113,7 @@ impl PowerSupervisor {
     }
 
     pub fn is_battery_mode(&self) -> bool {
-        self.inner.on_battery.get() && !self.inner.ac_turbo_override.get()
+        effective_battery_mode(self.inner.on_battery.get(), self.inner.manual_turbo.get())
     }
 
     pub fn on_battery_raw(&self) -> bool {
@@ -121,16 +136,25 @@ impl PowerSupervisor {
         self.inner.hw_only_video.get()
     }
 
-    pub fn ac_turbo_override(&self) -> bool {
-        self.inner.ac_turbo_override.get()
+    /// Manual HUD override: `Some(true)` forces Turbo, `Some(false)` forces battery-saver, `None` follows the power source.
+    pub fn manual_turbo(&self) -> Option<bool> {
+        self.inner.manual_turbo.get()
     }
 
     pub fn va_caps(&self) -> &VaCapabilities {
         &self.inner.va_caps
     }
 
-    pub fn set_on_battery(&self, on_batt: bool) {
+    /// Records a power-source change; a manual HUD override never outlives the source it was set on.
+    fn note_power_source(&self, on_batt: bool) {
+        if self.inner.on_battery.get() != on_batt {
+            self.inner.manual_turbo.set(None);
+        }
         self.inner.on_battery.set(on_batt);
+    }
+
+    pub fn set_on_battery(&self, on_batt: bool) {
+        self.note_power_source(on_batt);
         self.sync_system_power();
     }
 
@@ -144,8 +168,9 @@ impl PowerSupervisor {
         self.push_extension_policy(web_context);
     }
 
+    /// HUD "AC Turbo Performance Hold" switch: works in both directions on AC and on battery.
     pub fn set_ac_turbo_override(&self, enabled: bool) {
-        self.inner.ac_turbo_override.set(enabled);
+        self.inner.manual_turbo.set(Some(enabled));
         self.sync_system_power();
     }
 
@@ -156,7 +181,7 @@ impl PowerSupervisor {
     pub fn refresh_telemetry(&self) -> TelemetrySnapshot {
         let snap = self.inner.sensors.borrow_mut().sample();
         if snap.on_battery != self.inner.on_battery.get() {
-            self.inner.on_battery.set(snap.on_battery);
+            self.note_power_source(snap.on_battery);
             self.sync_system_power();
         }
         *self.inner.telemetry.borrow_mut() = snap.clone();
@@ -230,7 +255,10 @@ impl PowerSupervisor {
 
     /// Broadcasts active GStreamer video decode policy to all WebProcess extensions.
     pub fn push_extension_policy(&self, web_context: &WebContext) {
-        let block_dgpu = std::env::var_os("EXPLORER_ALLOW_DGPU").is_none() || self.is_battery_mode();
+        if super::is_disabled() {
+            return;
+        }
+        let block_dgpu = dgpu_isolation_requested();
         let params = (self.inner.hw_only_video.get(), block_dgpu).to_variant();
         web_context.set_web_process_extensions_initialization_user_data(&params);
         let msg = UserMessage::new("explorer.power-policy", Some(&params));
@@ -350,6 +378,17 @@ mod tests {
         let unthrottle = decide_pid_transitions(&mut map, &active, &media, false);
         assert_eq!(unthrottle, vec![PidAction::Unthrottle(200)]);
         assert!(!map[&3].throttled);
+    }
+
+    #[test]
+    fn manual_turbo_switch_works_in_both_directions_on_ac_and_battery() {
+        // Follows the power source by default.
+        assert!(!effective_battery_mode(false, None));
+        assert!(effective_battery_mode(true, None));
+        // On AC the HUD switch can now force battery-saver (previously a no-op).
+        assert!(effective_battery_mode(false, Some(false)));
+        // On battery the HUD switch can still force turbo.
+        assert!(!effective_battery_mode(true, Some(true)));
     }
 
     #[test]

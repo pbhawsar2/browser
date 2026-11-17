@@ -46,6 +46,14 @@ menubutton.nav-menu > button:hover:not(:disabled) {
   color: #FFFFFF;
 }
 
+/* Keyboard focus ring (outline is otherwise suppressed on these cards). */
+button.nav-btn:focus-visible,
+menubutton.nav-menu > button:focus-visible,
+menubutton.power-pill > button:focus-visible {
+  outline: 2px solid rgba(56, 189, 248, 0.85);
+  outline-offset: -2px;
+}
+
 button.nav-btn:active:not(:disabled) {
   background-color: #0B111E;
   border-color: #38BDF8;

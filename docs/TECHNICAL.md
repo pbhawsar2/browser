@@ -110,7 +110,7 @@ Registered on `adw::Application` in `src/main.rs` for single-instance integratio
 | `EXPLORER_SW_RENDER` | unset | If set, disables hardware acceleration (`HardwareAccelerationPolicy::Never`). |
 | `EXPLORER_NON_UNIQUE` | unset | If set, runs an isolated process instead of attaching to the primary D-Bus instance. |
 | `EXPLORER_NO_SPELLCHECK` | unset | If set, disables WebKit spell checking. |
-| `EXPLORER_NO_SESSION` | unset | If set, disables session persistence (`running.lock` / tab restore). |
+| `EXPLORER_NO_SESSION` | unset | If set, disables session persistence (`session.json` save / tab restore). |
 | `EXPLORER_WEBEXT_DIR` | build-time path / `~/.local/lib/explorer` | Override directory containing `libexplorer_webext.so`. |
 | `XDG_DOWNLOAD_DIR` | `$HOME/Downloads` | Target directory for file downloads. |
 
