@@ -56,6 +56,7 @@ impl PreparedIcon {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct InstalledWebApp {
     pub desktop_id: String,
     pub name: String,

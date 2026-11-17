@@ -2,6 +2,7 @@
 //! tab bar (zero left panel), pre-warmed spare tab pool, +5% default DPI zoom,
 //! shortcuts, fullscreen video, crash-safe session restore, and UI snapshotter.
 
+use super::apps_popover::AppsMenuUi;
 use super::downloads::DownloadManagerUi;
 use super::find_bar::FindBarUi;
 use super::navigation::{self, HOME_URL};
@@ -80,7 +81,7 @@ struct BrowserState {
     back_btn: Button,
     fwd_btn: Button,
     reload_btn: Button,
-    install_app_btn: Button,
+    apps_menu: AppsMenuUi,
     progress_bar: ProgressBar,
     tab_bar_wrap: GtkBox,
     tab_strip: GtkBox,
@@ -120,9 +121,9 @@ pub fn trigger_install_webapp_if_running() {
             && !st.is_app_mode
             && let Some(wv) = st.active_webview()
         {
-            let hud = st.power_hud.clone();
+            let apps_c = st.apps_menu.clone();
             webapp_dialog::show_install_webapp_dialog(&st.window, &wv, move || {
-                hud.refresh_webapps_list();
+                apps_c.refresh();
             });
         }
     });
@@ -315,16 +316,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
         network_session.connect_download_started(move |_, dl| dl_c.track_download(dl));
     }
 
-    let install_app_btn = Button::builder()
-        .icon_name("view-grid-symbolic")
-        .tooltip_text("Install page as Web App")
-        .has_frame(false)
-        .focus_on_click(false)
-        .valign(Align::Center)
-        .visible(!is_app_mode)
-        .sensitive(false)
-        .build();
-    install_app_btn.add_css_class("nav-btn");
+    let apps_menu = AppsMenuUi::new(is_app_mode);
 
     let top_new_tab_btn = Button::builder()
         .icon_name("list-add-symbolic")
@@ -413,7 +405,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
     header_hbox.append(&dl_ui.button);
     header_hbox.append(&power_hud.pill_button);
     header_hbox.append(&top_new_tab_btn);
-    header_hbox.append(&install_app_btn);
+    header_hbox.append(&apps_menu.button);
 
     // Clean visual gap between page/browser actions and window controls.
     min_ctrl.widget().set_margin_start(4);
@@ -485,7 +477,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
         back_btn,
         fwd_btn,
         reload_btn,
-        install_app_btn,
+        apps_menu,
         progress_bar,
         tab_bar_wrap,
         tab_strip,
@@ -913,7 +905,7 @@ impl BrowserState {
             .map(|s| s.to_string())
             .unwrap_or_else(|| rec.current_url.borrow().clone());
         let is_http = cur.starts_with("http://") || cur.starts_with("https://");
-        self.install_app_btn.set_sensitive(is_http);
+        self.apps_menu.set_can_install(is_http);
 
         if !self.url_entry.has_focus() {
             let shown = navigation::display_url_for_bar(&cur);
@@ -1083,11 +1075,11 @@ fn wire_header_controls(st: &BrowserState, top_new_tab_btn: &Button) {
     }
     {
         let s = st.clone();
-        st.install_app_btn.connect_clicked(move |_| {
+        st.apps_menu.set_on_install(move || {
             if let Some(wv) = s.active_webview() {
-                let hud = s.power_hud.clone();
+                let apps_c = s.apps_menu.clone();
                 webapp_dialog::show_install_webapp_dialog(&s.window, &wv, move || {
-                    hud.refresh_webapps_list();
+                    apps_c.refresh();
                 });
             }
         });

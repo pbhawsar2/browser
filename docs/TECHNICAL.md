@@ -33,6 +33,7 @@ Browser/
     │   ├── window.rs               # Window, horizontal auto-hiding tabs, URL bar, session, lifecycle
     │   ├── navigation.rs           # URL normalization & Google search query routing
     │   ├── pages.rs                # Built-in Start Page & error page HTML
+    │   ├── apps_popover.rs         # Web Apps menu (Install Current Page + launch/uninstall list)
     │   ├── downloads.rs            # Native download manager (`$XDG_DOWNLOAD_DIR`)
     │   ├── find_bar.rs             # In-page Ctrl+F search bar
     │   ├── power_popover.rs        # Live hardware/power HUD popover
@@ -43,7 +44,7 @@ Browser/
     └── tuning/                     # Isolated hardware, power, adblock & engine optimizations
         ├── mod.rs                  # `EngineTuning` facade + `EXPLORER_DISABLE_TUNING=1` switch
         ├── hardware.rs             # DRM `renderD*` detection, O_RDWR libva probe, sysfs, PPD, Mutter DBus
-        ├── power.rs                # `PowerSupervisor` (`Zero-Fan` / `144Hz · AC Turbo`)
+        ├── power.rs                # `PowerSupervisor` (`Zero-Fan · <W>` / `AC Turbo`)
         ├── content_blocker.rs      # Brave-style DFA ad/tracker filter (`explorer-adblock-v3`) & AV1 gatekeeper
         └── webkit_engine.rs        # Env defaults, Safari UA, DNS prefetch, `EventControllerScroll` scaler
 ```

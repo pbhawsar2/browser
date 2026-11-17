@@ -112,6 +112,7 @@ menubutton.power-pill > button {
   margin: 0;
   font-size: 9.2pt;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
 
@@ -272,15 +273,65 @@ button.tab-close:hover {
 
 .hud-mono {
   font-family: ui-monospace, "JetBrains Mono", monospace;
-  font-size: 8.8pt;
-  color: #94A3B8;
+  font-size: 8.9pt;
+  font-variant-numeric: tabular-nums;
+  color: #CBD5E1;
+}
+
+.hud-row-label {
+  font-size: 9.6pt;
+  font-weight: 500;
+  color: #E2E8F0;
 }
 
 .hud-card {
   background-color: #131C2E;
-  border: 1px solid rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 9px;
-  padding: 8px 10px;
+  padding: 10px 12px;
+}
+
+button.apps-install-btn {
+  background-image: none;
+  background-color: rgba(56, 189, 248, 0.14);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  box-shadow: none;
+  border-radius: 9px;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #E0F2FE;
+  font-size: 9.6pt;
+  font-weight: 600;
+  transition: background-color 110ms ease, border-color 110ms ease;
+}
+
+button.apps-install-btn:hover:not(:disabled) {
+  background-color: rgba(56, 189, 248, 0.24);
+  border-color: #38BDF8;
+  color: #FFFFFF;
+}
+
+button.apps-install-btn:disabled {
+  background-color: #131C2E;
+  border-color: rgba(51, 65, 85, 0.55);
+  color: rgba(148, 163, 184, 0.5);
+}
+
+button.apps-item-btn,
+button.apps-item-btn:hover,
+button.apps-item-btn:active {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 2px 4px;
+  color: #E2E8F0;
+  font-size: 9.6pt;
+  font-weight: 500;
+}
+
+button.apps-item-btn:hover {
+  color: #FFFFFF;
 }
 
 .webapp-icon-preview {

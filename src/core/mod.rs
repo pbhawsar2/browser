@@ -1,5 +1,6 @@
 //! Core upstream GTK4 / Libadwaita / WebKitGTK browser UI and lifecycle.
 
+pub mod apps_popover;
 pub mod downloads;
 pub mod find_bar;
 pub mod navigation;

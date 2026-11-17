@@ -24,9 +24,24 @@ impl PowerMode {
     pub fn pill_badge(self) -> &'static str {
         match self {
             PowerMode::BatteryZeroFan => "Zero-Fan",
-            PowerMode::AcTurbo => "144Hz · AC Turbo",
+            PowerMode::AcTurbo => "AC Turbo",
         }
     }
+}
+
+/// Formats the compact header pill (`Zero-Fan · 6.2W · 0 RPM` on battery; `AC Turbo · 0 RPM` on AC).
+/// Wattage (`W`) is intentionally shown on battery power only.
+pub fn format_pill_text(mode: PowerMode, t: &TelemetrySnapshot) -> String {
+    let mut parts = vec![mode.pill_badge().to_string()];
+    if t.on_battery
+        && let Some(w) = t.batt_watts.or(t.pkg_watts)
+    {
+        parts.push(format!("{w:.1}W"));
+    }
+    if let Some(rpm) = t.fan_rpm {
+        parts.push(format!("{rpm} RPM"));
+    }
+    parts.join(" · ")
 }
 
 #[derive(Debug, Clone)]
@@ -146,22 +161,10 @@ impl PowerSupervisor {
         snap
     }
 
-    /// Formats the compact header status pill string (`"Zero-Fan · 6.2W · 0 RPM"` etc.).
+    /// Formats the compact header status pill string (`"Zero-Fan · 6.2W · 0 RPM"` on battery, `"AC Turbo · 0 RPM"` on AC).
     pub fn pill_text(&self) -> String {
         let t = self.inner.telemetry.borrow();
-        let mut parts = vec![self.mode().pill_badge().to_string()];
-        let watts = if t.on_battery {
-            t.batt_watts.or(t.pkg_watts)
-        } else {
-            t.pkg_watts
-        };
-        if let Some(w) = watts {
-            parts.push(format!("{w:.1}W"));
-        }
-        if let Some(rpm) = t.fan_rpm {
-            parts.push(format!("{rpm} RPM"));
-        }
-        parts.join(" · ")
+        format_pill_text(self.mode(), &t)
     }
 
     /// Synchronizes timer slack, `power-profiles-daemon` performance hold,
@@ -322,5 +325,35 @@ mod tests {
         let unthrottle = decide_pid_transitions(&mut map, &active, &media, false);
         assert_eq!(unthrottle, vec![PidAction::Unthrottle(200)]);
         assert!(!map[&3].throttled);
+    }
+
+    #[test]
+    fn pill_text_hides_refresh_rate_and_shows_watts_on_battery_only() {
+        let ac_snap = TelemetrySnapshot {
+            on_battery: false,
+            pkg_watts: Some(18.4),
+            batt_watts: None,
+            fan_rpm: Some(0),
+            cpu_percent: 6.0,
+            cpu_temp_c: Some(60.0),
+            igpu_busy: None,
+            igpu_mhz: None,
+            igpu_temp_c: None,
+            igpu_watts: None,
+            dgpu_state: None,
+        };
+        assert_eq!(format_pill_text(PowerMode::AcTurbo, &ac_snap), "AC Turbo · 0 RPM");
+
+        let batt_snap = TelemetrySnapshot {
+            on_battery: true,
+            pkg_watts: Some(8.1),
+            batt_watts: Some(6.2),
+            fan_rpm: Some(0),
+            ..ac_snap
+        };
+        assert_eq!(
+            format_pill_text(PowerMode::BatteryZeroFan, &batt_snap),
+            "Zero-Fan · 6.2W · 0 RPM"
+        );
     }
 }
