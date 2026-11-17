@@ -151,4 +151,12 @@ Unless already set in the user's environment, Explorer sets the following defaul
 - **Top Bezel (`.top-bezel`):** `44px` minimum height; all navigation buttons, menu buttons, and Cairo window controls share an exact `36x34px` allocation (`y = 5`).
 - **Tab Bar (`.tab-bar`):** `38px` horizontal tab strip that automatically hides when only `1` tab is open, ensuring single-tab viewports start at `x = 0` with zero wasted vertical or horizontal space.
 - **URL Bar (`entry.url-bar`):** `34px` height inside `adw::Clamp(maximum_size = 880, tightening_threshold = 480)` with `10.6pt` medium-weight text.
-- **Power HUD Pill (`menubutton.power-pill > button`):** `32px` min-height capsule (`border-radius: 999px`) displaying live mode, refresh rate, power draw, and fan RPM.
+- **Power HUD Pill (`menubutton.power-pill > button`):** `32px` min-height capsule (`border-radius: 999px`) displaying live mode (`AC Turbo` or `Zero-Fan`), battery wattage (battery mode only), and fan RPM.
+
+---
+
+## 7. Architecture Tradeoffs & Runtime Behavior
+
+- **`ProcessSwapOnCrossSiteNavigation = false`:** Intentional memory optimization reducing multi-tab PSS by ~43% vs Chrome (pages share WebProcesses safely without site-swap overhead).
+- **Per-Thread Background Throttling:** Inactive non-media tabs (`media_pages` exemption tracks audio playback) transition every TID in `/proc/<pid>/task/*` to `SCHED_BATCH` + `IOPRIO_CLASS_IDLE` on battery and revert cleanly to `SCHED_OTHER` + `IOPRIO_CLASS_BE/4` when foregrounded or on AC power.
+- **DRM / Widevine Status:** Fedora's WebKitGTK ships without EME/Widevine CDM (`navigator.requestMediaKeySystemAccess` unavailable), so DRM-protected OTT streams require Chrome.

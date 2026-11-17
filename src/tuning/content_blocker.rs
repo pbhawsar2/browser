@@ -2,9 +2,7 @@
 //! gatekeeper (blocks software AV1 decode), and battery shader CSS injection.
 
 use gtk4::gio;
-use std::cell::Cell;
 use std::path::Path;
-use std::rc::Rc;
 use webkit6::{
     UserContentFilterStore, UserContentInjectedFrames, UserContentManager, UserScript,
     UserScriptInjectionTime, UserStyleLevel, UserStyleSheet,
@@ -165,16 +163,13 @@ pub fn build_user_content_manager(
     let _ = std::fs::create_dir_all(filter_dir);
     let store = UserContentFilterStore::new(&filter_dir.to_string_lossy());
     let ucm_clone = ucm.clone();
-    let done = Rc::new(Cell::new(false));
-    let done_cb = done.clone();
     let store_save = store.clone();
     const FILTER_ID: &str = "explorer-adblock-v3";
 
+    // Filter callbacks execute asynchronously on the GLib main loop and attach
+    // the compiled DFA filter to `UserContentManager` without nested pumping.
     store.load(FILTER_ID, gio::Cancellable::NONE, move |res| match res {
-        Ok(filter) => {
-            ucm_clone.add_filter(&filter);
-            done_cb.set(true);
-        }
+        Ok(filter) => ucm_clone.add_filter(&filter),
         Err(_) => {
             let rules_bytes = gtk4::glib::Bytes::from_static(BLOCKER_RULES_JSON.as_bytes());
             store_save.save(FILTER_ID, &rules_bytes, gio::Cancellable::NONE, move |sres| {
@@ -182,17 +177,9 @@ pub fn build_user_content_manager(
                     Ok(filter) => ucm_clone.add_filter(&filter),
                     Err(e) => eprintln!("Explorer content-blocker compile error: {e}"),
                 }
-                done_cb.set(true);
             });
         }
     });
-
-    // Pump briefly so compiled DFA filter attaches before first navigation.
-    let ctx = gtk4::glib::MainContext::default();
-    let start = std::time::Instant::now();
-    while !done.get() && start.elapsed().as_millis() < 250 {
-        ctx.iteration(false);
-    }
 
     ucm
 }

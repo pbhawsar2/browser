@@ -12,6 +12,7 @@ use webkit6::WebContext;
 #[derive(Clone)]
 pub struct PowerHudUi {
     pub pill_button: MenuButton,
+    popover: Popover,
     pill_label: Label,
     last_battery_style: Rc<Cell<Option<bool>>>,
     cpu_lbl: Label,
@@ -135,6 +136,7 @@ impl PowerHudUi {
 
         let hud = Self {
             pill_button,
+            popover: popover.clone(),
             pill_label,
             last_battery_style: Rc::new(Cell::new(None)),
             cpu_lbl,
@@ -158,6 +160,10 @@ impl PowerHudUi {
 
         hud.sync(&supervisor, &hw_sw, &cin_sw, &turbo_sw);
         hud
+    }
+
+    pub fn is_popover_open(&self) -> bool {
+        self.popover.is_visible()
     }
 
     pub fn sync_pill_only(&self, supervisor: &PowerSupervisor) {
@@ -207,6 +213,9 @@ impl PowerHudUi {
         }
         if let Some(c) = t.igpu_temp_c {
             igpu_parts.push(format!("{c:.0}°C"));
+        }
+        if let Some(w) = t.igpu_watts {
+            igpu_parts.push(format!("{w:.1}W"));
         }
         self.igpu_lbl.set_text(&format!(
             "iGPU: {}",

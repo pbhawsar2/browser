@@ -56,6 +56,7 @@ struct SupervisorInner {
     hw_only_video: Cell<bool>,
     ac_turbo_override: Cell<bool>,
     ppd_cookie: Cell<Option<u32>>,
+    ppd_pending: Cell<bool>,
     last_hz: Cell<Option<u32>>,
     sensors: RefCell<SensorPaths>,
     telemetry: RefCell<TelemetrySnapshot>,
@@ -86,6 +87,7 @@ impl PowerSupervisor {
                 hw_only_video: Cell::new(true),
                 ac_turbo_override: Cell::new(false),
                 ppd_cookie: Cell::new(None),
+                ppd_pending: Cell::new(false),
                 last_hz: Cell::new(None),
                 sensors: RefCell::new(sensors),
                 telemetry: RefCell::new(telemetry),
@@ -167,24 +169,47 @@ impl PowerSupervisor {
         format_pill_text(self.mode(), &t)
     }
 
+    /// Applies lightweight kernel timer slack synchronously without D-Bus I/O.
+    pub fn apply_timer_slack(&self) {
+        if super::is_disabled() {
+            return;
+        }
+        hardware::apply_timer_slack_ns(if self.is_battery_mode() { 2_000_000 } else { 50_000 });
+    }
+
+    pub fn invalidate_last_hz(&self) {
+        self.inner.last_hz.set(None);
+    }
+
     /// Synchronizes timer slack, `power-profiles-daemon` performance hold,
-    /// and eDP display refresh rate with current power state.
+    /// and eDP display refresh rate asynchronously with current power state.
     pub fn sync_system_power(&self) {
         if super::is_disabled() {
             return;
         }
         let battery_mode = self.is_battery_mode();
-
-        // 2 ms timer slack on battery coalesces idle wakeups; 50 us keeps AC frame pacing tight.
-        hardware::apply_timer_slack_ns(if battery_mode { 2_000_000 } else { 50_000 });
+        self.apply_timer_slack();
 
         // Hold PPD `"performance"` on AC Turbo only; release cleanly on battery.
         let want_ppd_perf = !battery_mode;
-        match (want_ppd_perf, self.inner.ppd_cookie.get()) {
-            (true, None) => self.inner.ppd_cookie.set(hardware::hold_performance_profile()),
-            (false, Some(cookie)) => {
-                hardware::release_performance_profile(cookie);
+        match (want_ppd_perf, self.inner.ppd_cookie.get(), self.inner.ppd_pending.get()) {
+            (true, None, false) => {
+                self.inner.ppd_pending.set(true);
+                let sup = self.clone();
+                hardware::hold_performance_profile_async(move |cookie_opt| {
+                    sup.inner.ppd_pending.set(false);
+                    if let Some(cookie) = cookie_opt {
+                        if !sup.is_battery_mode() {
+                            sup.inner.ppd_cookie.set(Some(cookie));
+                        } else {
+                            hardware::release_performance_profile_async(cookie);
+                        }
+                    }
+                });
+            }
+            (false, Some(cookie), _) => {
                 self.inner.ppd_cookie.set(None);
+                hardware::release_performance_profile_async(cookie);
             }
             _ => {}
         }
@@ -198,7 +223,7 @@ impl PowerSupervisor {
             };
             if self.inner.last_hz.get() != Some(target_hz) {
                 self.inner.last_hz.set(Some(target_hz));
-                let _ = hardware::set_edp_refresh_rate(target_hz as f64);
+                hardware::set_edp_refresh_rate_async(target_hz as f64);
             }
         }
     }
@@ -248,7 +273,7 @@ impl PowerSupervisor {
 
     pub fn release_all(&self) {
         if let Some(cookie) = self.inner.ppd_cookie.take() {
-            hardware::release_performance_profile(cookie);
+            hardware::release_performance_profile_async(cookie);
         }
         let mut map = self.inner.tab_pids.borrow_mut();
         for info in map.values_mut() {

@@ -427,41 +427,20 @@ impl SensorPaths {
 }
 
 fn readable(p: PathBuf) -> Option<PathBuf> {
-    fs::metadata(&p).ok().map(|_| p)
+    fs::File::open(&p).ok().map(|_| p)
 }
 
 fn read_u64(p: &Path) -> Option<u64> {
     fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
 }
 
-/// Switches the built-in laptop panel (`eDP-*`) to `target_hz` via GNOME Mutter
-/// DisplayConfig D-Bus. Returns `Ok(())` when already at `target_hz` or updated;
-/// degrades cleanly on non-GNOME compositors.
-pub fn set_edp_refresh_rate(target_hz: f64) -> Result<(), String> {
-    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
-        .map_err(|e| format!("session bus unavailable: {e}"))?;
-
-    let state = bus
-        .call_sync(
-            Some("org.gnome.Mutter.DisplayConfig"),
-            "/org/gnome/Mutter/DisplayConfig",
-            "org.gnome.Mutter.DisplayConfig",
-            "GetCurrentState",
-            None,
-            Some(glib::VariantTy::new(
-                "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})",
-            ).unwrap()),
-            gio::DBusCallFlags::NONE,
-            2000,
-            gio::Cancellable::NONE,
-        )
-        .map_err(|e| format!("GetCurrentState failed: {e}"))?;
-
-    let serial = state.child_value(0).get::<u32>().ok_or("missing serial")?;
+/// Computes `ApplyMonitorsConfig` parameters if any built-in `eDP-*` panel needs
+/// switching to `target_hz`. Returns `None` when already at target or unavailable.
+fn build_edp_monitors_params(state: &glib::Variant, target_hz: f64) -> Option<glib::Variant> {
+    let serial = state.child_value(0).get::<u32>()?;
     let monitors = state.child_value(1);
     let logical_monitors = state.child_value(2);
 
-    // Build connector -> best matching mode id map for built-in eDP displays.
     let mut target_mode_by_conn = std::collections::HashMap::<String, String>::new();
     for i in 0..monitors.n_children() {
         let mon = monitors.child_value(i);
@@ -481,18 +460,15 @@ pub fn set_edp_refresh_rate(target_hz: f64) -> Result<(), String> {
             let h = mode.child_value(2).get::<i32>().unwrap_or(0);
             let hz = mode.child_value(3).get::<f64>().unwrap_or(0.0);
             let props = mode.child_value(6);
-            let mut is_current = false;
-            if let Some(dict) = props.get::<std::collections::HashMap<String, glib::Variant>>() {
-                is_current = dict
-                    .get("is-current")
-                    .and_then(|v| v.get::<bool>())
-                    .unwrap_or(false);
-            }
+            let is_current = props
+                .get::<std::collections::HashMap<String, glib::Variant>>()
+                .and_then(|d| d.get("is-current").and_then(|v| v.get::<bool>()))
+                .unwrap_or(false);
             if is_current {
                 cur_w = Some(w);
                 cur_h = Some(h);
                 if (hz - target_hz).abs() < 2.0 {
-                    return Ok(());
+                    return None;
                 }
             }
         }
@@ -508,8 +484,8 @@ pub fn set_edp_refresh_rate(target_hz: f64) -> Result<(), String> {
                 continue;
             }
             let dist = (hz - target_hz).abs();
-            let props = mode.child_value(6);
-            let is_cur = props
+            let is_cur = mode
+                .child_value(6)
                 .get::<std::collections::HashMap<String, glib::Variant>>()
                 .and_then(|d| d.get("is-current").and_then(|v| v.get::<bool>()))
                 .unwrap_or(false);
@@ -521,17 +497,16 @@ pub fn set_edp_refresh_rate(target_hz: f64) -> Result<(), String> {
 
         if let Some((mode_id, dist, is_cur)) = best_id {
             if is_cur || dist > 20.0 {
-                return Ok(());
+                return None;
             }
             target_mode_by_conn.insert(connector, mode_id);
         }
     }
 
     if target_mode_by_conn.is_empty() {
-        return Ok(());
+        return None;
     }
 
-    // Reconstruct logical_monitors array: a(iiduba(ssa{sv}))
     type LogicalMon = (
         i32,
         i32,
@@ -567,21 +542,51 @@ pub fn set_edp_refresh_rate(target_hz: f64) -> Result<(), String> {
 
     let method: u32 = 1; // temporary (non-persistent)
     let empty_props: std::collections::HashMap<String, glib::Variant> = std::collections::HashMap::new();
-    let params = (serial, method, new_logical, empty_props).to_variant();
-    bus.call_sync(
-        Some("org.gnome.Mutter.DisplayConfig"),
-        "/org/gnome/Mutter/DisplayConfig",
-        "org.gnome.Mutter.DisplayConfig",
-        "ApplyMonitorsConfig",
-        Some(&params),
-        None,
-        gio::DBusCallFlags::NONE,
-        2000,
-        gio::Cancellable::NONE,
-    )
-    .map_err(|e| format!("ApplyMonitorsConfig failed: {e}"))?;
+    Some((serial, method, new_logical, empty_props).to_variant())
+}
 
-    Ok(())
+/// Switches the built-in laptop panel (`eDP-*`) to `target_hz` asynchronously via
+/// GNOME Mutter DisplayConfig D-Bus, avoiding main-thread startup/toggle stalls.
+pub fn set_edp_refresh_rate_async(target_hz: f64) {
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |res| {
+        let Ok(bus) = res else {
+            return;
+        };
+        let bus_apply = bus.clone();
+        bus.call(
+            Some("org.gnome.Mutter.DisplayConfig"),
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            "GetCurrentState",
+            None,
+            Some(glib::VariantTy::new(
+                "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})",
+            ).unwrap()),
+            gio::DBusCallFlags::NONE,
+            2000,
+            gio::Cancellable::NONE,
+            move |state_res| {
+                let Ok(state) = state_res else {
+                    return;
+                };
+                let Some(params) = build_edp_monitors_params(&state, target_hz) else {
+                    return;
+                };
+                bus_apply.call(
+                    Some("org.gnome.Mutter.DisplayConfig"),
+                    "/org/gnome/Mutter/DisplayConfig",
+                    "org.gnome.Mutter.DisplayConfig",
+                    "ApplyMonitorsConfig",
+                    Some(&params),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    2000,
+                    gio::Cancellable::NONE,
+                    |_| {},
+                );
+            },
+        );
+    });
 }
 
 fn find_current_mode_id(monitors: &glib::Variant, conn: &str) -> Option<String> {
@@ -605,12 +610,18 @@ fn find_current_mode_id(monitors: &glib::Variant, conn: &str) -> Option<String> 
     None
 }
 
-/// Acquires an AC `"performance"` hold from `power-profiles-daemon`.
-pub fn hold_performance_profile() -> Option<u32> {
-    let bus = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE).ok()?;
-    let args = ("performance", "Explorer AC Turbo", "io.explorer.Browser").to_variant();
-    let reply = bus
-        .call_sync(
+/// Acquires an AC `"performance"` hold asynchronously from `power-profiles-daemon`.
+pub fn hold_performance_profile_async(on_cookie: impl FnOnce(Option<u32>) + 'static) {
+    let cb = std::cell::RefCell::new(Some(on_cookie));
+    gio::bus_get(gio::BusType::System, gio::Cancellable::NONE, move |res| {
+        let Ok(bus) = res else {
+            if let Some(f) = cb.borrow_mut().take() {
+                f(None);
+            }
+            return;
+        };
+        let args = ("performance", "Explorer AC Turbo", "io.explorer.Browser").to_variant();
+        bus.call(
             Some("net.hadess.PowerProfiles"),
             "/net/hadess/PowerProfiles",
             "net.hadess.PowerProfiles",
@@ -620,26 +631,34 @@ pub fn hold_performance_profile() -> Option<u32> {
             gio::DBusCallFlags::NONE,
             1500,
             gio::Cancellable::NONE,
-        )
-        .ok()?;
-    reply.child_value(0).get::<u32>()
+            move |reply_res| {
+                let cookie = reply_res.ok().and_then(|r| r.child_value(0).get::<u32>());
+                if let Some(f) = cb.borrow_mut().take() {
+                    f(cookie);
+                }
+            },
+        );
+    });
 }
 
-/// Releases a previously held `power-profiles-daemon` cookie cleanly.
-pub fn release_performance_profile(cookie: u32) {
-    if let Ok(bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
-        let _ = bus.call_sync(
-            Some("net.hadess.PowerProfiles"),
-            "/net/hadess/PowerProfiles",
-            "net.hadess.PowerProfiles",
-            "ReleaseProfile",
-            Some(&(cookie,).to_variant()),
-            None,
-            gio::DBusCallFlags::NONE,
-            1500,
-            gio::Cancellable::NONE,
-        );
-    }
+/// Releases a previously held `power-profiles-daemon` cookie asynchronously.
+pub fn release_performance_profile_async(cookie: u32) {
+    gio::bus_get(gio::BusType::System, gio::Cancellable::NONE, move |res| {
+        if let Ok(bus) = res {
+            bus.call(
+                Some("net.hadess.PowerProfiles"),
+                "/net/hadess/PowerProfiles",
+                "net.hadess.PowerProfiles",
+                "ReleaseProfile",
+                Some(&(cookie,).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                1500,
+                gio::Cancellable::NONE,
+                |_| {},
+            );
+        }
+    });
 }
 
 /// Tunes Linux kernel timer slack (`PR_SET_TIMERSLACK`) on the UI process.
@@ -653,32 +672,61 @@ pub fn apply_timer_slack_ns(ns: u64) -> Option<u64> {
     }
 }
 
-/// Tunes per-PID CPU nice value and `ioprio_set` class (idle vs best-effort)
-/// without halting IPC event loops.
-pub fn set_process_ioprio(pid: i32, idle_class: bool) {
-    if pid <= 1 {
-        return;
-    }
+fn apply_tid_throttling(tid: i32, idle_class: bool) {
     const IOPRIO_WHO_PROCESS: libc::c_int = 1;
     const IOPRIO_CLASS_BE: libc::c_int = 2;
     const IOPRIO_CLASS_IDLE: libc::c_int = 3;
     const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 
-    let prio = if idle_class {
+    let ioprio = if idle_class {
         IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT
     } else {
         (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4
     };
-    let nice_val: libc::c_int = if idle_class { 12 } else { 0 };
+    // `SCHED_BATCH` <-> `SCHED_OTHER` is reversible without CAP_SYS_NICE, whereas
+    // `setpriority(..., 12)` cannot be restored back to 0 under RLIMIT_NICE=0.
+    let sched_policy = if idle_class {
+        libc::SCHED_BATCH
+    } else {
+        libc::SCHED_OTHER
+    };
+    let sched_param = libc::sched_param { sched_priority: 0 };
+
     unsafe {
-        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, pid, prio);
-        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice_val);
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, tid, ioprio);
+        libc::sched_setscheduler(tid, sched_policy, &sched_param);
     }
 }
 
-/// Watches UPower `OnBattery` changes on the system D-Bus and invokes `on_change`.
+/// Tunes per-thread I/O priority and reversible batch scheduling across every
+/// thread in `pid` (`/proc/<pid>/task/*`) without halting IPC event loops.
+pub fn set_process_ioprio(pid: i32, idle_class: bool) {
+    if pid <= 1 {
+        return;
+    }
+    let task_dir = format!("/proc/{pid}/task");
+    let mut applied_any = false;
+    if let Ok(entries) = fs::read_dir(&task_dir) {
+        for entry in entries.flatten() {
+            if let Ok(tid) = entry.file_name().to_string_lossy().parse::<i32>()
+                && tid > 1
+            {
+                apply_tid_throttling(tid, idle_class);
+                applied_any = true;
+            }
+        }
+    }
+    if !applied_any {
+        apply_tid_throttling(pid, idle_class);
+    }
+}
+
+/// Watches UPower `OnBattery` changes asynchronously on the system D-Bus.
 pub fn attach_upower_watcher(on_change: impl Fn(bool) + 'static) {
-    if let Ok(bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
+    gio::bus_get(gio::BusType::System, gio::Cancellable::NONE, move |res| {
+        let Ok(bus) = res else {
+            return;
+        };
         let sub = bus.subscribe_to_signal(
             Some("org.freedesktop.UPower"),
             Some("org.freedesktop.DBus.Properties"),
@@ -697,5 +745,49 @@ pub fn attach_upower_watcher(on_change: impl Fn(bool) + 'static) {
         );
         // Keep subscription alive for the process lifetime.
         let _ = Box::leak(Box::new((bus, sub)));
+    });
+}
+
+/// Watches GNOME Mutter `MonitorsChanged` so cached refresh state resets cleanly
+/// whenever the user alters display settings manually.
+pub fn attach_monitors_changed_watcher(on_changed: impl Fn() + 'static) {
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |res| {
+        let Ok(bus) = res else {
+            return;
+        };
+        let sub = bus.subscribe_to_signal(
+            Some("org.gnome.Mutter.DisplayConfig"),
+            Some("org.gnome.Mutter.DisplayConfig"),
+            Some("MonitorsChanged"),
+            Some("/org/gnome/Mutter/DisplayConfig"),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |_| on_changed(),
+        );
+        let _ = Box::leak(Box::new((bus, sub)));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_tid_batch_and_ioprio_throttling_is_reversible_unprivileged() {
+        let mut child = match std::process::Command::new("/bin/sleep").arg("2").spawn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let pid = child.id() as i32;
+        set_process_ioprio(pid, true);
+        unsafe {
+            assert_eq!(libc::sched_getscheduler(pid), libc::SCHED_BATCH);
+        }
+        set_process_ioprio(pid, false);
+        unsafe {
+            assert_eq!(libc::sched_getscheduler(pid), libc::SCHED_OTHER);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

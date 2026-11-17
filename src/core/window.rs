@@ -95,6 +95,7 @@ struct BrowserState {
     spare_scheduled: Rc<Cell<bool>>,
     html_fullscreen: Rc<Cell<bool>>,
     media_pages: Rc<RefCell<HashSet<u64>>>,
+    session_save_timer: Rc<RefCell<Option<glib::SourceId>>>,
     closing: Rc<Cell<bool>>,
 }
 
@@ -238,7 +239,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
     let igpu_node = tuning::detect_igpu_render_node();
     let va_caps = tuning::probe_va_capabilities(&igpu_node);
     let supervisor = PowerSupervisor::new(on_battery, va_caps);
-    supervisor.sync_system_power();
+    supervisor.apply_timer_slack();
 
     let data_dir = cfg.profile_dir.join("data");
     let cookies_path = cfg.profile_dir.join("cookies.sqlite");
@@ -491,6 +492,7 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
         spare_scheduled: Rc::new(Cell::new(false)),
         html_fullscreen: Rc::new(Cell::new(false)),
         media_pages,
+        session_save_timer: Rc::new(RefCell::new(None)),
         closing: Rc::new(Cell::new(false)),
     };
 
@@ -527,6 +529,15 @@ pub fn build_and_present(app: &adw::Application, cfg: LaunchConfig) {
     }
 
     window.present();
+
+    // Sync D-Bus refresh rate & PPD after initial window map so cold launch stays instant.
+    let sup_init = state.supervisor.clone();
+    let closing_init = state.closing.clone();
+    glib::idle_add_local_once(move || {
+        if !closing_init.get() {
+            sup_init.sync_system_power();
+        }
+    });
 }
 
 impl BrowserState {
@@ -621,7 +632,7 @@ impl BrowserState {
         }
         if !self.is_app_mode {
             self.schedule_spare_warmup(180);
-            self.save_session_now();
+            self.schedule_session_save();
         }
         id
     }
@@ -717,7 +728,7 @@ impl BrowserState {
                         st.sync_active_bar(&rec_c);
                     }
                     if !st.is_app_mode {
-                        st.save_session_now();
+                        st.schedule_session_save();
                     }
                 }
             });
@@ -883,7 +894,7 @@ impl BrowserState {
 
         self.reconcile_pids();
         if !self.is_app_mode {
-            self.save_session_now();
+            self.schedule_session_save();
         }
     }
 
@@ -956,7 +967,7 @@ impl BrowserState {
             return;
         }
         if !self.is_app_mode {
-            self.save_session_now();
+            self.schedule_session_save();
         }
     }
 
@@ -1005,6 +1016,24 @@ impl BrowserState {
         }
         let media = self.media_pages.borrow().clone();
         self.supervisor.reconcile_tab_priorities(&active_pages, &media);
+    }
+
+    fn schedule_session_save(&self) {
+        if self.is_app_mode
+            || self.closing.get()
+            || std::env::var_os("EXPLORER_NO_SESSION").is_some()
+        {
+            return;
+        }
+        if self.session_save_timer.borrow().is_some() {
+            return;
+        }
+        let st = self.clone();
+        let tid = glib::timeout_add_local_once(Duration::from_millis(600), move || {
+            *st.session_save_timer.borrow_mut() = None;
+            st.save_session_now();
+        });
+        *self.session_save_timer.borrow_mut() = Some(tid);
     }
 
     fn save_session_now(&self) {
@@ -1233,21 +1262,15 @@ fn wire_power_and_lifecycle(
         });
     }
 
-    let timer_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     {
-        let sup = st.supervisor.clone();
-        let hud = st.power_hud.clone();
-        let closing = st.closing.clone();
-        let tid = glib::timeout_add_local(Duration::from_secs(2), move || {
-            if closing.get() {
-                return glib::ControlFlow::Break;
-            }
-            sup.refresh_telemetry();
-            hud.sync_pill_only(&sup);
-            glib::ControlFlow::Continue
+        let sup_m = st.supervisor.clone();
+        tuning::hardware::attach_monitors_changed_watcher(move || {
+            sup_m.invalidate_last_hz();
         });
-        *timer_id.borrow_mut() = Some(tid);
     }
+
+    let timer_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    schedule_telemetry_tick(&st.supervisor, &st.power_hud, &st.closing, &timer_id);
 
     {
         let s = st.clone();
@@ -1255,6 +1278,9 @@ fn wire_power_and_lifecycle(
         st.window.connect_close_request(move |_| {
             s.closing.set(true);
             if let Some(id) = tid_ref.borrow_mut().take() {
+                id.remove();
+            }
+            if let Some(id) = s.session_save_timer.borrow_mut().take() {
                 id.remove();
             }
             s.save_session_now();
@@ -1267,6 +1293,36 @@ fn wire_power_and_lifecycle(
             glib::Propagation::Proceed
         });
     }
+}
+
+fn schedule_telemetry_tick(
+    sup: &PowerSupervisor,
+    hud: &PowerHudUi,
+    closing: &Rc<Cell<bool>>,
+    timer_slot: &Rc<RefCell<Option<glib::SourceId>>>,
+) {
+    if closing.get() {
+        return;
+    }
+    let secs = if sup.is_battery_mode() && !hud.is_popover_open() {
+        5
+    } else {
+        2
+    };
+    let sup_c = sup.clone();
+    let hud_c = hud.clone();
+    let closing_c = closing.clone();
+    let slot_c = timer_slot.clone();
+    let tid = glib::timeout_add_local_once(Duration::from_secs(secs), move || {
+        *slot_c.borrow_mut() = None;
+        if closing_c.get() {
+            return;
+        }
+        sup_c.refresh_telemetry();
+        hud_c.sync_pill_only(&sup_c);
+        schedule_telemetry_tick(&sup_c, &hud_c, &closing_c, &slot_c);
+    });
+    *timer_slot.borrow_mut() = Some(tid);
 }
 
 fn sync_win_ctrl_states(win: &adw::ApplicationWindow, max_btn: &WinCtrlButton, fs_btn: &WinCtrlButton) {

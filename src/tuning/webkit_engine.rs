@@ -17,7 +17,6 @@ use gtk4::{Entry, EventControllerScroll};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -68,18 +67,6 @@ pub fn apply_startup_env(on_battery: bool) {
     set_env_default("MESA_SHADER_CACHE_MAX_SIZE", "2G");
     set_env_default("WEBKIT_WEB_RENDER_DEVICE_FILE", &igpu_node);
 
-    // Select AMD VA-API driver when render node vendor matches 0x1002.
-    if let Some(node_name) = Path::new(&igpu_node).file_name().and_then(|s| s.to_str()) {
-        let vendor_path = format!("/sys/class/drm/{node_name}/device/vendor");
-        if fs::read_to_string(vendor_path)
-            .unwrap_or_default()
-            .trim()
-            .eq_ignore_ascii_case("0x1002")
-        {
-            set_env_default("LIBVA_DRIVER_NAME", "radeonsi");
-        }
-    }
-
     set_env_default("JSC_useArchitectureSpecificOptimizations", "1");
     set_env_default("JSC_useConcurrentJIT", "1");
     set_env_default("JSC_useConcurrentGC", "1");
@@ -87,6 +74,18 @@ pub fn apply_startup_env(on_battery: bool) {
 
     // Keep NVIDIA Optimus dGPU suspended unless explicitly requested via EXPLORER_ALLOW_DGPU.
     if on_battery || std::env::var_os("EXPLORER_ALLOW_DGPU").is_none() {
+        // Guard AMD VA-API against probing `/usr/lib64/dri/nvidia_drv_video.so` on renderD129
+        // during GStreamer VA plugin discovery (which wakes the RTX 3050 Ti to `active`).
+        if let Some(node_name) = Path::new(&igpu_node).file_name().and_then(|s| s.to_str()) {
+            let vendor_path = format!("/sys/class/drm/{node_name}/device/vendor");
+            if std::fs::read_to_string(vendor_path)
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("0x1002")
+            {
+                set_env_default("LIBVA_DRIVER_NAME", "radeonsi");
+            }
+        }
         set_env_default("CUDA_VISIBLE_DEVICES", "-1");
         if Path::new("/usr/share/glvnd/egl_vendor.d/50_mesa.json").exists() {
             set_env_default(
