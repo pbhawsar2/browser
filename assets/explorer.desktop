@@ -2,7 +2,7 @@
 Version=1.0
 Name=Explorer
 Comment=Fast, clean, hardware-accelerated browser
-Exec=/home/piyush/.local/bin/explorer %u
+Exec=explorer %u
 Icon=io.explorer.Browser
 StartupWMClass=io.explorer.Browser
 Terminal=false

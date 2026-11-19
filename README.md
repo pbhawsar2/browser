@@ -24,17 +24,52 @@ sudo dnf install -y --setopt=install_weak_deps=False \
   libva-devel libdrm-devel gstreamer1-devel gstreamer1-plugins-base-devel
 ```
 
-### Build & Install to `~/.local`
+### Turnkey Installation (Recommended)
+
+Running `./install.sh` without arguments performs a complete, turnkey installation:
 
 ```bash
-./scripts/install.sh
+chmod +x install.sh install-desktop.sh uninstall.sh
+./install.sh
 ```
 
-Or manually:
+This single command:
+- Verifies optimized release binaries (`explorer` and `libexplorer_webext.so`), compiling them automatically if missing
+- Installs the standalone binary (`~/.local/bin/explorer`), WebExtension library (`~/.local/lib/explorer/`), and application icons (no fragile symlinks)
+- Configures and validates desktop launcher integration with dynamic `Exec` path resolution
+- Refreshes the system desktop database and GTK icon cache
+- Automatically registers **Explorer** as the default web browser handler for HTTP, HTTPS, and HTML MIME types
+
+### Optional Build & Install Flags
+
+- `--test`: Run the test suite (`cargo test`) before compiling release binaries
+- `--rebuild`: Force recompilation even if release binaries already exist
+- `--no-mime`: Skip registering Explorer as the default web browser
+
+### Custom Prefix / System-Wide Install
+
+To install system-wide (e.g. `/usr/local`):
 
 ```bash
-cargo test
-cargo build --release
+PREFIX=/usr/local ./install.sh
+```
+
+### Desktop Integration Only
+
+If binaries are already compiled and you only wish to re-install or refresh the standalone binary and desktop entry:
+
+```bash
+./install-desktop.sh
+```
+
+### Uninstall
+
+```bash
+# Uninstall application launcher, binary, WebExtension, and icons
+./uninstall.sh
+
+# Or uninstall and completely purge all caches, user profile, and application data
+./uninstall.sh --purge
 ```
 
 `build.rs` automatically discovers an optional custom PGO/ThinLTO WebKitGTK prefix (`$EXPLORER_WEBKIT_DIR`, `/opt/explorer-webkit`, or `/opt/velox-webkit`) and falls back transparently to system `webkitgtk-6.0`.
