@@ -1,0 +1,38 @@
+# Explorer — Phase 2 GN Arguments for Custom Zen 3 (Ryzen 7 5800H) CEF / Chromium Build
+# Run on a 32 GB+ RAM / 150 GB+ disk build host or CI runner to produce a drop-in
+# `libcef.so` that decisively beats stock Google Chrome on Speedometer 3.1.
+
+is_official_build = true
+is_debug = false
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+
+# Native Zen 3 microarchitecture + ThinLTO + 2-Stage PGO
+use_thin_lto = true
+thin_lto_enable_optimizations = true
+chrome_pgo_phase = 2
+# pgo_data_path = "/workspace/pgo/explorer-znver3-speedometer3.profdata"
+
+# Media & Streaming Parity (H.264, HEVC, VP9, Widevine CDM)
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+enable_widevine = true
+use_vaapi = true
+
+# Strip Chrome bloat not used by Explorer Alloy mode
+enable_nacl = false
+enable_reporting = false
+enable_background_mode = false
+enable_pdf = true
+enable_print_preview = false
+enable_remoting = false
+safe_browsing_mode = 0
+use_official_google_api_keys = false
+
+# Linux Wayland Ozone target
+use_ozone = true
+ozone_platform_wayland = true
+ozone_platform_x11 = true
+use_sysroot = true
+target_cpu = "x64"

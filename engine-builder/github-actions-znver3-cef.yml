@@ -1,0 +1,44 @@
+# Phase 2 Cloud Build Workflow: Custom Zen 3 (-march=znver3) + 2-Stage PGO + ThinLTO libcef.so
+# Copy into `.github/workflows/build-znver3-cef.yml` (requires a 32 GB+ RAM / 150 GB+ disk runner)
+# to produce a drop-in `libcef.so` that beats stock Google Chrome on Speedometer 3.1.
+
+name: Build Explorer Zen3 PGO+ThinLTO libcef
+
+on:
+  workflow_dispatch:
+    inputs:
+      cef_branch:
+        description: 'CEF Chromium branch (e.g. 8127 for Chromium 158)'
+        required: true
+        default: '8127'
+
+jobs:
+  build-znver3-cef:
+    runs-on: ubuntu-24.04-16core  # Or self-hosted 32 GB+ RAM / 150 GB+ SSD Linux x86_64 runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Chromium/CEF Linux build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld llvm ninja-build pkg-config \
+            python3 git curl libglib2.0-dev libgtk-3-dev libva-dev libdrm-dev libsystemd-dev
+
+      - name: Fetch depot_tools & automate-git.py
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          curl -fsSL https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate-git.py -o automate-git.py
+
+      - name: Build Stage-2 PGO + ThinLTO + -march=znver3 libcef.so
+        env:
+          CEF_BRANCH: ${{ inputs.cef_branch }}
+        run: |
+          bash engine-builder/build-znver3-cef.sh
+
+      - name: Upload drop-in libcef.so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: explorer-libcef-znver3-pgo
+          path: |
+            cef-znver3-build/chromium/src/cef/binary_distrib/cef_binary_*_minimal.tar.bz2

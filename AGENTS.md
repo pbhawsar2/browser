@@ -29,30 +29,34 @@ This document defines mandatory operating rules for all AI agents (Antigravity, 
 
 ## 2. Architecture & Upgradeability Guardrails
 
-- **Keep Core and Tuning Separated:**
-  - `src/core/` contains pure upstream GTK4 / Libadwaita / WebKitGTK UI, tab/window lifecycle, downloads, find bar, and WebApp installation. Do not couple hardware/driver hacks directly into `src/core/`.
-  - `src/tuning/` contains all hardware, DRM/VA-API, power supervisor, content blocker, scroll scaling, and WebKit engine tuning.
-  - Every optimization in `src/tuning/` **must** remain cleanly bypassable via `EXPLORER_DISABLE_TUNING=1`.
+- **Keep SOLID Modules Strictly Separated:**
+  - `hal/` owns all Linux hardware, DRM/VA-API, Optimus dGPU isolation, power governor, display refresh, process throttling, and telemetry logic — zero UI or CEF coupling.
+  - `policy/` owns pure deterministic state machines (`PowerPolicyEngine`, `MediaCodecPolicy`, `PidThrottlePlanner`, `navigation_policy`).
+  - `shield/` + `shield-brave/` own Brave `adblock-rust` filtering and async list updates.
+  - `vault/` owns AES-256-GCM encrypted credential storage.
+  - `webapp/` owns standalone chromeless Linux WebApp installation.
+  - `engine/` owns CEF Alloy client hooks and hardware-driven Chromium/V8 flags.
+  - `app/` owns the Frameless Obsidian WebUI chrome, multi-tab window lifecycle, downloads, find bar, and Control Overlay.
+  - Every hardware/engine optimization **must** remain cleanly bypassable via `EXPLORER_DISABLE_TUNING=1`.
 - **UI & Theme Invariants:**
-  - Top bezel buttons and window controls stay aligned to `36x34px` (`button.nav-btn`, `menubutton.nav-menu > button`, and Cairo window controls).
-  - Never reintroduce a permanently-allocating left tab sidebar (`GtkRevealer` horizontal width leak); multi-tab UI uses the auto-hiding top horizontal `.tab-bar` (`visible` only when `tabs > 1`).
-  - Default page zoom is `1.05` (`DEFAULT_PAGE_ZOOM`), and **Google** is the default search engine.
+  - Top bezel stays compact (`44px`) with `36x34px` rounded card buttons and pixel-aligned SVG icons.
+  - Multi-tab UI uses the auto-hiding top horizontal `.tab-bar` (`38px`, `visible` only when `tabs > 1`).
+  - Default page zoom is `1.05` (`kDefaultPageZoomFactor`), and **Google** is the default search engine.
+  - Zero browsing history stored; persistent cookies & explicit clear-site-data controls.
 
 ---
 
 ## 3. Stability First: 100% Rigorous Verification
 
-The primary objective is maintaining rock-solid app stability, high performance, and hardware decode reliability on Wayland / Linux (WebKitGTK 6.0, VA-API, and AMD/Optimus isolation).
+The primary objective is maintaining rock-solid app stability, zero-overlap UI polish, high Speedometer/rendering performance, and hardware decode reliability on Wayland / Linux.
 
 Before presenting any changes for commit approval:
-1. **Build Integrity**:
-   - Ensure the project builds and tests cleanly without warnings or errors (`cargo test` and `cargo build --release`).
+1. **Build & Unit Test Integrity**:
+   - Ensure `shield-brave` (`cargo build --release --manifest-path shield-brave/Cargo.toml`) and the C++20 CMake project (`cmake --build build` + `ctest --test-dir build --output-on-failure`) compile cleanly with zero warnings and 100% passing unit tests.
 2. **Desktop & Shell Integration**:
-   - If desktop entries, scripts, or assets are touched, validate them (`desktop-file-validate`).
+   - Validate `.desktop` files (`desktop-file-validate`).
    - Ensure install scripts remain turnkey and industrial-grade (standalone binaries via `install -p -m 755`, **zero fragile symlinks**).
-3. **Subsystem & WebProcess Extension Verification**:
-   - Verify both the main `explorer` binary and `libexplorer_webext.so` WebExtension build cleanly.
-4. **Clean Tree**:
+3. **Clean Tree**:
    - Ensure no temporary files (`*.swp`, `*.tmp_rot`, ad-hoc build artifacts) pollute the working tree.
 
 ---

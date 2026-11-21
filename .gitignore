@@ -1,8 +1,11 @@
-# Rust build artifacts
-/target/
+# Build & dependency artifacts
+/build/
+/shield-brave/target/
+/cef-znver3-build/
 **/*.rs.bk
 
-# Editor / OS clutter
+# Editor / IDE / OS clutter
+.vscode/
 *.swp
 *.swo
 *~
@@ -10,3 +13,4 @@
 *.orig
 *.rej
 *.bak
+*.tmp_rot

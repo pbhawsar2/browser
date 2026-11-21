@@ -1,56 +1,32 @@
 #!/usr/bin/env bash
+# Clean uninstaller for Explorer Browser (preserves user vault/profile unless --purge-data is passed).
 set -euo pipefail
 
-PREFIX="${PREFIX:-${HOME}/.local}"
-BIN_DST="${PREFIX}/bin/explorer"
-LIB_DST="${PREFIX}/lib/explorer"
-APP_DST="${PREFIX}/share/applications/explorer.desktop"
-ICON_BASE="${PREFIX}/share/icons/hicolor"
+PREFIX="${PREFIX:-$HOME/.local}"
+CEF_DIR="${EXPLORER_CEF_DIR:-$HOME/.local/share/explorer-cef}"
+PURGE_DATA=0
 
-PURGE_DATA=false
 for arg in "$@"; do
-  case "${arg}" in
-    --purge|--all-data)
-      PURGE_DATA=true
-      ;;
-    -h|--help)
-      echo "Usage: ./uninstall.sh [--purge]"
-      echo "Uninstalls binary, WebExtension, icons, and desktop entry."
-      echo "  --purge, --all-data  Also delete user profile, WebKit cache, and application data"
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: ${arg}" >&2
-      exit 1
-      ;;
-  esac
+    [[ "$arg" == "--purge-data" ]] && PURGE_DATA=1
 done
 
-# Remove binaries, library directory, and desktop integration
-rm -f "${BIN_DST}"
-rm -rf "${LIB_DST}"
-rm -f "${APP_DST}"
-rm -f "${ICON_BASE}/scalable/apps/io.explorer.Browser.svg"
-for size in 48 64 128 256 512; do
-  rm -f "${ICON_BASE}/${size}x${size}/apps/io.explorer.Browser.png"
-done
+pkill -f "explorer-cef/Release/explorer" 2>/dev/null || true
+sleep 0.3
 
-# Clean up application data, profile, and cache if requested
-if [[ "${PURGE_DATA}" == "true" ]]; then
-  rm -rf "${HOME}/.cache/explorer"
-  rm -rf "${HOME}/.local/share/explorer"
-  rm -rf "${HOME}/.config/explorer"
-  rm -rf "${PREFIX}/share/explorer"
-  echo "[browser] Removed user profile, cache, and application data."
+rm -f "$PREFIX/bin/explorer" \
+      "$CEF_DIR/Release/explorer" \
+      "$CEF_DIR/Release/explorer-icon.png" \
+      "$PREFIX/share/applications/explorer.desktop" \
+      "$PREFIX/share/icons/hicolor/scalable/apps/io.explorer.Browser.svg" \
+      "$PREFIX/share/icons/hicolor/48x48/apps/io.explorer.Browser.png" \
+      "$PREFIX/share/icons/hicolor/64x64/apps/io.explorer.Browser.png" \
+      "$PREFIX/share/icons/hicolor/128x128/apps/io.explorer.Browser.png" \
+      "$PREFIX/share/icons/hicolor/256x256/apps/io.explorer.Browser.png"
+
+if [[ "$PURGE_DATA" -eq 1 ]]; then
+    rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/explorer" "$CEF_DIR" "${CEF_DIR}.prev"
 fi
 
-if command -v update-desktop-database >/dev/null 2>&1; then
-  update-desktop-database "${PREFIX}/share/applications" >/dev/null 2>&1 || true
-fi
-if command -v gtk4-update-icon-cache >/dev/null 2>&1; then
-  gtk4-update-icon-cache -f -t "${ICON_BASE}" >/dev/null 2>&1 || true
-elif command -v gtk-update-icon-cache >/dev/null 2>&1; then
-  gtk-update-icon-cache -f -t "${ICON_BASE}" >/dev/null 2>&1 || true
-fi
-
-echo "[browser] Uninstalled binary, WebExtension, icons, and desktop entry from ${PREFIX}."
+gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
+update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+echo "Explorer uninstalled cleanly."

@@ -1,82 +1,38 @@
 # Explorer Browser
 
-Fast, minimalist Linux Wayland browser built in Rust with **GTK4**, **Libadwaita**, **WebKitGTK 6.0**, and **mimalloc** (`target-cpu=native`, ThinLTO). Designed for clean separation between upstream browser core logic and Fedora/AMD/Optimus hardware optimizations.
+**Explorer** is a hardware-tuned, modular C++20 + Rust desktop web browser powered by **Blink + V8 + Skia (CEF 158 Alloy Mode)** — engineered for Linux Wayland / AMD Ryzen + Radeon iGPU + NVIDIA Optimus laptops with zero Chrome bloat, built-in **Brave `adblock-rust`**, **AES-256-GCM** encrypted password vault, standalone chromeless **Web Apps**, and rock-solid multi-tab stability.
 
-## Key Features
+## SOLID Architecture
 
-- **Clean Core / Tuning Split:** Pure GTK4/WebKitGTK UI in `src/core/` isolated from hardware/engine optimizations in `src/tuning/` for seamless future Fedora upgrades (`EXPLORER_DISABLE_TUNING=1` runs pure upstream behavior).
-- **Unified `36x34px` Top Bezel:** Crisp dark-mode UI (`#080C14` / `#131C2C`) with Cairo window controls, `1.05x` default 1080p DPI zoom, **Google** default search, and an auto-hiding `38px` horizontal tab bar (hidden when 1 tab is open so pages start at `x = 0`).
-- **Pre-warmed New Tab (`Ctrl+T`):** Lazily keeps one spare Start Page `WebView` ready for instant tab creation.
-- **16-Thread `AC Turbo` Scaling:** Scales Skia & JavaScriptCore threads to CPU parallelism on AC power (`+29.1%` Speedometer 3.1 vs stock WebKitGTK).
-- **AMD Cezanne VA-API & Optimus Isolation:** Probes `/dev/dri/renderD*` via `O_RDWR` `libva` (`VP9 · H264 · HEVC`), prefers `vavp9dec`/`vah264dec`, and keeps the discrete NVIDIA GPU suspended for `0 RPM` quiet browsing.
-- **Brave-Style Native DFA Adblocker:** Curated third-party tracker/ad rules (`explorer-adblock-v3`) compiled once to disk via `UserContentFilterStore`.
-- **Smooth Scroll Scaler:** `3.0x` discrete wheel / `1.85x` smooth trackpad scaling on WebKit's `EventControllerScroll` (keeping `Ctrl+Wheel` zoom `1.0x`).
-- **WebApp (PWA) Installer:** Install any website as a standalone desktop app (`--app=<url>`) with generated squircle icons.
+| Module | Directory | Responsibility |
+| :--- | :--- | :--- |
+| **HAL** | `hal/` | AMD/Intel iGPU discovery (`0x1002`), NVIDIA Optimus dGPU D3cold isolation (`0x10de`), RADV Vulkan ICD pinning, direct `O_RDWR` `libva` VLD probe, async `sd-bus` PPD/UPower/Mutter 60↔144 Hz refresh control, reversible per-TID `SCHED_BATCH` + `IOPRIO_IDLE` throttling, and live sysfs/hwmon telemetry (zero UI/CEF coupling) |
+| **Policy** | `policy/` | Pure deterministic state machines: `PowerPolicyEngine` (`Zero-Fan` ↔ `AC Turbo`), `MediaCodecPolicy` (hardware VA-API VP9 vs software AV1 gatekeeper), `PidThrottlePlanner`, and `navigation_policy` (Google default search + `1.05x` default page zoom) |
+| **Shield** | `shield/` + `shield-brave/` | Native **Brave `adblock-rust`** (`v0.13.6`) network-layer ad & tracker blocker with instant atomic On/Off toggle, OTT/payment `@@` exceptions, and async EasyList/EasyPrivacy/Peter Lowe filter list updater |
+| **Vault** | `vault/` | OpenSSL `libcrypto` **AES-256-GCM** encrypted local password vault (`0600` key + random 96-bit IV + 128-bit auth tag) with save, update, delete, origin lookup, and one-click autofill |
+| **WebApp** | `webapp/` | Turnkey Linux FreeDesktop installer launching sites as pure chromeless standalone desktop apps (`--app=<url> --app-id=<id>`) with fetched 256px favicon icons and isolated profiles |
+| **Engine** | `engine/` | Dependency-inverted `ITabObserver`, hardware-driven Blink/V8/VA-API/Wayland flag generator, and `ExplorerCefClient` (DoClose multi-tab isolation, Shield IO hook, Downloads manager, keyboard shortcuts, renderer PID IPC) |
+| **App UI** | `app/` | Frameless Obsidian WebUI chrome (`44px` top bezel with `36x34px` controls, auto-hiding `38px` tab bar for `tabs > 1`, `38px` Find bar, 4-tab `Power / Vault / Downloads / Apps` floating control overlay), zero browsing history, persistent cookies, and atomic session restore |
+| **Engine Builder** | `engine-builder/` | Cloud/CI build configuration (`args.gn`, `build-znver3-cef.sh`, GitHub Actions workflow) for drop-in custom `-march=znver3` + 2-Stage PGO + ThinLTO + BOLT `libcef.so` |
 
-## Quick Start & Installation
-
-### Build Prerequisites (Fedora)
-
-```bash
-sudo dnf install -y --setopt=install_weak_deps=False \
-  rust cargo gcc pkgconf-pkg-config \
-  gtk4-devel libadwaita-devel webkitgtk6.0-devel \
-  libva-devel libdrm-devel gstreamer1-devel gstreamer1-plugins-base-devel
-```
-
-### Turnkey Installation (Recommended)
-
-Running `./install.sh` without arguments performs a complete, turnkey installation:
+## Build, Test & Install
 
 ```bash
-chmod +x install.sh install-desktop.sh uninstall.sh
+chmod +x install-cef.sh install.sh update.sh uninstall.sh
 ./install.sh
 ```
 
-This single command:
-- Verifies optimized release binaries (`explorer` and `libexplorer_webext.so`), compiling them automatically if missing
-- Installs the standalone binary (`~/.local/bin/explorer`), WebExtension library (`~/.local/lib/explorer/`), and application icons (no fragile symlinks)
-- Configures and validates desktop launcher integration with dynamic `Exec` path resolution
-- Refreshes the system desktop database and GTK icon cache
-- Automatically registers **Explorer** as the default web browser handler for HTTP, HTTPS, and HTML MIME types
-
-### Optional Build & Install Flags
-
-- `--test`: Run the test suite (`cargo test`) before compiling release binaries
-- `--rebuild`: Force recompilation even if release binaries already exist
-- `--no-mime`: Skip registering Explorer as the default web browser
-
-### Custom Prefix / System-Wide Install
-
-To install system-wide (e.g. `/usr/local`):
+## Updating Chromium / CEF Engine Safely
 
 ```bash
-PREFIX=/usr/local ./install.sh
+./update.sh                              # Check & upgrade to latest stable CEF/Chromium
+./update.sh --tarball /path/to/cef.tbz2  # Install custom znver3 PGO+ThinLTO+BOLT libcef.so
+./update.sh --rollback                   # Instant rollback if needed
 ```
 
-### Desktop Integration Only
+## Runtime Escape Hatches
 
-If binaries are already compiled and you only wish to re-install or refresh the standalone binary and desktop entry:
-
-```bash
-./install-desktop.sh
-```
-
-### Uninstall
-
-```bash
-# Uninstall application launcher, binary, WebExtension, and icons
-./uninstall.sh
-
-# Or uninstall and completely purge all caches, user profile, and application data
-./uninstall.sh --purge
-```
-
-`build.rs` automatically discovers an optional custom PGO/ThinLTO WebKitGTK prefix (`$EXPLORER_WEBKIT_DIR`, `/opt/explorer-webkit`, or `/opt/velox-webkit`) and falls back transparently to system `webkitgtk-6.0`.
-
-## Documentation
-
-- [**Technical Reference**](docs/TECHNICAL.md) — Complete folder map, CLI flags (`--app`, `--app-id`), D-Bus actions, keyboard shortcuts, all `EXPLORER_*` environment variables & hidden configurations, and UI specs.
-- [**Engineering Findings & Benchmarks**](docs/FINDINGS.md) — Hardware/DRM, WebKit Content Blocker, GTK4 layout/CSS postmortems, and Chrome vs. Explorer memory/performance measurements.
-- [**Custom WebKitGTK & Fedora Upgrade Guide**](patches/README.md) — Notes on optional Clang 2-stage PGO + ThinLTO WebKitGTK builds and future Fedora upgrades.
-- [**AI Agent Rules**](AGENTS.md) — Repository rules for AI coding assistants (never auto-commit or auto-push without explicit user permission).
+- `EXPLORER_DISABLE_TUNING=1 explorer` — bypass all hardware, power, VA-API, and V8 optimizations.
+- `EXPLORER_ALLOW_DGPU=1 explorer` — allow discrete GPU access instead of Optimus D3cold isolation.
+- `EXPLORER_GPU_BACKEND=angle|vulkan|graphite explorer` — select graphics backend (default `angle`).
+- `EXPLORER_CEF_DIR=/custom/cef` — override the CEF runtime directory.

@@ -1,0 +1,18 @@
+[package]
+name = "explorer-shield-brave"
+version = "0.2.0"
+edition = "2024"
+description = "Brave adblock-rust C-ABI static library for Explorer v2"
+
+[lib]
+name = "explorer_shield_brave"
+crate-type = ["staticlib"]
+
+[dependencies]
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
