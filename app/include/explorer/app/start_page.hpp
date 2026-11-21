@@ -15,11 +15,18 @@ inline std::string startPageDataUrl() {
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; background: #080C14; }
+  ::-webkit-scrollbar-track { background: #080C14; }
+  ::-webkit-scrollbar-thumb { background: rgba(56,189,248,0.38); border-radius: 999px; border: 2px solid #080C14; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(56,189,248,0.75); }
+  ::-webkit-scrollbar-button, ::-webkit-scrollbar-corner { display: none; width: 0; height: 0; }
   body {
     background: radial-gradient(circle at 50% 18%, #132038 0%, #080C14 66%);
     color: #F8FAFC;
     font-family: "Adwaita Sans", Inter, system-ui, -apple-system, sans-serif;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     min-height: 100vh;
     display: flex;
     flex-direction: column;

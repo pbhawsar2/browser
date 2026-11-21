@@ -24,6 +24,26 @@ if(NOT DEFINED CEF_ROOT OR "${CEF_ROOT}" STREQUAL "")
 endif()
 
 set(EXPLORER_OPT_FLAGS -O3 -march=native -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+set(EXPLORER_LINK_FLAGS "")
+
+option(EXPLORER_PGO_GENERATE "Build with Clang PGO instrumentation (-fprofile-generate)" OFF)
+set(EXPLORER_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-raw" CACHE PATH "Directory for raw PGO .profraw profiles")
+set(EXPLORER_PGO_USE "" CACHE FILEPATH "Path to merged Clang .profdata file for PGO-optimized build")
+
+if(EXPLORER_PGO_GENERATE)
+    message(STATUS "Explorer PGO Stage 1: Enabling instrumentation -> ${EXPLORER_PGO_DIR}")
+    list(APPEND EXPLORER_OPT_FLAGS "-fprofile-generate=${EXPLORER_PGO_DIR}")
+    list(APPEND EXPLORER_LINK_FLAGS "-fprofile-generate=${EXPLORER_PGO_DIR}")
+elseif(NOT "${EXPLORER_PGO_USE}" STREQUAL "" AND EXISTS "${EXPLORER_PGO_USE}")
+    message(STATUS "Explorer PGO Stage 2: Using profile data -> ${EXPLORER_PGO_USE} (+ ThinLTO)")
+    list(APPEND EXPLORER_OPT_FLAGS
+        "-fprofile-use=${EXPLORER_PGO_USE}"
+        "-Wno-profile-instr-out-of-date"
+        "-Wno-profile-instr-unprofiled"
+        "-flto=thin"
+    )
+    list(APPEND EXPLORER_LINK_FLAGS "-fprofile-use=${EXPLORER_PGO_USE}" "-flto=thin")
+endif()
 
 # ------------------------------------------------------------------------------
 # Module 1: explorer_hal (Hardware Abstraction Layer — zero UI/CEF dependencies)
@@ -38,6 +58,7 @@ add_library(explorer_hal STATIC
 )
 target_include_directories(explorer_hal PUBLIC hal/include)
 target_compile_options(explorer_hal PRIVATE ${EXPLORER_OPT_FLAGS})
+target_link_options(explorer_hal PUBLIC ${EXPLORER_LINK_FLAGS})
 target_link_libraries(explorer_hal PUBLIC PkgConfig::SYSTEMD dl pthread)
 
 # ------------------------------------------------------------------------------
@@ -51,6 +72,7 @@ add_library(explorer_policy STATIC
 )
 target_include_directories(explorer_policy PUBLIC policy/include)
 target_compile_options(explorer_policy PRIVATE ${EXPLORER_OPT_FLAGS})
+target_link_options(explorer_policy PUBLIC ${EXPLORER_LINK_FLAGS})
 target_link_libraries(explorer_policy PUBLIC explorer_hal)
 
 # ------------------------------------------------------------------------------
@@ -62,6 +84,7 @@ add_library(explorer_shield STATIC
 )
 target_include_directories(explorer_shield PUBLIC shield/include)
 target_compile_options(explorer_shield PRIVATE ${EXPLORER_OPT_FLAGS})
+target_link_options(explorer_shield PUBLIC ${EXPLORER_LINK_FLAGS})
 target_link_libraries(explorer_shield PUBLIC "${BRAVE_SHIELD_LIB}" dl pthread m)
 
 # ------------------------------------------------------------------------------
@@ -72,6 +95,7 @@ add_library(explorer_vault STATIC
 )
 target_include_directories(explorer_vault PUBLIC vault/include)
 target_compile_options(explorer_vault PRIVATE ${EXPLORER_OPT_FLAGS})
+target_link_options(explorer_vault PUBLIC ${EXPLORER_LINK_FLAGS})
 target_link_libraries(explorer_vault PUBLIC PkgConfig::CRYPTO)
 
 # ------------------------------------------------------------------------------
@@ -82,6 +106,7 @@ add_library(explorer_webapp STATIC
 )
 target_include_directories(explorer_webapp PUBLIC webapp/include)
 target_compile_options(explorer_webapp PRIVATE ${EXPLORER_OPT_FLAGS})
+target_link_options(explorer_webapp PUBLIC ${EXPLORER_LINK_FLAGS})
 
 # ------------------------------------------------------------------------------
 # Unit Tests (5 Independent SOLID Test Suites)
@@ -110,6 +135,7 @@ if(BUILD_TESTING)
     add_executable(test_app_stores app/tests/test_app_stores.cpp app/src/session_store.cpp)
     target_include_directories(test_app_stores PRIVATE app/include)
     target_compile_options(test_app_stores PRIVATE ${EXPLORER_OPT_FLAGS})
+    target_link_options(test_app_stores PRIVATE ${EXPLORER_LINK_FLAGS})
     add_test(NAME explorer_app_stores_tests COMMAND test_app_stores)
 endif()
 
@@ -129,6 +155,7 @@ if(DEFINED CEF_ROOT AND EXISTS "${CEF_ROOT}/cmake/FindCEF.cmake")
     )
     target_include_directories(explorer_engine PUBLIC engine/include "${CEF_ROOT}")
     target_compile_options(explorer_engine PRIVATE ${EXPLORER_OPT_FLAGS})
+    target_link_options(explorer_engine PUBLIC ${EXPLORER_LINK_FLAGS})
     target_link_libraries(explorer_engine PUBLIC
         explorer_hal
         explorer_policy
@@ -143,6 +170,7 @@ if(DEFINED CEF_ROOT AND EXISTS "${CEF_ROOT}/cmake/FindCEF.cmake")
     )
     target_include_directories(explorer PRIVATE app/include "${CEF_ROOT}")
     target_compile_options(explorer PRIVATE ${EXPLORER_OPT_FLAGS})
+    target_link_options(explorer PRIVATE ${EXPLORER_LINK_FLAGS})
     target_link_libraries(explorer PRIVATE
         explorer_engine
         explorer_vault

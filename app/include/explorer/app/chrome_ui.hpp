@@ -161,6 +161,26 @@ inline std::string topChromeHtmlDataUrl() {
   .mini-pill.key { border-color: rgba(52,211,153,0.42); background: rgba(52,211,153,0.14); color: #6EE7B7; display: none; }
   .mini-pill.key.show { display: inline-flex; }
 
+  .zoom-pill {
+    height: 22px; border-radius: 999px; flex-shrink: 0;
+    border: 1px solid rgba(148, 163, 184, 0.28); background: rgba(19, 28, 44, 0.92);
+    display: inline-flex; align-items: center; overflow: hidden;
+    font-variant-numeric: tabular-nums;
+  }
+  .zoom-pill button {
+    height: 100%; border: none; background: transparent; color: #CBD5E1;
+    font-size: 11px; font-weight: 600; line-height: 1; cursor: pointer;
+    padding: 0 6px; display: inline-flex; align-items: center; justify-content: center;
+    transition: background-color 100ms ease, color 100ms ease;
+  }
+  .zoom-pill button:hover { background: rgba(56, 189, 248, 0.22); color: #FFFFFF; }
+  .zoom-pill button:active { background: rgba(56, 189, 248, 0.36); color: #7DD3FC; }
+  .zoom-pill #btn-zoom-reset {
+    padding: 0 5px; color: #7DD3FC;
+    border-left: 1px solid rgba(148, 163, 184, 0.18);
+    border-right: 1px solid rgba(148, 163, 184, 0.18);
+  }
+
   button.power-pill {
     height: 34px; border-radius: 8px; padding: 0 11px; flex-shrink: 0;
     font-size: 12px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums;
@@ -260,6 +280,11 @@ inline std::string topChromeHtmlDataUrl() {
         </span>
         <input id="url-input" type="text" spellcheck="false" autocomplete="off" placeholder="Search Google or enter URL...">
         <button class="mini-pill key" id="btn-key" title="Saved Encrypted Passwords">Key</button>
+        <div class="zoom-pill" title="Page Zoom (Ctrl - / Ctrl 0 / Ctrl +)">
+          <button type="button" id="btn-zoom-out" title="Zoom Out (Ctrl -)">−</button>
+          <button type="button" id="btn-zoom-reset" title="Reset Zoom (Ctrl 0)">105%</button>
+          <button type="button" id="btn-zoom-in" title="Zoom In (Ctrl +)">+</button>
+        </div>
         <button class="mini-pill" id="btn-shield" title="Brave Adblock Shield (click to manage)">Shield</button>
       </div>
     </div>
@@ -333,6 +358,9 @@ inline std::string topChromeHtmlDataUrl() {
   document.getElementById('btn-hud').onclick = () => send('open_panel', 'power');
   document.getElementById('btn-shield').onclick = () => send('open_panel', 'shield');
   document.getElementById('btn-key').onclick = () => send('open_panel', 'vault');
+  document.getElementById('btn-zoom-out').onclick = () => send('zoom_out');
+  document.getElementById('btn-zoom-reset').onclick = () => send('zoom_reset');
+  document.getElementById('btn-zoom-in').onclick = () => send('zoom_in');
   document.getElementById('btn-downloads').onclick = () => send('open_panel', 'downloads');
   document.getElementById('btn-apps').onclick = () => send('open_panel', 'apps');
   document.getElementById('btn-min').onclick = () => send('win_min');
@@ -411,6 +439,10 @@ inline std::string topChromeHtmlDataUrl() {
     keyBtn.className = 'mini-pill key' + ((s.siteCreds > 0 || s.hasPendingLogin) ? ' show' : '');
     keyBtn.textContent = s.hasPendingLogin ? 'Save Login' : ('Key (' + s.siteCreds + ')');
 
+    if (s.zoomPct) {
+      document.getElementById('btn-zoom-reset').textContent = s.zoomPct + '%';
+    }
+
     document.getElementById('dl-dot').className = 'badge-dot' + (s.activeDownloads > 0 ? ' show' : '');
     window.__updateProgress(s.loading, s.progress);
 
@@ -465,24 +497,30 @@ inline std::string powerHudHtmlDataUrl() {
 <title>Explorer Control Panel</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  ::-webkit-scrollbar { width: 7px; height: 7px; background: #0E1524; }
+  ::-webkit-scrollbar-track { background: #0E1524; }
+  ::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.36); border-radius: 999px; border: 1.5px solid #0E1524; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(56, 189, 248, 0.72); }
+  ::-webkit-scrollbar-button, ::-webkit-scrollbar-corner { display: none; width: 0; height: 0; }
   html, body {
     width: 100%; height: 100%; overflow: hidden;
     background: #0E1524; color: #F8FAFC;
     font-family: "Adwaita Sans", Inter, system-ui, -apple-system, sans-serif;
-    text-rendering: geometricPrecision; -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased;
     border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 12px;
     display: flex; flex-direction: column;
   }
   .top {
-    padding: 10px 12px; display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; display: flex; align-items: center; gap: 6px;
     border-bottom: 1px solid rgba(148, 163, 184, 0.14); flex-shrink: 0;
   }
-  .tabs { display: flex; flex: 1; min-width: 0; gap: 4px; }
+  .tabs { display: flex; flex: 1; min-width: 0; gap: 4px; align-items: center; }
   .tab {
-    flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    flex: 1 0 auto; white-space: nowrap;
     background: transparent; border: 1px solid transparent; border-radius: 7px;
     color: #94A3B8; font-size: 12.5px; font-weight: 600; line-height: 1.2;
-    padding: 6px 4px; cursor: pointer; text-align: center;
+    padding: 6px 9px; cursor: pointer; text-align: center;
+    transition: background-color 110ms ease, color 110ms ease, border-color 110ms ease;
   }
   .tab:hover { color: #F8FAFC; background: #131C2E; }
   .tab.active { background: #18273F; border-color: rgba(56,189,248,0.52); color: #FFFFFF; }
@@ -496,20 +534,20 @@ inline std::string powerHudHtmlDataUrl() {
 
   .body {
     flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px;
-    display: flex; flex-direction: column; gap: 8px;
+    display: flex; flex-direction: column; gap: 9px;
   }
-  .pane { display: none; flex-direction: column; gap: 8px; }
+  .pane { display: none; flex-direction: column; gap: 9px; }
   .pane.active { display: flex; }
 
   .card {
     background: #131C2E; border: 1px solid rgba(148, 163, 184, 0.16);
-    border-radius: 9px; padding: 9px 11px; display: flex; flex-direction: column; gap: 6px;
+    border-radius: 9px; padding: 10px 12px; display: flex; flex-direction: column; gap: 7px;
   }
   .card-title {
     font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
     color: #94A3B8; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; gap: 10px; min-height: 20px; }
+  .row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; gap: 10px; min-height: 22px; }
   .lbl { color: #CBD5E1; font-weight: 500; flex-shrink: 0; white-space: nowrap; }
   .val {
     font-family: ui-monospace, "JetBrains Mono", monospace; font-size: 12.5px; font-weight: 600;
@@ -520,9 +558,9 @@ inline std::string powerHudHtmlDataUrl() {
 
   .toggle-row {
     display: flex; justify-content: space-between; align-items: center; gap: 12px;
-    min-height: 24px; font-size: 13px; font-weight: 500; color: #F1F5F9; cursor: pointer;
+    min-height: 26px; font-size: 13px; font-weight: 500; color: #F1F5F9; cursor: pointer;
   }
-  .toggle-row span { flex: 1; min-width: 0; line-height: 1.25; }
+  .toggle-row span { flex: 1; min-width: 0; line-height: 1.3; }
   .sw {
     width: 38px; height: 21px; border-radius: 999px; background: #334155;
     position: relative; transition: background 130ms ease; border: none; cursor: pointer; flex-shrink: 0;
@@ -536,41 +574,45 @@ inline std::string powerHudHtmlDataUrl() {
   .sw.on.green { background: #34D399; }
 
   .btn {
-    height: 32px; border-radius: 8px; padding: 0 12px;
+    height: 34px; border-radius: 8px; padding: 0 12px;
     background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.44);
-    color: #E0F2FE; font-size: 12.5px; font-weight: 600; line-height: 1;
+    color: #E0F2FE; font-size: 13px; font-weight: 600; line-height: 1;
     cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     display: inline-flex; align-items: center; justify-content: center;
   }
   .btn:hover { background: rgba(56, 189, 248, 0.26); border-color: #38BDF8; color: #FFFFFF; }
   .btn.danger { background: rgba(248,113,113,0.14); border-color: rgba(248,113,113,0.45); color: #FECACA; }
   .btn.danger:hover { background: rgba(248,113,113,0.28); border-color: #F87171; color: #FFFFFF; }
-  .btn.sm { height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
-  .btn-row { display: flex; gap: 6px; width: 100%; }
+  .btn.sm { height: 30px; padding: 0 10px; font-size: 12.5px; border-radius: 6px; }
+  .btn-row { display: flex; gap: 6px; width: 100%; align-items: center; }
   .btn-row .btn { flex: 1; min-width: 0; }
 
   input.field {
-    width: 100%; height: 32px; background: #0B111E; border: 1px solid #334155; border-radius: 7px;
-    padding: 0 10px; color: #FFFFFF; font-size: 12.5px; line-height: 1; outline: none; user-select: text;
+    width: 100%; height: 36px; background: #0B111E; border: 1px solid #334155; border-radius: 7px;
+    padding: 0 12px; color: #FFFFFF; font-size: 14px; font-weight: 500; line-height: 1.2; outline: none; user-select: text;
   }
-  input.field:focus { border-color: #38BDF8; }
+  input.field::placeholder { color: #94A3B8; font-weight: 400; }
+  input.field:focus { border-color: #38BDF8; background: #0F172A; }
 
   .list-item {
-    background: #0D1524; border: 1px solid rgba(148,163,184,0.14); border-radius: 7px;
-    padding: 8px 10px; display: flex; flex-direction: column; gap: 5px; min-width: 0;
+    background: #0D1524; border: 1px solid rgba(148,163,184,0.18); border-radius: 8px;
+    padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0;
   }
   .item-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; }
   .item-name {
-    flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600; line-height: 1.25; color: #FFFFFF;
+    flex: 1; min-width: 0; font-size: 14px; font-weight: 600; line-height: 1.3; color: #FFFFFF;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .item-sub {
-    width: 100%; min-width: 0; font-size: 11.5px; line-height: 1.25; color: #94A3B8;
+    width: 100%; min-width: 0; font-size: 13px; line-height: 1.3; color: #CBD5E1;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .item-stat { flex-shrink: 0; white-space: nowrap; font-family: ui-monospace, "JetBrains Mono", monospace; font-size: 11.5px; font-weight: 600; color: #7DD3FC; }
-  .empty { font-size: 12.5px; color: #94A3B8; text-align: center; padding: 12px 0; }
-  .status-msg { font-size: 12px; line-height: 1.3; color: #6EE7B7; min-height: 16px; word-break: break-word; }
+  .item-stat {
+    flex-shrink: 0; white-space: nowrap; font-family: ui-monospace, "JetBrains Mono", monospace;
+    font-size: 13px; font-weight: 600; line-height: 1.3; color: #7DD3FC;
+  }
+  .empty { font-size: 13px; color: #94A3B8; text-align: center; padding: 12px 0; }
+  .status-msg { font-size: 12.5px; line-height: 1.35; color: #6EE7B7; min-height: 16px; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -601,7 +643,16 @@ inline std::string powerHudHtmlDataUrl() {
       </div>
 
       <div class="card">
-        <div class="card-title">Power &amp; Display Governor</div>
+        <div class="card-title">Power, Display &amp; Zoom Governor</div>
+        <div class="row">
+          <span class="lbl">Page Zoom</span>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <button class="btn sm" type="button" style="flex:0 0 30px; padding:0;" onclick="send('zoom_out')" title="Zoom Out (Ctrl -)">−</button>
+            <span class="val cyan" id="v-zoom" style="min-width:46px; text-align:center;">105%</span>
+            <button class="btn sm" type="button" style="flex:0 0 30px; padding:0;" onclick="send('zoom_in')" title="Zoom In (Ctrl +)">+</button>
+            <button class="btn sm" type="button" style="flex:0 0 auto;" onclick="send('zoom_reset')" title="Reset Zoom (Ctrl 0)">Reset</button>
+          </div>
+        </div>
         <div class="toggle-row" onclick="send('toggle_turbo')">
           <span>AC Turbo Performance Hold (PPD)</span>
           <button class="sw" id="sw-turbo" type="button"></button>
@@ -787,7 +838,10 @@ inline std::string powerHudHtmlDataUrl() {
       document.getElementById('tab-' + t).className = 'tab' + (t === name ? ' active' : '');
       document.getElementById('pane-' + t).className = 'pane' + (t === name ? ' active' : '');
     }
-    if (notify) send('hud_tab_select', name);
+    if (notify) {
+      document.getElementById('status-msg').textContent = '';
+      send('hud_tab_select', name);
+    }
   }
   window.__selectTab = (name) => switchTab(name, false);
 
@@ -823,6 +877,10 @@ inline std::string powerHudHtmlDataUrl() {
     dgpuEl.className = 'val ' + ((h.dgpu || '').startsWith('suspended') ? 'ok' : 'warn');
     document.getElementById('v-fan').textContent = h.fan || '—';
     document.getElementById('v-power').textContent = h.power || '—';
+    if (h.zoomPct) {
+      const zEl = document.getElementById('v-zoom');
+      if (zEl) zEl.textContent = h.zoomPct + '%';
+    }
     document.getElementById('status-msg').textContent = h.statusMsg || '';
 
     const origField = document.getElementById('v-origin');

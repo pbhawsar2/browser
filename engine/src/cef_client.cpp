@@ -92,7 +92,7 @@ ExplorerCefClient::ExplorerCefClient(
     : tab_id_(tab_id),
       observer_(observer),
       shield_(std::move(shield)),
-      default_zoom_level_(explorer::policy::zoomFactorToCefLevel(default_zoom_factor)) {}
+      current_zoom_level_(explorer::policy::zoomFactorToCefLevel(default_zoom_factor)) {}
 
 bool ExplorerCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
                                                  CefRefPtr<CefFrame> /*frame*/,
@@ -134,7 +134,7 @@ bool ExplorerCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser
 void ExplorerCefClient::OnAfterCreated(CefRefPtr<CefBrowser> browser) {
     CEF_REQUIRE_UI_THREAD();
     if (browser && browser->GetHost()) {
-        browser->GetHost()->SetZoomLevel(default_zoom_level_);
+        browser->GetHost()->SetZoomLevel(current_zoom_level_);
     }
     if (observer_) {
         observer_->onTabCreated(tab_id_);
@@ -243,9 +243,9 @@ void ExplorerCefClient::OnLoadStart(CefRefPtr<CefBrowser> browser,
                                     TransitionType /*transition_type*/) {
     CEF_REQUIRE_UI_THREAD();
     if (browser && frame && frame->IsMain() && browser->GetHost()) {
-        // Re-apply default 1.05x zoom cleanly if at neutral 0.0
-        if (browser->GetHost()->GetZoomLevel() == 0.0) {
-            browser->GetHost()->SetZoomLevel(default_zoom_level_);
+        // Maintain the tab's active zoom level consistently across navigations
+        if (std::abs(browser->GetHost()->GetZoomLevel() - current_zoom_level_) > 1e-4) {
+            browser->GetHost()->SetZoomLevel(current_zoom_level_);
         }
     }
 }

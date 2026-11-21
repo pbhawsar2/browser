@@ -238,6 +238,46 @@ public:
             static const char* kPageUxHooksJs = R"JS((() => {
                 if (window.__explorerUxWired) return;
                 window.__explorerUxWired = true;
+                const kCssText =
+                    '::-webkit-scrollbar{width:8px!important;height:8px!important;background:#080C14!important;}' +
+                    '::-webkit-scrollbar-track{background:#080C14!important;border-left:1px solid rgba(148,163,184,0.12)!important;}' +
+                    '::-webkit-scrollbar-thumb{background:rgba(56,189,248,0.40)!important;border-radius:999px!important;border:2px solid #080C14!important;}' +
+                    '::-webkit-scrollbar-thumb:hover{background:rgba(56,189,248,0.75)!important;}' +
+                    '::-webkit-scrollbar-thumb:active{background:#38BDF8!important;}' +
+                    '::-webkit-scrollbar-button,::-webkit-scrollbar-corner{display:none!important;width:0!important;height:0!important;}' +
+                    'html,body{-webkit-font-smoothing:antialiased!important;-moz-osx-font-smoothing:grayscale!important;text-rendering:optimizeLegibility!important;}';
+                let adoptedApplied = false;
+                const injectThemeCss = () => {
+                    try {
+                        if (document.documentElement) {
+                            document.documentElement.style.setProperty('-webkit-font-smoothing', 'antialiased');
+                            document.documentElement.style.setProperty('text-rendering', 'optimizeLegibility');
+                        }
+                        if (!adoptedApplied && document.adoptedStyleSheets && typeof CSSStyleSheet !== 'undefined') {
+                            const sheet = new CSSStyleSheet();
+                            sheet.replaceSync(kCssText);
+                            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+                            adoptedApplied = true;
+                        }
+                        if (!document.getElementById('__explorer_theme_css')) {
+                            const root = document.head || document.documentElement;
+                            if (root) {
+                                const st = document.createElement('style');
+                                st.id = '__explorer_theme_css';
+                                const nEl = document.querySelector('style[nonce],script[nonce],link[nonce]');
+                                if (nEl && (nEl.nonce || nEl.getAttribute('nonce'))) {
+                                    st.setAttribute('nonce', nEl.nonce || nEl.getAttribute('nonce'));
+                                }
+                                st.textContent = kCssText;
+                                root.appendChild(st);
+                            }
+                        }
+                    } catch {}
+                };
+                injectThemeCss();
+                document.addEventListener('readystatechange', injectThemeCss);
+                document.addEventListener('DOMContentLoaded', injectThemeCss, { once: true });
+                window.addEventListener('load', injectThemeCss, { once: true });
                 let lastY = window.scrollY || 0;
                 let hidden = false;
                 let ticking = false;
@@ -255,6 +295,7 @@ public:
                     try { if (typeof __expTopbarReveal === 'function') __expTopbarReveal(!!reveal); } catch {}
                 };
                 window.addEventListener('scroll', () => {
+                    if (!document.getElementById('__explorer_theme_css')) injectThemeCss();
                     if (ticking) return;
                     ticking = true;
                     requestAnimationFrame(() => {

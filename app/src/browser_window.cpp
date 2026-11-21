@@ -353,8 +353,8 @@ private:
 
 class HudOverlayViewDelegate : public CefBrowserViewDelegate {
 public:
-    CefSize GetPreferredSize(CefRefPtr<CefView> /*view*/) override { return CefSize(440, 556); }
-    CefSize GetMinimumSize(CefRefPtr<CefView> /*view*/) override { return CefSize(440, 556); }
+    CefSize GetPreferredSize(CefRefPtr<CefView> /*view*/) override { return CefSize(488, 580); }
+    CefSize GetMinimumSize(CefRefPtr<CefView> /*view*/) override { return CefSize(488, 580); }
     cef_runtime_style_t GetBrowserRuntimeStyle() override { return CEF_RUNTIME_STYLE_ALLOY; }
 
 private:
@@ -663,6 +663,7 @@ void BrowserWindow::openNewTab(const std::string& url, bool activate) {
     entry.id = id;
     entry.url = url;
     entry.title = (url.rfind("data:", 0) == 0) ? "New Tab" : url;
+    entry.zoom_factor = cfg_.default_zoom;
     entry.client = client;
     entry.view = bview;
 
@@ -870,6 +871,7 @@ void BrowserWindow::pushChromeState() {
     std::string shown_url;
     bool can_back = false, can_fwd = false, loading = false;
     double progress = 0.0;
+    int zoom_pct = static_cast<int>(std::lround(cfg_.default_zoom * 100.0));
     size_t site_creds = 0;
 
     if (active) {
@@ -878,6 +880,7 @@ void BrowserWindow::pushChromeState() {
         can_fwd = active->can_fwd;
         loading = active->loading;
         progress = active->progress;
+        zoom_pct = static_cast<int>(std::lround(active->zoom_factor * 100.0));
         if (services_.vault && !shown_url.empty()) {
             site_creds = services_.vault->findForOrigin(shown_url).size();
         }
@@ -909,6 +912,7 @@ void BrowserWindow::pushChromeState() {
        << "\"canFwd\":" << (can_fwd ? "true" : "false") << ","
        << "\"loading\":" << (loading ? "true" : "false") << ","
        << "\"progress\":" << progress << ","
+       << "\"zoomPct\":" << zoom_pct << ","
        << "\"adblockOn\":" << (adblock_on ? "true" : "false") << ","
        << "\"blocked\":" << blocked << ","
        << "\"siteCreds\":" << site_creds << ","
@@ -1023,6 +1027,7 @@ void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
     auto* active = activeTabEntry();
     std::string cur_origin = active ? explorer::vault::AesGcmPasswordVault::normalizeOrigin(active->url) : "";
     std::string cur_title = (active && active->title != "New Tab") ? active->title : "";
+    int zoom_pct = static_cast<int>(std::lround((active ? active->zoom_factor : cfg_.default_zoom) * 100.0));
 
     bool adblock_on = services_.shield ? services_.shield->isEnabled() : false;
     uint64_t blocked = services_.shield ? services_.shield->blockedCount() : 0;
@@ -1034,6 +1039,7 @@ void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
        << "\"autohide\":" << (prefs_.autohide_topbar ? "true" : "false") << ","
        << "\"batteryMode\":" << (power_policy_.isBatteryMode() ? "true" : "false") << ","
        << "\"cinema60\":" << (power_policy_.cinema60Hz() ? "true" : "false") << ","
+       << "\"zoomPct\":" << zoom_pct << ","
        << "\"rules\":" << rules << ","
        << "\"blocked\":" << blocked << ","
        << "\"cpu\":\"" << jsonEscape(cpu_str) << "\","
@@ -1135,7 +1141,14 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             setHudVisible(true, target_tab);
         }
     } else if (cmd == "hud_tab_select") {
+        status_msg_.clear();
         if (!arg.empty()) active_hud_tab_ = arg;
+    } else if (cmd == "zoom_in") {
+        onTabShortcut(explorer::engine::ShortcutAction::ZoomIn);
+    } else if (cmd == "zoom_out") {
+        onTabShortcut(explorer::engine::ShortcutAction::ZoomOut);
+    } else if (cmd == "zoom_reset") {
+        onTabShortcut(explorer::engine::ShortcutAction::ZoomReset);
     } else if (cmd == "close_hud") {
         setHudVisible(false);
     } else if (cmd == "toggle_adblock" && services_.shield) {
@@ -1647,20 +1660,33 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
             if (b && b->CanGoForward()) b->GoForward();
             break;
         case A::ZoomIn:
-            if (b && b->GetHost()) {
-                double cur = explorer::policy::cefLevelToZoomFactor(b->GetHost()->GetZoomLevel());
-                b->GetHost()->SetZoomLevel(explorer::policy::zoomFactorToCefLevel(std::clamp(cur + 0.1, 0.3, 3.0)));
+            if (t && b && b->GetHost()) {
+                t->zoom_factor = std::clamp(std::round((t->zoom_factor + 0.1) * 100.0) / 100.0, 0.3, 3.0);
+                double lvl = explorer::policy::zoomFactorToCefLevel(t->zoom_factor);
+                if (t->client) t->client->setZoomLevel(lvl);
+                b->GetHost()->SetZoomLevel(lvl);
+                pushChromeState();
+                if (hud_visible_) pushHudState(last_snap_);
             }
             break;
         case A::ZoomOut:
-            if (b && b->GetHost()) {
-                double cur = explorer::policy::cefLevelToZoomFactor(b->GetHost()->GetZoomLevel());
-                b->GetHost()->SetZoomLevel(explorer::policy::zoomFactorToCefLevel(std::clamp(cur - 0.1, 0.3, 3.0)));
+            if (t && b && b->GetHost()) {
+                t->zoom_factor = std::clamp(std::round((t->zoom_factor - 0.1) * 100.0) / 100.0, 0.3, 3.0);
+                double lvl = explorer::policy::zoomFactorToCefLevel(t->zoom_factor);
+                if (t->client) t->client->setZoomLevel(lvl);
+                b->GetHost()->SetZoomLevel(lvl);
+                pushChromeState();
+                if (hud_visible_) pushHudState(last_snap_);
             }
             break;
         case A::ZoomReset:
-            if (b && b->GetHost()) {
-                b->GetHost()->SetZoomLevel(explorer::policy::zoomFactorToCefLevel(cfg_.default_zoom));
+            if (t && b && b->GetHost()) {
+                t->zoom_factor = cfg_.default_zoom;
+                double lvl = explorer::policy::zoomFactorToCefLevel(t->zoom_factor);
+                if (t->client) t->client->setZoomLevel(lvl);
+                b->GetHost()->SetZoomLevel(lvl);
+                pushChromeState();
+                if (hud_visible_) pushHudState(last_snap_);
             }
             break;
         case A::ToggleFullscreen:

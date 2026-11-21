@@ -49,6 +49,7 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         "ParallelDownloading",
         "WaylandPerSurfaceScale",
         "WaylandUiScale",
+        "OverlayScrollbars",
         "WebAssemblyTiering",
         "WebAssemblyDynamicTiering",
         "V8VmFuture",
@@ -100,8 +101,11 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
     // Prevent WebRTC from leaking local private LAN IPs while keeping video calls working.
     cmd->AppendSwitchWithValue("webrtc-ip-handling-policy", "default_public_interface_only");
 
-    // 3. Hardware VA-API VCN decode + Wayland fractional scaling + BFCache + HTTP/3 + V8/WASM tiering.
+    // 3. Hardware VA-API VCN decode + Wayland fractional scaling + crisp typography + BFCache + HTTP/3 + V8/WASM tiering.
     cmd->AppendSwitch("enable-quic");
+    cmd->AppendSwitch("enable-font-antialiasing");
+    cmd->AppendSwitchWithValue("font-render-hinting", "medium");
+    cmd->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
     cmd->AppendSwitchWithValue("num-raster-threads", "4");
     cmd->AppendSwitchWithValue("renderer-process-limit", "8");
 

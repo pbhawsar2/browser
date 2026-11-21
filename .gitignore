@@ -2,6 +2,7 @@
 /build/
 /shield-brave/target/
 /cef-znver3-build/
+/pgo/*.profraw
 **/*.rs.bk
 
 # Editor / IDE / OS clutter

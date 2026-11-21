@@ -26,7 +26,7 @@ if [[ "$ROLLBACK" -eq 1 ]]; then
         echo "No previous CEF backup found at $BACKUP_DIR" >&2
         exit 1
     fi
-    pkill -f "explorer-cef/Release/explorer" 2>/dev/null || true
+    pkill -x "explorer" 2>/dev/null || true
     sleep 0.3
     rm -rf "$CEF_DIR"
     mv "$BACKUP_DIR" "$CEF_DIR"
@@ -81,7 +81,7 @@ cp -a "$SRC/cmake" "$SRC/include" "$SRC/libcef_dll" "$SRC/Release" "$SRC/Resourc
 echo "$NEW_VER" > "$STAGE/final/CEF_VERSION"
 
 # Atomic swap preserving user profile, encrypted vault, cookies, and installed WebApps
-pkill -f "explorer-cef/Release/explorer" 2>/dev/null || true
+pkill -x "explorer" 2>/dev/null || true
 sleep 0.4
 rm -rf "$BACKUP_DIR"
 if [[ -d "$CEF_DIR" ]]; then

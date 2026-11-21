@@ -115,6 +115,7 @@ public:
                            CefRefPtr<CefDownloadItemCallback> callback) override;
 
     void cancelDownload(uint32_t download_id);
+    void setZoomLevel(double cef_zoom_level) { current_zoom_level_ = cef_zoom_level; }
 
     // CefKeyboardHandler
     bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
@@ -128,7 +129,7 @@ private:
     uint64_t tab_id_;
     ITabObserver* observer_;
     std::shared_ptr<const explorer::shield::IContentShield> shield_;
-    double default_zoom_level_;
+    double current_zoom_level_;
     std::unordered_map<uint32_t, CefRefPtr<CefDownloadItemCallback>> active_downloads_;
 
     IMPLEMENT_REFCOUNTING(ExplorerCefClient);

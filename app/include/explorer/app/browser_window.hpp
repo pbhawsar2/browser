@@ -115,6 +115,7 @@ private:
         std::string title = "New Tab";
         std::string favicon;
         double progress = 0.0;
+        double zoom_factor = 1.05;
         bool loading = false;
         bool can_back = false;
         bool can_fwd = false;
