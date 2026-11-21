@@ -80,7 +80,9 @@ void AmdCezanneGpuIsolator::applyIsolationEnv(const std::string& vendor, bool al
     // Scoped strictly to Optimus isolation so EXPLORER_ALLOW_DGPU=1 remains free to use NVDEC.
     if (vendor == "0x1002") {
         setEnvDefault("LIBVA_DRIVER_NAME", "radeonsi");
-        setEnvDefault("LIBVA_DRIVERS_PATH", "/usr/lib64/dri-freeworld:/usr/lib64/dri");
+        if (fs::exists("/usr/lib64/dri-freeworld", ec) || fs::exists("/usr/lib64/dri", ec)) {
+            setEnvDefault("LIBVA_DRIVERS_PATH", "/usr/lib64/dri-freeworld:/usr/lib64/dri");
+        }
         if (fs::exists("/usr/share/vulkan/icd.d/radeon_icd.x86_64.json", ec)) {
             setEnvDefault("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json");
             setEnvDefault("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json");

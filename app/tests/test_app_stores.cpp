@@ -40,6 +40,8 @@ int main() {
     CHECK(reloaded.adblock_enabled == false);
     CHECK(reloaded.autohide_topbar == true);
     CHECK(reloaded.save_cookies == true);
+    auto prefs_perms = fs::status(tmp_dir / "prefs.json", ec).permissions();
+    CHECK((prefs_perms & fs::perms::others_all) == fs::perms::none);
 
     // 2. SessionStore atomic write + active index preservation
     SessionStore sess_store(tmp_dir / "session.json");

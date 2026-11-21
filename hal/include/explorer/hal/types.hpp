@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace explorer::hal {
 
@@ -47,18 +48,21 @@ struct HardwareProfile {
     VaCapabilities va_caps;
 };
 
-/// Live thermal, power, iGPU, fan, CPU, and Optimus dGPU state.
+/// Live thermal, power, iGPU, fan, CPU, battery, and Optimus dGPU state.
 struct TelemetrySnapshot {
     bool on_battery = false;
     float cpu_percent = 0.0f;
     std::optional<float> cpu_temp_c;
     std::optional<float> pkg_watts;
     std::optional<float> batt_watts;
+    std::optional<uint32_t> batt_capacity_pct;
+    std::optional<std::string> batt_status_str;
     std::optional<uint32_t> igpu_busy;
     std::optional<uint32_t> igpu_mhz;
     std::optional<float> igpu_temp_c;
     std::optional<float> igpu_watts;
     std::optional<uint32_t> fan_rpm;
+    std::vector<uint32_t> fan_rpms;
     std::optional<std::string> dgpu_state;
 };
 

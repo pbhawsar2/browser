@@ -26,6 +26,7 @@ public:
 private:
     std::optional<std::filesystem::path> ac_online_;
     std::optional<std::filesystem::path> batt_status_;
+    std::optional<std::filesystem::path> batt_capacity_;
     std::optional<std::filesystem::path> batt_power_uw_;
     std::optional<std::filesystem::path> batt_volt_uv_;
     std::optional<std::filesystem::path> batt_curr_ua_;

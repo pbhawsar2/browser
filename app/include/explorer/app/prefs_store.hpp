@@ -1,6 +1,8 @@
 #pragma once
 // Persistent user preferences (adblock toggle, auto-hide top bar on scroll, cookie persistence).
 
+#include <sys/stat.h>
+
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -50,7 +52,9 @@ public:
                 << "}\n";
             out.flush();
         }
+        ::chmod(tmp.c_str(), 0600);
         std::filesystem::rename(tmp, file_path_, ec);
+        ::chmod(file_path_.c_str(), 0600);
     }
 
 private:

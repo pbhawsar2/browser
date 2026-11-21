@@ -54,6 +54,7 @@ public:
     virtual void onTabShortcut(ShortcutAction action) = 0;
     virtual void onTabDownloadUpdated(const DownloadRecord& record) = 0;
     virtual void onTabScrollRevealTopBar(uint64_t tab_id, bool reveal) = 0;
+    virtual void onTabMediaStateChanged(uint64_t /*tab_id*/, bool /*playing*/) {}
     virtual void onTabLoginSubmitted(const std::string& origin,
                                      const std::string& username,
                                      const std::string& password) = 0;

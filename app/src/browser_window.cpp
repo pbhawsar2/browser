@@ -15,13 +15,19 @@
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
 
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -50,7 +56,8 @@ constexpr int kAccelQuit = 116;
 std::string jsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -62,12 +69,31 @@ std::string jsonEscape(const std::string& s) {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
+                } else if (c == 0xE2 && i + 2 < s.size() &&
+                           static_cast<unsigned char>(s[i + 1]) == 0x80 &&
+                           (static_cast<unsigned char>(s[i + 2]) == 0xA8 ||
+                            static_cast<unsigned char>(s[i + 2]) == 0xA9)) {
+                    out += (static_cast<unsigned char>(s[i + 2]) == 0xA8) ? "\\u2028" : "\\u2029";
+                    i += 2;
                 } else {
                     out.push_back(static_cast<char>(c));
                 }
         }
     }
     return out;
+}
+
+void appendUtf8Codepoint(std::string& out, uint32_t cp) {
+    if (cp <= 0x7F) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
 }
 
 /// Extracts a string value for `"key":"..."` from simple flat JSON payloads sent by our trusted HUD.
@@ -83,7 +109,28 @@ std::string extractJsonField(const std::string& json, const std::string& key) {
             if (nxt == 'n') out.push_back('\n');
             else if (nxt == 'r') out.push_back('\r');
             else if (nxt == 't') out.push_back('\t');
-            else out.push_back(nxt);
+            else if (nxt == 'b') out.push_back('\b');
+            else if (nxt == 'f') out.push_back('\f');
+            else if (nxt == 'u' && i + 4 < json.size()) {
+                uint32_t cp = 0;
+                bool ok = true;
+                for (int k = 1; k <= 4; ++k) {
+                    unsigned char hc = static_cast<unsigned char>(json[i + k]);
+                    cp <<= 4;
+                    if (hc >= '0' && hc <= '9') cp |= (hc - '0');
+                    else if (hc >= 'a' && hc <= 'f') cp |= (hc - 'a' + 10);
+                    else if (hc >= 'A' && hc <= 'F') cp |= (hc - 'A' + 10);
+                    else { ok = false; break; }
+                }
+                if (ok) {
+                    appendUtf8Codepoint(out, cp);
+                    i += 4;
+                } else {
+                    out.push_back('u');
+                }
+            } else {
+                out.push_back(nxt);
+            }
             ++i;
         } else if (json[i] == '"') {
             break;
@@ -94,14 +141,119 @@ std::string extractJsonField(const std::string& json, const std::string& key) {
     return out;
 }
 
+void cleanseSecret(std::string& s) {
+    volatile char* p = s.data();
+    for (size_t i = 0; i < s.size(); ++i) {
+        p[i] = '\0';
+    }
+    s.clear();
+}
+
+class GuardedUiTask : public CefTask {
+public:
+    GuardedUiTask(std::shared_ptr<std::atomic<bool>> token, std::function<void()> fn)
+        : token_(std::move(token)), fn_(std::move(fn)) {}
+
+    void Execute() override {
+        if (token_ && token_->load() && fn_) {
+            fn_();
+        }
+    }
+
+private:
+    std::shared_ptr<std::atomic<bool>> token_;
+    std::function<void()> fn_;
+    IMPLEMENT_REFCOUNTING(GuardedUiTask);
+};
+
 void spawnDetachedXdgOpen(const std::string& target) {
     if (target.empty()) return;
+    const char* arg = target.c_str();
     pid_t pid = ::fork();
+    if (pid < 0) return;
     if (pid == 0) {
         ::setsid();
-        ::execlp("xdg-open", "xdg-open", target.c_str(), nullptr);
+        pid_t grandchild = ::fork();
+        if (grandchild == 0) {
+            ::execlp("xdg-open", "xdg-open", arg, nullptr);
+            ::_exit(127);
+        }
+        ::_exit(0);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+bool runPasswordVerifierHelper(const char* helper_path,
+                               const char* const argv[],
+                               const char* pass_bytes,
+                               size_t pass_len,
+                               bool append_newline) {
+    if (::access(helper_path, X_OK) != 0) return false;
+    int pipefd[2]{-1, -1};
+    if (::pipe(pipefd) != 0) return false;
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        ::close(pipefd[1]);
+        ::dup2(pipefd[0], STDIN_FILENO);
+        ::close(pipefd[0]);
+        int devnull = ::open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            ::close(devnull);
+        }
+        ::execv(helper_path, const_cast<char* const*>(argv));
         ::_exit(127);
     }
+
+    ::close(pipefd[0]);
+    size_t off = 0;
+    while (off < pass_len) {
+        ssize_t n = ::write(pipefd[1], pass_bytes + off, pass_len - off);
+        if (n <= 0) break;
+        off += static_cast<size_t>(n);
+    }
+    char term = append_newline ? '\n' : '\0';
+    (void)::write(pipefd[1], &term, 1);
+    ::close(pipefd[1]);
+
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/// Verifies the current Linux user's login/sudo password against PAM (`unix_chkpwd` or `sudo`).
+bool verifyLinuxSystemPassword(const std::string& sys_password) {
+    if (sys_password.empty()) return false;
+
+    std::string username;
+    if (struct passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_name) {
+        username = pw->pw_name;
+    } else if (const char* env_u = std::getenv("USER"); env_u && env_u[0]) {
+        username = env_u;
+    }
+
+    const char* chkpwd_bins[] = {"/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd", "/usr/bin/unix_chkpwd"};
+    for (const char* bin : chkpwd_bins) {
+        if (::access(bin, X_OK) != 0 || username.empty()) continue;
+        const char* argv_user[] = {bin, username.c_str(), "nullok", nullptr};
+        return runPasswordVerifierHelper(bin, argv_user, sys_password.data(), sys_password.size(), false);
+    }
+
+    if (::access("/usr/bin/sudo", X_OK) == 0) {
+        const char* argv_sudo[] = {"/usr/bin/sudo", "-k", "-S", "-p", "", "/usr/bin/true", nullptr};
+        return runPasswordVerifierHelper("/usr/bin/sudo", argv_sudo, sys_password.data(), sys_password.size(), true);
+    }
+    return false;
 }
 
 CefRefPtr<CefImage> loadAppIconImage(const std::string& app_id) {
@@ -157,6 +309,14 @@ public:
     bool CanMinimize(CefRefPtr<CefWindow> /*window*/) override { return true; }
     CefSize GetPreferredSize(CefRefPtr<CefView> /*view*/) override { return CefSize(1280, 820); }
     cef_runtime_style_t GetWindowRuntimeStyle() override { return CEF_RUNTIME_STYLE_ALLOY; }
+    bool GetLinuxWindowProperties(CefRefPtr<CefWindow> /*window*/,
+                                  CefLinuxWindowProperties& properties) override {
+        std::string app_id = owner_ ? owner_->linuxAppId() : "explorer";
+        CefString(&properties.wayland_app_id).FromString(app_id);
+        CefString(&properties.wm_class_class).FromString(app_id);
+        CefString(&properties.wm_class_name).FromString(app_id);
+        return true;
+    }
 
 private:
     BrowserWindow* owner_;
@@ -222,7 +382,11 @@ BrowserWindow::BrowserWindow(WindowLaunchConfig cfg, RuntimeServices services)
 }
 
 BrowserWindow::~BrowserWindow() {
-    alive_.store(false);
+    life_token_->store(false);
+    if (pending_login_) {
+        cleanseSecret(pending_login_->password);
+        pending_login_.reset();
+    }
     if (chrome_client_) chrome_client_->detach();
     if (hud_client_) hud_client_->detach();
     for (auto& t : tabs_) {
@@ -231,6 +395,8 @@ BrowserWindow::~BrowserWindow() {
     for (auto& [id, rt] : retiring_tabs_) {
         if (rt.client) rt.client->detachObserver();
     }
+    if (services_.power_gov) services_.power_gov->shutdown();
+    if (services_.display_ctrl) services_.display_ctrl->shutdown();
 }
 
 void BrowserWindow::show() {
@@ -354,34 +520,38 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
 
     window_->Show();
 
-    CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::syncSystemPower, base::Unretained(this)), 150);
+    auto tok = life_token_;
+    CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { syncSystemPower(); }), 150);
 
     if (services_.power_gov) {
-        services_.power_gov->startBatteryWatcher([this](bool on_batt) {
-            if (alive_.load()) {
-                CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::onPowerSourceChangedFromThread,
-                                                   base::Unretained(this), on_batt));
+        services_.power_gov->startBatteryWatcher([this, tok](bool on_batt) {
+            if (tok->load()) {
+                CefPostTask(TID_UI, new GuardedUiTask(tok, [this, on_batt]() {
+                    onPowerSourceChangedFromThread(on_batt);
+                }));
             }
         });
     }
     if (services_.display_ctrl) {
-        services_.display_ctrl->startMonitorsChangedWatcher([this]() {
-            if (alive_.load()) {
-                CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::syncSystemPower, base::Unretained(this)));
+        services_.display_ctrl->startMonitorsChangedWatcher([this, tok]() {
+            if (tok->load()) {
+                CefPostTask(TID_UI, new GuardedUiTask(tok, [this]() { syncSystemPower(); }));
             }
         });
     }
 
     // Skip periodic telemetry polling in pure chromeless --app= mode (zero bezel/HUD).
     if (!is_app_mode) {
-        CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::onTelemetryTick, base::Unretained(this)), 2000);
+        CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 2000);
     }
 }
 
 void BrowserWindow::handleWindowDestroyed() {
     CEF_REQUIRE_UI_THREAD();
-    alive_.store(false);
-    flushSessionNow();
+    life_token_->store(false);
+    if (!session_flushed_on_close_) {
+        flushSessionNow();
+    }
 
     if (services_.throttler) {
         for (const auto& t : throttle_planner_.releaseAll()) {
@@ -398,10 +568,36 @@ void BrowserWindow::handleWindowDestroyed() {
 
 bool BrowserWindow::handleCanClose() {
     CEF_REQUIRE_UI_THREAD();
-    if (!closing_) {
-        closing_ = true;
+    if (!session_flushed_on_close_) {
         flushSessionNow();
+        session_flushed_on_close_ = true;
+        session_dirty_ = false;
+    }
+    closing_ = true;
 
+    // Snapshot browser handles before calling TryCloseBrowser() so synchronous OnBeforeClose
+    // callbacks cannot invalidate tabs_ or retiring_tabs_ iterators.
+    std::vector<CefRefPtr<CefBrowser>> browsers;
+    browsers.reserve(tabs_.size() + retiring_tabs_.size());
+    for (auto& t : tabs_) {
+        if (t.view && t.view->GetBrowser()) {
+            browsers.push_back(t.view->GetBrowser());
+        }
+    }
+    for (auto& [id, rt] : retiring_tabs_) {
+        if (rt.view && rt.view->GetBrowser()) {
+            browsers.push_back(rt.view->GetBrowser());
+        }
+    }
+
+    bool all_ready = true;
+    for (auto& b : browsers) {
+        if (b && b->GetHost() && !b->GetHost()->TryCloseBrowser()) {
+            all_ready = false;
+        }
+    }
+
+    if (all_ready) {
         if (hud_overlay_) {
             hud_overlay_->Destroy();
             hud_overlay_ = nullptr;
@@ -414,22 +610,6 @@ bool BrowserWindow::handleCanClose() {
             if (root_panel_) root_panel_->RemoveChildView(chrome_view_);
             if (auto cb = chrome_view_->GetBrowser()) cb->GetHost()->CloseBrowser(true);
             chrome_view_ = nullptr;
-        }
-    }
-
-    bool all_ready = true;
-    for (auto& t : tabs_) {
-        if (t.view && t.view->GetBrowser()) {
-            if (!t.view->GetBrowser()->GetHost()->TryCloseBrowser()) {
-                all_ready = false;
-            }
-        }
-    }
-    for (auto& [id, rt] : retiring_tabs_) {
-        if (rt.view && rt.view->GetBrowser()) {
-            if (!rt.view->GetBrowser()->GetHost()->TryCloseBrowser()) {
-                all_ready = false;
-            }
         }
     }
     return all_ready;
@@ -501,6 +681,14 @@ void BrowserWindow::openNewTab(const std::string& url, bool activate) {
 
 void BrowserWindow::activateTab(uint64_t tab_id) {
     CEF_REQUIRE_UI_THREAD();
+    if (active_tab_id_ != 0 && active_tab_id_ != tab_id) {
+        if (find_visible_) {
+            if (auto* prev = activeTabEntry(); prev && prev->view && prev->view->GetBrowser()) {
+                prev->view->GetBrowser()->GetHost()->StopFinding(true);
+            }
+        }
+        html_fullscreen_ = false;
+    }
     setHudVisible(false);
     scroll_hidden_ = false;
     active_tab_id_ = tab_id;
@@ -564,7 +752,7 @@ void BrowserWindow::closeTab(uint64_t tab_id) {
 
 void BrowserWindow::finishRetireTab(uint64_t tab_id) {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load()) return;
+    if (!life_token_->load()) return;
     auto rit = retiring_tabs_.find(tab_id);
     if (rit == retiring_tabs_.end()) return;
     // Dropping the detached CefBrowserView tears down the child browser cleanly and fires OnBeforeClose.
@@ -624,16 +812,28 @@ void BrowserWindow::setHudVisible(bool visible, const std::string& tab) {
     hud_visible_ = visible;
     hud_overlay_->SetVisible(visible);
     if (visible) {
-        if (!tab.empty()) pending_hud_tab_ = tab;
+        if (!tab.empty()) {
+            active_hud_tab_ = tab;
+            pending_hud_tab_ = tab;
+        }
+        if (changed) {
+            last_hud_sig_.clear();
+        }
         if (services_.telemetry) last_snap_ = services_.telemetry->sample();
         pushHudState(last_snap_);
-        if (!tab.empty() && hud_ready_ && hud_view_ && hud_view_->GetBrowser()) {
+        if (!pending_hud_tab_.empty() && hud_ready_ && hud_view_ && hud_view_->GetBrowser()) {
             hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
-                "window.__selectTab('" + jsonEscape(tab) + "');", "explorer://hud", 0);
+                "window.__selectTab('" + jsonEscape(pending_hud_tab_) + "');", "explorer://hud", 0);
             pending_hud_tab_.clear();
         }
         if (hud_view_) hud_view_->RequestFocus();
     } else if (changed) {
+        if (hud_ready_ && hud_view_ && hud_view_->GetBrowser()) {
+            hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
+                "if(typeof clearRevealedPasswords==='function')clearRevealedPasswords();"
+                "if(typeof cancelVaultAuth==='function')cancelVaultAuth();",
+                "explorer://hud", 0);
+        }
         if (auto* t = activeTabEntry(); t && t->view) t->view->RequestFocus();
     }
 }
@@ -682,7 +882,15 @@ void BrowserWindow::pushChromeState() {
             site_creds = services_.vault->findForOrigin(shown_url).size();
         }
         if (window_) {
-            window_->SetTitle(active->title.empty() ? "Explorer" : (active->title + " — Explorer"));
+            const std::string suffix = " — Explorer";
+            std::string win_title = "Explorer";
+            if (!active->title.empty()) {
+                win_title = (active->title.size() >= suffix.size() &&
+                             active->title.compare(active->title.size() - suffix.size(), suffix.size(), suffix) == 0)
+                                ? active->title
+                                : (active->title + suffix);
+            }
+            window_->SetTitle(win_title);
         }
     }
 
@@ -756,29 +964,61 @@ void BrowserWindow::pushChromeProgress(bool loading, double progress) {
 void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
     if (!hud_ready_ || !hud_view_ || !hud_view_->GetBrowser()) return;
 
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "%.0f%% · %.1f°C",
-                  snap.cpu_percent, snap.cpu_temp_c.value_or(0.0f));
-    std::string cpu_str = snap.cpu_temp_c.has_value()
-                              ? std::string(buf)
-                              : std::to_string(static_cast<int>(snap.cpu_percent)) + "%";
+    std::ostringstream cpu;
+    {
+        char cb[64];
+        std::snprintf(cb, sizeof(cb), "%.0f%%", snap.cpu_percent);
+        cpu << cb;
+    }
+    if (snap.cpu_temp_c) {
+        char tb[32];
+        std::snprintf(tb, sizeof(tb), " · %.1f°C", *snap.cpu_temp_c);
+        cpu << tb;
+    }
+    if (snap.pkg_watts) {
+        char wb[32];
+        std::snprintf(wb, sizeof(wb), " · %.1fW", *snap.pkg_watts);
+        cpu << wb;
+    }
+    std::string cpu_str = cpu.str();
 
     std::ostringstream igpu;
     if (snap.igpu_busy) igpu << *snap.igpu_busy << "%";
     if (snap.igpu_mhz) igpu << (igpu.tellp() > 0 ? " · " : "") << *snap.igpu_mhz << " MHz";
-    if (snap.igpu_watts) {
-        char wb[24];
-        std::snprintf(wb, sizeof(wb), "%.1fW", *snap.igpu_watts);
-        igpu << (igpu.tellp() > 0 ? " · " : "") << wb;
+    if (snap.igpu_temp_c) {
+        char tb[32];
+        std::snprintf(tb, sizeof(tb), "%.1f°C", *snap.igpu_temp_c);
+        igpu << (igpu.tellp() > 0 ? " · " : "") << tb;
     }
 
     std::ostringstream fan;
-    if (snap.fan_rpm) fan << *snap.fan_rpm << " RPM";
-    if (snap.on_battery && snap.batt_watts) {
-        char wb[24];
-        std::snprintf(wb, sizeof(wb), "%.1fW batt", *snap.batt_watts);
-        fan << (fan.tellp() > 0 ? " · " : "") << wb;
+    if (snap.fan_rpms.size() >= 2) {
+        fan << snap.fan_rpms[0] << " / " << snap.fan_rpms[1] << " RPM";
+    } else if (snap.fan_rpm) {
+        fan << *snap.fan_rpm << " RPM";
     }
+
+    std::ostringstream pwr;
+    pwr << (snap.on_battery ? "Battery" : "AC");
+    if (snap.batt_capacity_pct) {
+        pwr << " · " << *snap.batt_capacity_pct << "%";
+    }
+    if (snap.batt_status_str && !snap.batt_status_str->empty()) {
+        pwr << " (" << *snap.batt_status_str;
+        if (snap.batt_watts && *snap.batt_watts > 0.05f) {
+            char wb[32];
+            std::snprintf(wb, sizeof(wb), " · %.1fW", *snap.batt_watts);
+            pwr << wb;
+        }
+        pwr << ")";
+    } else if (snap.batt_watts && *snap.batt_watts > 0.05f) {
+        char wb[32];
+        std::snprintf(wb, sizeof(wb), " · %.1fW", *snap.batt_watts);
+        pwr << wb;
+    }
+
+    std::string dgpu_str = snap.dgpu_state.value_or("n/a");
+    if (dgpu_str == "suspended") dgpu_str = "suspended (D3cold)";
 
     auto* active = activeTabEntry();
     std::string cur_origin = active ? explorer::vault::AesGcmPasswordVault::normalizeOrigin(active->url) : "";
@@ -799,8 +1039,9 @@ void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
        << "\"cpu\":\"" << jsonEscape(cpu_str) << "\","
        << "\"igpu\":\"" << jsonEscape(igpu.str().empty() ? "Idle" : igpu.str()) << "\","
        << "\"va\":\"" << jsonEscape(services_.hw.va_caps.summary()) << "\","
-       << "\"dgpu\":\"" << jsonEscape(snap.dgpu_state.value_or("n/a")) << "\","
+       << "\"dgpu\":\"" << jsonEscape(dgpu_str) << "\","
        << "\"fan\":\"" << jsonEscape(fan.str().empty() ? "0 RPM" : fan.str()) << "\","
+       << "\"power\":\"" << jsonEscape(pwr.str()) << "\","
        << "\"currentOrigin\":\"" << jsonEscape(cur_origin) << "\","
        << "\"currentTitle\":\"" << jsonEscape(cur_title) << "\","
        << "\"statusMsg\":\"" << jsonEscape(status_msg_) << "\","
@@ -829,16 +1070,22 @@ void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
     }
     js << "],\"webapps\":[";
     if (services_.webapp_installer) {
-        auto apps = services_.webapp_installer->listInstalled();
-        for (size_t i = 0; i < apps.size(); ++i) {
+        if (!webapps_cache_valid_) {
+            cached_webapps_ = services_.webapp_installer->listInstalled();
+            webapps_cache_valid_ = true;
+        }
+        for (size_t i = 0; i < cached_webapps_.size(); ++i) {
             if (i > 0) js << ",";
-            js << "{\"id\":\"" << jsonEscape(apps[i].app_id)
-               << "\",\"name\":\"" << jsonEscape(apps[i].name)
-               << "\",\"url\":\"" << jsonEscape(apps[i].url) << "\"}";
+            js << "{\"id\":\"" << jsonEscape(cached_webapps_[i].app_id)
+               << "\",\"name\":\"" << jsonEscape(cached_webapps_[i].name)
+               << "\",\"url\":\"" << jsonEscape(cached_webapps_[i].url) << "\"}";
         }
     }
     js << "]});";
-    hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js.str(), "explorer://hud", 0);
+    std::string payload = js.str();
+    if (payload == last_hud_sig_) return;  // Zero redundant HUD IPC when state is unchanged!
+    last_hud_sig_ = std::move(payload);
+    hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(last_hud_sig_, "explorer://hud", 0);
 }
 
 void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& arg) {
@@ -881,11 +1128,14 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
         try { closeTab(std::stoull(arg)); } catch (...) {}
     } else if (cmd == "open_panel") {
         status_msg_.clear();
-        if (hud_visible_ && arg.empty()) {
+        std::string target_tab = arg.empty() ? "power" : arg;
+        if (hud_visible_ && (arg.empty() || active_hud_tab_ == target_tab)) {
             setHudVisible(false);
         } else {
-            setHudVisible(true, arg.empty() ? "power" : arg);
+            setHudVisible(true, target_tab);
         }
+    } else if (cmd == "hud_tab_select") {
+        if (!arg.empty()) active_hud_tab_ = arg;
     } else if (cmd == "close_hud") {
         setHudVisible(false);
     } else if (cmd == "toggle_adblock" && services_.shield) {
@@ -896,10 +1146,12 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
         setStatusBanner(prefs_.adblock_enabled ? "Brave Shield enabled" : "Brave Shield paused");
     } else if (cmd == "update_filters" && services_.shield) {
         setStatusBanner("Downloading EasyList & EasyPrivacy...");
-        services_.shield->updateFilterListsAsync([this](bool ok, size_t total) {
-            if (alive_.load()) {
-                CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::onFilterUpdateFinished,
-                                                   base::Unretained(this), ok, total));
+        auto tok = life_token_;
+        services_.shield->updateFilterListsAsync([this, tok](bool ok, size_t total) {
+            if (tok->load()) {
+                CefPostTask(TID_UI, new GuardedUiTask(tok, [this, ok, total]() {
+                    onFilterUpdateFinished(ok, total);
+                }));
             }
         });
     } else if (cmd == "toggle_autohide") {
@@ -935,12 +1187,16 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
                                           pending_login_->username,
                                           pending_login_->password)) {
             std::string u = pending_login_->username;
+            cleanseSecret(pending_login_->password);
             pending_login_.reset();
             pushChromeState();
             setStatusBanner("Saved encrypted login for " + u);
         }
     } else if (cmd == "vault_dismiss_pending") {
-        pending_login_.reset();
+        if (pending_login_) {
+            cleanseSecret(pending_login_->password);
+            pending_login_.reset();
+        }
         pushChromeState();
         pushHudState(last_snap_);
     } else if (cmd == "vault_delete" && services_.vault) {
@@ -950,17 +1206,34 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             pushChromeState();
             setStatusBanner("Deleted saved login for " + u);
         }
+    } else if (cmd == "vault_reveal" && services_.vault) {
+        std::string o = extractJsonField(arg, "origin");
+        std::string u = extractJsonField(arg, "username");
+        std::string auth_pw = extractJsonField(arg, "authPassword");
+        if (o.empty() || u.empty() || auth_pw.empty()) {
+            cleanseSecret(auth_pw);
+            return;
+        }
+        auto tok = life_token_;
+        setStatusBanner("Verifying Linux login / root password...");
+        std::thread([this, tok, o, u, auth_pw = std::move(auth_pw)]() mutable {
+            bool ok = verifyLinuxSystemPassword(auth_pw);
+            cleanseSecret(auth_pw);
+            if (tok->load()) {
+                CefPostTask(TID_UI, new GuardedUiTask(tok, [this, ok, o, u]() {
+                    onVaultRevealAuthFinished(ok, o, u);
+                }));
+            }
+        }).detach();
     } else if (cmd == "vault_fill" && services_.vault && b && b->GetMainFrame()) {
         std::string o = extractJsonField(arg, "origin");
         std::string u = extractJsonField(arg, "username");
         // Security: verify the live active frame's origin EXACTLY matches the credential's origin
-        // and is HTTPS (or localhost/127.0.0.1) to prevent cross-origin credential exfiltration!
+        // and is HTTPS (or exact localhost/127.0.0.1) to prevent cross-origin credential exfiltration!
         std::string live_url = b->GetMainFrame()->GetURL().ToString();
         std::string live_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(live_url);
         std::string req_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(o);
-        bool secure_origin = (live_origin.rfind("https://", 0) == 0 ||
-                              live_origin.rfind("http://localhost", 0) == 0 ||
-                              live_origin.rfind("http://127.0.0.1", 0) == 0);
+        bool secure_origin = explorer::policy::isSecureWebOrigin(live_origin);
         if (!secure_origin || live_origin.empty() || live_origin != req_origin) {
             setStatusBanner("Blocked autofill: origin mismatch or insecure page");
             return;
@@ -969,8 +1242,9 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             if (c.username == u) {
                 std::string fill_js =
                     "(() => {"
-                    " const pw = document.querySelector('input[type=\"password\"]');"
-                    " const usr = document.querySelector('input[type=\"email\"], input[type=\"text\"][name*=\"user\" i], input[type=\"text\"][name*=\"login\" i], input[autocomplete=\"username\"]');"
+                    " const pw = document.querySelector('input[type=\"password\"]:not([disabled])');"
+                    " const root = (pw && pw.form) ? pw.form : document;"
+                    " const usr = root.querySelector('input[autocomplete=\"username\"], input[type=\"email\"], input[type=\"text\"][name*=\"user\" i], input[type=\"text\"][name*=\"login\" i], input[type=\"text\"][name*=\"email\" i], input[type=\"text\"][name*=\"id\" i], input[type=\"text\"][id*=\"user\" i], input[type=\"text\"][id*=\"login\" i], input[type=\"text\"]:not([disabled])');"
                     " const setVal = (el, val) => { if (!el) return; el.focus(); const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; setter.call(el, val); el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); };"
                     " setVal(usr, \"" + jsonEscape(c.username) + "\");"
                     " setVal(pw, \"" + jsonEscape(c.password) + "\");"
@@ -1011,20 +1285,32 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             std::string name = arg.empty() ? t->title : arg;
             std::string url = t->url;
             std::string fav = t->favicon;
+            if (fav.empty()) {
+                std::string orig = explorer::vault::AesGcmPasswordVault::normalizeOrigin(url);
+                if (!orig.empty()) fav = orig + "/favicon.ico";
+            }
             auto installer = services_.webapp_installer;
+            auto tok = life_token_;
             setStatusBanner("Installing Web App: " + name + "...");
-            std::thread([this, installer, name, url, fav]() {
+            std::thread([this, tok, installer, name, url, fav]() {
                 auto installed = installer->install(name, url, fav);
-                if (alive_.load()) {
-                    CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::onWebAppInstallFinished,
-                                                       base::Unretained(this), true, installed.name));
+                bool ok = !installed.app_id.empty();
+                std::string final_name = ok ? installed.name : name;
+                if (tok->load()) {
+                    CefPostTask(TID_UI, new GuardedUiTask(tok, [this, ok, final_name]() {
+                        onWebAppInstallFinished(ok, final_name);
+                    }));
                 }
             }).detach();
         } else {
             setStatusBanner("Open an http/https website first to install as App");
         }
     } else if (cmd == "webapp_launch" && services_.webapp_installer) {
-        for (const auto& a : services_.webapp_installer->listInstalled()) {
+        if (!webapps_cache_valid_) {
+            cached_webapps_ = services_.webapp_installer->listInstalled();
+            webapps_cache_valid_ = true;
+        }
+        for (const auto& a : cached_webapps_) {
             if (a.app_id == arg) {
                 services_.webapp_installer->launch(a);
                 setHudVisible(false);
@@ -1033,6 +1319,7 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
         }
     } else if (cmd == "webapp_uninstall" && services_.webapp_installer) {
         if (services_.webapp_installer->uninstall(arg)) {
+            webapps_cache_valid_ = false;
             setStatusBanner("Uninstalled Web App");
         }
     } else if (cmd == "clear_site_data" && t && b) {
@@ -1051,6 +1338,9 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
                 "try{localStorage.clear();sessionStorage.clear();}catch(e){}", "", 0);
         }
         setStatusBanner("Cleared all cookies & site data");
+    } else if (cmd == "find_input" && b) {
+        if (arg.empty()) b->GetHost()->StopFinding(true);
+        else b->GetHost()->Find(arg, true, false, false);
     } else if (cmd == "find_next" && b) {
         if (arg.empty()) b->GetHost()->StopFinding(true);
         else b->GetHost()->Find(arg, true, false, true);
@@ -1064,7 +1354,10 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
         if (window_->IsMaximized()) window_->Restore();
         else window_->Maximize();
     } else if (cmd == "win_full" && window_) {
-        window_->SetFullscreen(!window_->IsFullscreen());
+        bool next_full = !window_->IsFullscreen();
+        if (!next_full) html_fullscreen_ = false;
+        window_->SetFullscreen(next_full);
+        updateChromeLayout();
     } else if (cmd == "win_close" && window_) {
         window_->Close();
     }
@@ -1072,15 +1365,46 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
 
 void BrowserWindow::onFilterUpdateFinished(bool ok, size_t total_rules) {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load()) return;
+    if (!life_token_->load()) return;
     setStatusBanner(ok ? ("Updated Brave Shield: " + std::to_string(total_rules) + " rules active")
                        : "Filter update failed (kept existing rules)");
 }
 
 void BrowserWindow::onWebAppInstallFinished(bool ok, std::string app_name) {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load()) return;
+    if (!life_token_->load()) return;
+    if (ok) webapps_cache_valid_ = false;
     setStatusBanner(ok ? ("Installed app: " + app_name) : "Web App install failed");
+}
+
+void BrowserWindow::onVaultRevealAuthFinished(bool ok, std::string origin, std::string username) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!life_token_->load() || !hud_ready_ || !hud_view_ || !hud_view_->GetBrowser()) return;
+    std::string norm = explorer::vault::AesGcmPasswordVault::normalizeOrigin(origin);
+    std::string found_pw;
+    bool found = false;
+    if (ok && services_.vault && !norm.empty()) {
+        for (const auto& c : services_.vault->findForOrigin(norm)) {
+            if (c.username == username) {
+                found_pw = c.password;
+                found = true;
+                break;
+            }
+        }
+    }
+    std::string msg = (ok && found)
+                          ? ("Verified — password revealed for " + username + " (auto-hides in 30s)")
+                          : "Authentication failed: invalid Linux login / root password";
+    status_msg_ = msg;
+    std::ostringstream js;
+    js << "if(typeof window.__onVaultRevealResult==='function')window.__onVaultRevealResult("
+       << ((ok && found) ? "true" : "false") << ",\""
+       << jsonEscape(norm) << "\",\""
+       << jsonEscape(username) << "\",\""
+       << jsonEscape(found_pw) << "\",\""
+       << jsonEscape(msg) << "\");";
+    cleanseSecret(found_pw);
+    hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js.str(), "explorer://hud-vault-reveal", 0);
 }
 
 void BrowserWindow::onChromeDraggableRegionsChanged(const std::vector<CefDraggableRegion>& regions) {
@@ -1111,12 +1435,10 @@ void BrowserWindow::onChromeShortcut(explorer::engine::ShortcutAction action) {
 
 void BrowserWindow::onChromeBrowserCreated(bool /*is_hud*/) {
     CEF_REQUIRE_UI_THREAD();
-    ++open_browser_count_;
 }
 
 void BrowserWindow::onChromeBrowserClosed(bool is_hud) {
     CEF_REQUIRE_UI_THREAD();
-    if (open_browser_count_ > 0) --open_browser_count_;
     if (is_hud) hud_ready_ = false;
     else chrome_ready_ = false;
     checkFinishShutdown();
@@ -1124,7 +1446,6 @@ void BrowserWindow::onChromeBrowserClosed(bool is_hud) {
 
 void BrowserWindow::onTabCreated(uint64_t /*tab_id*/) {
     CEF_REQUIRE_UI_THREAD();
-    ++open_browser_count_;
 }
 
 void BrowserWindow::onTabAddressChanged(uint64_t tab_id, const std::string& url) {
@@ -1183,8 +1504,9 @@ void BrowserWindow::onTabLoadingChanged(uint64_t tab_id, bool is_loading, bool c
     }
 }
 
-void BrowserWindow::onTabFullscreenChanged(uint64_t /*tab_id*/, bool fullscreen) {
+void BrowserWindow::onTabFullscreenChanged(uint64_t tab_id, bool fullscreen) {
     CEF_REQUIRE_UI_THREAD();
+    if (tab_id != active_tab_id_) return;
     html_fullscreen_ = fullscreen;
     if (fullscreen) {
         setHudVisible(false);
@@ -1218,8 +1540,14 @@ void BrowserWindow::onTabRendererPid(uint64_t tab_id, pid_t pid) {
 void BrowserWindow::onTabDownloadUpdated(const explorer::engine::DownloadRecord& record) {
     CEF_REQUIRE_UI_THREAD();
     bool found = false;
+    bool state_changed = false;
+    bool percent_changed = false;
     for (auto& d : downloads_) {
         if (d.id == record.id) {
+            state_changed = (d.in_progress != record.in_progress ||
+                             d.is_complete != record.is_complete ||
+                             d.is_canceled != record.is_canceled);
+            percent_changed = (d.percent != record.percent);
             d = record;
             found = true;
             break;
@@ -1228,9 +1556,15 @@ void BrowserWindow::onTabDownloadUpdated(const explorer::engine::DownloadRecord&
     if (!found) {
         downloads_.insert(downloads_.begin(), record);
         if (downloads_.size() > 30) downloads_.pop_back();
+        state_changed = true;
+        percent_changed = true;
     }
-    pushChromeState();
-    if (hud_visible_) pushHudState(last_snap_);
+    if (state_changed) {
+        pushChromeState();
+    }
+    if (hud_visible_ && (state_changed || percent_changed)) {
+        pushHudState(last_snap_);
+    }
 }
 
 void BrowserWindow::onTabScrollRevealTopBar(uint64_t tab_id, bool reveal) {
@@ -1244,12 +1578,24 @@ void BrowserWindow::onTabScrollRevealTopBar(uint64_t tab_id, bool reveal) {
     }
 }
 
+void BrowserWindow::onTabMediaStateChanged(uint64_t tab_id, bool playing) {
+    CEF_REQUIRE_UI_THREAD();
+    if (auto* t = findTab(tab_id)) {
+        if (t->playing_media == playing) return;
+        t->playing_media = playing;
+        reconcileRendererPriorities();
+    }
+}
+
 void BrowserWindow::onTabLoginSubmitted(const std::string& origin,
                                         const std::string& username,
                                         const std::string& password) {
     CEF_REQUIRE_UI_THREAD();
     std::string norm = explorer::vault::AesGcmPasswordVault::normalizeOrigin(origin);
     if (norm.empty() || username.empty() || password.empty()) return;
+    if (pending_login_) {
+        cleanseSecret(pending_login_->password);
+    }
     pending_login_ = explorer::vault::Credential{norm, username, password};
     pushChromeState();
     if (hud_visible_) pushHudState(last_snap_);
@@ -1318,7 +1664,12 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
             }
             break;
         case A::ToggleFullscreen:
-            if (window_) window_->SetFullscreen(!window_->IsFullscreen());
+            if (window_) {
+                bool next_full = !window_->IsFullscreen();
+                if (!next_full) html_fullscreen_ = false;
+                window_->SetFullscreen(next_full);
+                updateChromeLayout();
+            }
             break;
         case A::ToggleDevTools:
             if (b && b->GetHost()) {
@@ -1348,8 +1699,8 @@ bool BrowserWindow::onTabDoClose(uint64_t tab_id) {
 
     // Retiring individual tab (initiated by closeTab): NEVER close the parent CefWindow!
     if (retiring_tabs_.count(tab_id) != 0) {
-        CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::finishRetireTab,
-                                           base::Unretained(this), tab_id));
+        auto tok = life_token_;
+        CefPostTask(TID_UI, new GuardedUiTask(tok, [this, tab_id]() { finishRetireTab(tab_id); }));
         return true;
     }
 
@@ -1376,8 +1727,8 @@ bool BrowserWindow::onTabDoClose(uint64_t tab_id) {
                 pushChromeState();
             }
             scheduleSessionSave();
-            CefPostTask(TID_UI, base::BindOnce(&BrowserWindow::finishRetireTab,
-                                               base::Unretained(this), tab_id));
+            auto tok = life_token_;
+            CefPostTask(TID_UI, new GuardedUiTask(tok, [this, tab_id]() { finishRetireTab(tab_id); }));
             return true;
         }
     }
@@ -1387,7 +1738,6 @@ bool BrowserWindow::onTabDoClose(uint64_t tab_id) {
 
 void BrowserWindow::onTabClosed(uint64_t tab_id) {
     CEF_REQUIRE_UI_THREAD();
-    if (open_browser_count_ > 0) --open_browser_count_;
     throttle_planner_.unregisterTab(tab_id);
 
     if (auto rit = retiring_tabs_.find(tab_id); rit != retiring_tabs_.end()) {
@@ -1427,7 +1777,7 @@ void BrowserWindow::onTabClosed(uint64_t tab_id) {
 
 void BrowserWindow::onPowerSourceChangedFromThread(bool on_battery) {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load()) return;
+    if (!life_token_->load()) return;
     power_policy_.setPowerSource(on_battery);
     syncSystemPower();
     pushChromeState();
@@ -1436,7 +1786,7 @@ void BrowserWindow::onPowerSourceChangedFromThread(bool on_battery) {
 
 void BrowserWindow::syncSystemPower() {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load() || services_.hw.tuning_disabled) return;
+    if (!life_token_->load() || services_.hw.tuning_disabled) return;
     if (services_.power_gov) {
         services_.power_gov->applyTimerSlackNs(power_policy_.timerSlackNs());
         services_.power_gov->setPerformanceHoldAsync(power_policy_.wantsPerformanceHold());
@@ -1452,6 +1802,9 @@ void BrowserWindow::reconcileRendererPriorities() {
     std::unordered_set<uint64_t> active;
     if (active_tab_id_ != 0) active.insert(active_tab_id_);
     std::unordered_set<uint64_t> media;
+    for (const auto& t : tabs_) {
+        if (t.playing_media) media.insert(t.id);
+    }
     auto actions = throttle_planner_.reconcile(active, media, power_policy_.isBatteryMode());
     for (const auto& act : actions) {
         services_.throttler->setProcessIdleClass(act.pid, act.throttle);
@@ -1460,10 +1813,10 @@ void BrowserWindow::reconcileRendererPriorities() {
 
 void BrowserWindow::onTelemetryTick() {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load()) return;
+    if (!life_token_->load()) return;
 
     if (services_.telemetry) {
-        // Lightweight 2-file sysfs read when HUD is closed; full sensor sweep only when HUD is open!
+        // Lightweight sysfs read when HUD is closed; full sensor sweep only when HUD is open!
         last_snap_ = hud_visible_ ? services_.telemetry->sample()
                                   : services_.telemetry->sampleLite();
         if (last_snap_.on_battery != power_policy_.isOnBatteryRaw()) {
@@ -1475,24 +1828,26 @@ void BrowserWindow::onTelemetryTick() {
     }
 
     int next_ms = power_policy_.telemetryIntervalMs(hud_visible_);
-    CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::onTelemetryTick, base::Unretained(this)), next_ms);
+    auto tok = life_token_;
+    CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), next_ms);
 }
 
 void BrowserWindow::scheduleSessionSave() {
-    if (cfg_.disable_session || !cfg_.app_mode_url.empty() || session_dirty_) return;
+    if (cfg_.disable_session || !cfg_.app_mode_url.empty() || session_dirty_ || session_flushed_on_close_) return;
     session_dirty_ = true;
-    CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::onDebouncedSessionSave, base::Unretained(this)), 600);
+    auto tok = life_token_;
+    CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onDebouncedSessionSave(); }), 600);
 }
 
 void BrowserWindow::onDebouncedSessionSave() {
     CEF_REQUIRE_UI_THREAD();
-    if (!alive_.load() || !session_dirty_) return;
+    if (!life_token_->load() || !session_dirty_ || session_flushed_on_close_) return;
     session_dirty_ = false;
     flushSessionNow();
 }
 
 void BrowserWindow::flushSessionNow() {
-    if (cfg_.disable_session || !cfg_.app_mode_url.empty()) return;
+    if (cfg_.disable_session || !cfg_.app_mode_url.empty() || session_flushed_on_close_) return;
     SessionData data;
     for (size_t i = 0; i < tabs_.size(); ++i) {
         if (tabs_[i].url.rfind("data:", 0) == 0) continue;

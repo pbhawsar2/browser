@@ -3,6 +3,7 @@
 
 #include "include/wrapper/cef_helpers.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -14,14 +15,25 @@ namespace {
 explorer::shield::ResourceKind mapCefResourceType(CefRequest::ResourceType rt) {
     using namespace explorer::shield;
     switch (rt) {
-        case RT_MAIN_FRAME: return ResourceKind::MainFrame;
-        case RT_SUB_FRAME: return ResourceKind::SubFrame;
-        case RT_SCRIPT: return ResourceKind::Script;
-        case RT_IMAGE: return ResourceKind::Image;
+        case RT_MAIN_FRAME:
+        case RT_NAVIGATION_PRELOAD_MAIN_FRAME: return ResourceKind::MainFrame;
+        case RT_SUB_FRAME:
+        case RT_NAVIGATION_PRELOAD_SUB_FRAME: return ResourceKind::SubFrame;
+        case RT_SCRIPT:
+        case RT_WORKER:
+        case RT_SHARED_WORKER:
+        case RT_SERVICE_WORKER: return ResourceKind::Script;
+        case RT_IMAGE:
+        case RT_FAVICON: return ResourceKind::Image;
         case RT_STYLESHEET: return ResourceKind::Stylesheet;
+        case RT_FONT_RESOURCE: return ResourceKind::Font;
+        case RT_MEDIA: return ResourceKind::Media;
+        case RT_OBJECT:
+        case RT_PLUGIN_RESOURCE: return ResourceKind::Object;
         case RT_XHR:
-        case RT_PING:
-        case RT_CSP_REPORT: return ResourceKind::XhrOrFetch;
+        case RT_PREFETCH: return ResourceKind::XhrOrFetch;
+        case RT_PING: return ResourceKind::Ping;
+        case RT_CSP_REPORT: return ResourceKind::CspReport;
         default: return ResourceKind::Other;
     }
 }
@@ -60,11 +72,14 @@ std::filesystem::path resolveDownloadPath(const std::string& suggested_name) {
 
     auto stem = candidate.stem().string();
     auto ext = candidate.extension().string();
-    for (int i = 1; i <= 999; ++i) {
+    for (int i = 1; i <= 32; ++i) {
         auto next = dir / (stem + " (" + std::to_string(i) + ")" + ext);
         if (!std::filesystem::exists(next, ec)) return next;
     }
-    return candidate;
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    return dir / (stem + " (" + std::to_string(now_ms) + ")" + ext);
 }
 
 }  // namespace
@@ -98,6 +113,12 @@ bool ExplorerCefClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser
             observer_->onTabScrollRevealTopBar(tab_id_, args->GetBool(0));
             return true;
         }
+    } else if (message->GetName() == "explorer.media-state") {
+        auto args = message->GetArgumentList();
+        if (args && args->GetSize() >= 1) {
+            observer_->onTabMediaStateChanged(tab_id_, args->GetBool(0));
+            return true;
+        }
     } else if (message->GetName() == "explorer.login-capture") {
         auto args = message->GetArgumentList();
         if (args && args->GetSize() >= 3) {
@@ -125,7 +146,7 @@ bool ExplorerCefClient::OnBeforePopup(CefRefPtr<CefBrowser> /*browser*/,
                                       int /*popup_id*/,
                                       const CefString& target_url,
                                       const CefString& /*target_frame_name*/,
-                                      WindowOpenDisposition /*target_disposition*/,
+                                      cef_window_open_disposition_t /*target_disposition*/,
                                       bool /*user_gesture*/,
                                       const CefPopupFeatures& /*popupFeatures*/,
                                       CefWindowInfo& /*windowInfo*/,
@@ -179,7 +200,15 @@ void ExplorerCefClient::OnFaviconURLChange(CefRefPtr<CefBrowser> /*browser*/,
                                            const std::vector<CefString>& icon_urls) {
     CEF_REQUIRE_UI_THREAD();
     if (observer_ && !icon_urls.empty()) {
-        observer_->onTabFaviconChanged(tab_id_, icon_urls.front().ToString());
+        // Prefer PNG/SVG/apple-touch-icon or the last (typically highest-resolution) icon over 16x16 .ico.
+        std::string chosen = icon_urls.back().ToString();
+        for (const auto& u : icon_urls) {
+            std::string s = u.ToString();
+            if (s.find(".png") != std::string::npos || s.find(".svg") != std::string::npos) {
+                chosen = std::move(s);
+            }
+        }
+        observer_->onTabFaviconChanged(tab_id_, chosen);
     }
 }
 
@@ -224,7 +253,7 @@ void ExplorerCefClient::OnLoadStart(CefRefPtr<CefBrowser> browser,
 bool ExplorerCefClient::OnOpenURLFromTab(CefRefPtr<CefBrowser> /*browser*/,
                                          CefRefPtr<CefFrame> /*frame*/,
                                          const CefString& target_url,
-                                         WindowOpenDisposition target_disposition,
+                                         cef_window_open_disposition_t target_disposition,
                                          bool /*user_gesture*/) {
     CEF_REQUIRE_UI_THREAD();
     if (observer_ &&
@@ -241,11 +270,11 @@ CefRefPtr<CefResourceRequestHandler> ExplorerCefClient::GetResourceRequestHandle
     CefRefPtr<CefBrowser> /*browser*/,
     CefRefPtr<CefFrame> /*frame*/,
     CefRefPtr<CefRequest> /*request*/,
-    bool is_navigation,
+    bool /*is_navigation*/,
     bool is_download,
     const CefString& /*request_initiator*/,
     bool& /*disable_default_handling*/) {
-    if (!shield_ || is_navigation || is_download) {
+    if (is_download) {
         return nullptr;
     }
     return this;

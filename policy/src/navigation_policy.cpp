@@ -56,6 +56,35 @@ std::string normalizeOmnibarInput(std::string_view raw) {
     return "https://www.google.com/search?q=" + percentEncodeQuery(s);
 }
 
+bool isSecureWebOrigin(std::string_view url_or_origin) {
+    while (!url_or_origin.empty() && std::isspace(static_cast<unsigned char>(url_or_origin.front()))) {
+        url_or_origin.remove_prefix(1);
+    }
+    while (!url_or_origin.empty() && std::isspace(static_cast<unsigned char>(url_or_origin.back()))) {
+        url_or_origin.remove_suffix(1);
+    }
+    std::string s(url_or_origin);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    auto is_host_boundary = [](const std::string& str, size_t pos) {
+        if (pos >= str.size()) return true;
+        char c = str[pos];
+        return c == ':' || c == '/' || c == '?' || c == '#';
+    };
+
+    if (s.rfind("https://", 0) == 0) {
+        return s.size() > 8 && !is_host_boundary(s, 8);
+    }
+    if (s.rfind("http://localhost", 0) == 0 && is_host_boundary(s, 16)) {
+        return true;
+    }
+    if (s.rfind("http://127.0.0.1", 0) == 0 && is_host_boundary(s, 16)) {
+        return true;
+    }
+    return false;
+}
+
 double zoomFactorToCefLevel(double factor) {
     if (factor <= 0.1) factor = 0.1;
     return std::log(factor) / std::log(1.2);

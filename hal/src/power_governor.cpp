@@ -32,7 +32,8 @@ std::string readTrimmed(const fs::path& p) {
     return s;
 }
 
-std::optional<uint32_t> holdPpdProfileSync() {
+std::optional<uint32_t> holdPpdProfileSync(sd_bus** out_bus) {
+    if (!out_bus) return std::nullopt;
     sd_bus* bus = nullptr;
     if (sd_bus_open_system(&bus) < 0 || !bus) return std::nullopt;
 
@@ -60,14 +61,18 @@ std::optional<uint32_t> holdPpdProfileSync() {
     }
     sd_bus_error_free(&err);
     sd_bus_message_unref(reply);
-    sd_bus_unref(bus);
+    if (cookie.has_value()) {
+        // Keep the D-Bus connection open while the hold is active: tuned-ppd / power-profiles-daemon
+        // automatically revokes HoldProfile cookies as soon as the holding D-Bus peer disconnects!
+        *out_bus = bus;
+    } else {
+        sd_bus_unref(bus);
+    }
     return cookie;
 }
 
-void releasePpdProfileSync(uint32_t cookie) {
-    sd_bus* bus = nullptr;
-    if (sd_bus_open_system(&bus) < 0 || !bus) return;
-
+void releasePpdProfileSync(sd_bus* bus, uint32_t cookie) {
+    if (!bus) return;
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message* reply = nullptr;
     sd_bus_call_method(
@@ -123,6 +128,7 @@ LinuxPowerGovernor::~LinuxPowerGovernor() {
 bool LinuxPowerGovernor::isOnBatteryBoot() const {
     std::error_code ec;
     bool mains_offline = false;
+    bool has_battery = false;
     bool discharging = false;
     for (const auto& entry : fs::directory_iterator("/sys/class/power_supply", ec)) {
         std::string kind = readTrimmed(entry.path() / "type");
@@ -132,6 +138,7 @@ bool LinuxPowerGovernor::isOnBatteryBoot() const {
             }
             mains_offline = true;
         } else if (kind == "Battery") {
+            has_battery = true;
             std::string status = readTrimmed(entry.path() / "status");
             std::transform(status.begin(), status.end(), status.begin(), ::tolower);
             if (status == "discharging") {
@@ -139,7 +146,7 @@ bool LinuxPowerGovernor::isOnBatteryBoot() const {
             }
         }
     }
-    return discharging || mains_offline;
+    return discharging || (mains_offline && has_battery);
 }
 
 bool LinuxPowerGovernor::applyTimerSlackNs(unsigned long ns) const {
@@ -150,39 +157,51 @@ bool LinuxPowerGovernor::applyTimerSlackNs(unsigned long ns) const {
 void LinuxPowerGovernor::setPerformanceHoldAsync(bool hold) {
     if (isTuningDisabled()) return;
 
-    std::optional<uint32_t> to_release;
-    bool need_acquire = false;
+    std::thread prev_worker;
     {
         std::lock_guard<std::mutex> lock(mu_);
         ppd_desired_ = hold;
-        if (hold && !ppd_cookie_.has_value()) {
-            need_acquire = true;
-        } else if (!hold && ppd_cookie_.has_value()) {
-            to_release = ppd_cookie_;
-            ppd_cookie_.reset();
+        if (stop_watcher_.load() || ppd_in_flight_ || ppd_desired_ == ppd_cookie_.has_value()) {
+            return;
         }
-    }
-
-    if (to_release.has_value()) {
-        uint32_t c = *to_release;
-        std::thread([c]() { releasePpdProfileSync(c); }).detach();
-    } else if (need_acquire) {
-        std::thread([this]() {
-            auto c = holdPpdProfileSync();
-            if (!c.has_value()) return;
-            bool release_now = false;
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (ppd_desired_ && !stop_watcher_.load()) {
-                    ppd_cookie_ = c;
-                } else {
-                    release_now = true;
+        ppd_in_flight_ = true;
+        if (ppd_thread_.joinable()) {
+            prev_worker = std::move(ppd_thread_);
+        }
+        ppd_thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(mu_);
+            while (!stop_watcher_.load() && ppd_desired_ != ppd_cookie_.has_value()) {
+                if (ppd_desired_ && !ppd_cookie_.has_value()) {
+                    lock.unlock();
+                    sd_bus* new_bus = nullptr;
+                    auto c = holdPpdProfileSync(&new_bus);
+                    lock.lock();
+                    if (!c.has_value()) {
+                        break;
+                    }
+                    if (ppd_desired_ && !stop_watcher_.load() && !ppd_cookie_.has_value()) {
+                        ppd_cookie_ = c;
+                        ppd_bus_ = new_bus;
+                    } else {
+                        lock.unlock();
+                        releasePpdProfileSync(new_bus, *c);
+                        lock.lock();
+                    }
+                } else if (!ppd_desired_ && ppd_cookie_.has_value()) {
+                    uint32_t c = *ppd_cookie_;
+                    auto* b = static_cast<sd_bus*>(ppd_bus_);
+                    ppd_cookie_.reset();
+                    ppd_bus_ = nullptr;
+                    lock.unlock();
+                    releasePpdProfileSync(b, c);
+                    lock.lock();
                 }
             }
-            if (release_now) {
-                releasePpdProfileSync(*c);
-            }
-        }).detach();
+            ppd_in_flight_ = false;
+        });
+    }
+    if (prev_worker.joinable()) {
+        prev_worker.join();
     }
 }
 
@@ -259,15 +278,30 @@ void LinuxPowerGovernor::shutdown() {
         ::close(wake_fd_);
         wake_fd_ = -1;
     }
-    std::optional<uint32_t> cookie;
+    std::thread worker;
     {
         std::lock_guard<std::mutex> lock(mu_);
         ppd_desired_ = false;
-        cookie = ppd_cookie_;
-        ppd_cookie_.reset();
+        if (ppd_thread_.joinable()) {
+            worker = std::move(ppd_thread_);
+        }
     }
-    if (cookie.has_value()) {
-        releasePpdProfileSync(*cookie);
+    if (worker.joinable()) {
+        worker.join();
+    }
+    std::optional<uint32_t> cookie;
+    sd_bus* bus = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        cookie = ppd_cookie_;
+        bus = static_cast<sd_bus*>(ppd_bus_);
+        ppd_cookie_.reset();
+        ppd_bus_ = nullptr;
+    }
+    if (cookie.has_value() && bus) {
+        releasePpdProfileSync(bus, *cookie);
+    } else if (bus) {
+        sd_bus_unref(bus);
     }
 }
 

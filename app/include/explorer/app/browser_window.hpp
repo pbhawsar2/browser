@@ -76,6 +76,7 @@ public:
     void onTabShortcut(explorer::engine::ShortcutAction action) override;
     void onTabDownloadUpdated(const explorer::engine::DownloadRecord& record) override;
     void onTabScrollRevealTopBar(uint64_t tab_id, bool reveal) override;
+    void onTabMediaStateChanged(uint64_t tab_id, bool playing) override;
     void onTabLoginSubmitted(const std::string& origin,
                              const std::string& username,
                              const std::string& password) override;
@@ -97,10 +98,12 @@ public:
     bool handleCanClose();
     bool handleAccelerator(int command_id);
     int desiredChromeHeight() const;
+    std::string linuxAppId() const { return cfg_.app_id.empty() ? "explorer" : cfg_.app_id; }
 
     void onPowerSourceChangedFromThread(bool on_battery);
     void onFilterUpdateFinished(bool ok, size_t total_rules);
     void onWebAppInstallFinished(bool ok, std::string app_name);
+    void onVaultRevealAuthFinished(bool ok, std::string origin, std::string username);
     void onTelemetryTick();
     void onDebouncedSessionSave();
     void finishRetireTab(uint64_t tab_id);
@@ -115,6 +118,7 @@ private:
         bool loading = false;
         bool can_back = false;
         bool can_fwd = false;
+        bool playing_media = false;
         CefRefPtr<explorer::engine::ExplorerCefClient> client;
         CefRefPtr<CefBrowserView> view;
     };
@@ -162,10 +166,14 @@ private:
     std::vector<TabEntry> tabs_;
     std::unordered_map<uint64_t, TabEntry> retiring_tabs_;
     std::vector<explorer::engine::DownloadRecord> downloads_;
+    std::vector<explorer::webapp::InstalledWebApp> cached_webapps_;
+    bool webapps_cache_valid_ = false;
     std::optional<explorer::vault::Credential> pending_login_;
     std::string status_msg_;
     std::string pending_hud_tab_;
+    std::string active_hud_tab_ = "power";
     std::string last_telemetry_sig_;
+    std::string last_hud_sig_;
 
     uint64_t active_tab_id_ = 0;
     uint64_t next_tab_id_ = 1;
@@ -179,8 +187,8 @@ private:
     bool html_fullscreen_ = false;
     bool closing_ = false;
     bool session_dirty_ = false;
-    int open_browser_count_ = 0;
-    std::atomic<bool> alive_{true};
+    bool session_flushed_on_close_ = false;
+    std::shared_ptr<std::atomic<bool>> life_token_ = std::make_shared<std::atomic<bool>>(true);
 };
 
 }  // namespace explorer::app

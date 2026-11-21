@@ -33,8 +33,11 @@ public:
 
 private:
     std::mutex mu_;
+    void* ppd_bus_ = nullptr;
     std::optional<uint32_t> ppd_cookie_;
     bool ppd_desired_ = false;
+    bool ppd_in_flight_ = false;
+    std::thread ppd_thread_;
     std::atomic<bool> stop_watcher_{false};
     int wake_fd_ = -1;
     std::thread watcher_thread_;

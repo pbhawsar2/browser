@@ -1,6 +1,7 @@
 #include "explorer/shield/content_shield.hpp"
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -10,6 +11,8 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
+extern char** environ;
 
 extern "C" {
 void* explorer_brave_shield_new(const char* rules_utf8);
@@ -100,10 +103,39 @@ std::string_view resourceKindToBraveType(ResourceKind kind) {
         case ResourceKind::Script: return "script";
         case ResourceKind::Image: return "image";
         case ResourceKind::Stylesheet: return "stylesheet";
+        case ResourceKind::Font: return "font";
+        case ResourceKind::Media: return "media";
+        case ResourceKind::Object: return "object";
         case ResourceKind::XhrOrFetch: return "xmlhttprequest";
+        case ResourceKind::Ping: return "ping";
+        case ResourceKind::CspReport: return "csp_report";
         case ResourceKind::Other: return "other";
     }
     return "other";
+}
+
+bool spawnCurlHttps(const char* url, const std::string& out_path) {
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) return false;
+    ::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    const char* argv[] = {
+        "curl", "-fsSL", "--proto", "=https", "--tlsv1.2",
+        "--max-time", "20", "--max-filesize", "10485760",
+        url, "-o", out_path.c_str(), nullptr
+    };
+    pid_t pid = -1;
+    int rc = ::posix_spawnp(&pid, "curl", &actions, nullptr,
+                            const_cast<char* const*>(argv), environ);
+    ::posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0 || pid <= 0) return false;
+
+    int st = 0;
+    while (::waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
 }  // namespace
@@ -115,6 +147,17 @@ BraveAdblockShield::BraveAdblockShield(fs::path filters_dir, bool enabled)
 }
 
 BraveAdblockShield::~BraveAdblockShield() {
+    shutting_down_.store(true);
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(update_mu_);
+        if (update_thread_.joinable()) {
+            worker = std::move(update_thread_);
+        }
+    }
+    if (worker.joinable()) {
+        worker.join();
+    }
     if (handle_) {
         explorer_brave_shield_free(handle_);
         handle_ = nullptr;
@@ -162,66 +205,68 @@ BlockDecision BraveAdblockShield::evaluate(std::string_view request_url,
 }
 
 void BraveAdblockShield::updateFilterListsAsync(std::function<void(bool, size_t)> on_done) {
-    if (filters_dir_.empty()) {
+    if (filters_dir_.empty() || shutting_down_.load()) {
+        if (on_done) on_done(false, ruleCount());
+        return;
+    }
+    if (updating_.exchange(true)) {
         if (on_done) on_done(false, ruleCount());
         return;
     }
 
-    std::thread([this, cb = std::move(on_done)]() {
-        std::error_code ec;
-        fs::create_directories(filters_dir_, ec);
+    std::thread prev_worker;
+    {
+        std::lock_guard<std::mutex> lock(update_mu_);
+        if (shutting_down_.load()) {
+            updating_.store(false);
+            if (on_done) on_done(false, ruleCount());
+            return;
+        }
+        if (update_thread_.joinable()) {
+            prev_worker = std::move(update_thread_);
+        }
+        update_thread_ = std::thread([this, cb = std::move(on_done)]() {
+            std::error_code ec;
+            fs::create_directories(filters_dir_, ec);
 
-        // Download reputed, lightweight, zero-breakage community lists (Peter Lowe + EasyPrivacy).
-        struct Source {
-            const char* name;
-            const char* url;
-        };
-        static constexpr Source kSources[] = {
-            {"peter-lowe.txt",
-             "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext"},
-            {"easylist.txt", "https://easylist.to/easylist/easylist.txt"},
-            {"easyprivacy.txt", "https://easylist.to/easylist/easyprivacy.txt"},
-        };
+            struct Source {
+                const char* name;
+                const char* url;
+            };
+            static constexpr Source kSources[] = {
+                {"peter-lowe.txt",
+                 "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&showintro=0&mimetype=plaintext"},
+                {"easylist.txt", "https://easylist.to/easylist/easylist.txt"},
+                {"easyprivacy.txt", "https://easylist.to/easylist/easyprivacy.txt"},
+            };
 
-        bool any_ok = false;
-        for (const auto& s : kSources) {
-            fs::path dest = filters_dir_ / s.name;
-            fs::path tmp = dest;
-            tmp += ".tmp";
-            // Fetch strictly over HTTPS via fork+execvp (ZERO shell, capped at 10 MiB).
-            pid_t pid = ::fork();
-            bool ok = false;
-            if (pid == 0) {
-                int devnull = ::open("/dev/null", O_RDWR);
-                if (devnull >= 0) {
-                    ::dup2(devnull, STDOUT_FILENO);
-                    ::dup2(devnull, STDERR_FILENO);
-                    ::close(devnull);
+            bool any_ok = false;
+            for (const auto& s : kSources) {
+                if (shutting_down_.load()) break;
+                fs::path dest = filters_dir_ / s.name;
+                fs::path tmp = dest;
+                tmp += ".tmp";
+                bool ok = spawnCurlHttps(s.url, tmp.string());
+                if (ok && fs::exists(tmp, ec) && fs::file_size(tmp, ec) > 1024) {
+                    fs::rename(tmp, dest, ec);
+                    any_ok = true;
+                } else {
+                    fs::remove(tmp, ec);
                 }
-                ::execlp("curl", "curl", "-fsSL", "--proto", "=https", "--tlsv1.2",
-                         "--max-time", "20", "--max-filesize", "10485760",
-                         s.url, "-o", tmp.c_str(), nullptr);
-                ::_exit(127);
-            } else if (pid > 0) {
-                int st = 0;
-                while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-                ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
             }
-            if (ok && fs::exists(tmp, ec) && fs::file_size(tmp, ec) > 1024) {
-                fs::rename(tmp, dest, ec);
-                any_ok = true;
-            } else {
-                fs::remove(tmp, ec);
-            }
-        }
 
-        size_t total = ruleCount();
-        if (any_ok && handle_) {
-            std::string combined = loadCombinedRules();
-            total = explorer_brave_shield_reload(handle_, combined.c_str());
-        }
-        if (cb) cb(any_ok, total);
-    }).detach();
+            size_t total = ruleCount();
+            if (any_ok && !shutting_down_.load() && handle_) {
+                std::string combined = loadCombinedRules();
+                total = explorer_brave_shield_reload(handle_, combined.c_str());
+            }
+            updating_.store(false);
+            if (cb && !shutting_down_.load()) cb(any_ok, total);
+        });
+    }
+    if (prev_worker.joinable()) {
+        prev_worker.join();
+    }
 }
 
 }  // namespace explorer::shield

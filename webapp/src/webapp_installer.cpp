@@ -1,18 +1,22 @@
 #include "explorer/webapp/webapp_installer.hpp"
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <vector>
+
+extern char** environ;
 
 namespace explorer::webapp {
 
@@ -48,36 +52,43 @@ bool isValidAppId(const std::string& app_id) {
     return true;
 }
 
-/// Escapes `%` as `%%` for FreeDesktop Exec= lines so URL percent-encoding never triggers field codes.
+/// Escapes `%` as `%%` and quotes arguments containing spaces per FreeDesktop Exec= specification.
 std::string escapeDesktopExecArg(const std::string& s) {
+    bool needs_quote = (s.find_first_of(" \t\"\\") != std::string::npos);
     std::string out;
-    out.reserve(s.size() + 8);
+    out.reserve(s.size() + 12);
+    if (needs_quote) out.push_back('"');
     for (char c : s) {
         if (c == '%') out += "%%";
-        else out.push_back(c);
+        else if (needs_quote && (c == '"' || c == '\\' || c == '$' || c == '`')) {
+            out.push_back('\\');
+            out.push_back(c);
+        } else {
+            out.push_back(c);
+        }
     }
+    if (needs_quote) out.push_back('"');
     return out;
 }
 
-/// Executes an external helper directly via fork+execvp (ZERO /bin/sh shell invocation -> immune to command injection).
+/// Executes an external helper directly via posix_spawnp (ZERO /bin/sh shell invocation, async-signal-safe in MT process).
 bool runProcessNoShell(const std::vector<std::string>& argv) {
     if (argv.empty()) return false;
-    pid_t pid = ::fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        int devnull = ::open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            ::dup2(devnull, STDOUT_FILENO);
-            ::dup2(devnull, STDERR_FILENO);
-            ::close(devnull);
-        }
-        std::vector<char*> cargs;
-        cargs.reserve(argv.size() + 1);
-        for (const auto& a : argv) cargs.push_back(const_cast<char*>(a.c_str()));
-        cargs.push_back(nullptr);
-        ::execvp(cargs[0], cargs.data());
-        ::_exit(127);
-    }
+    std::vector<char*> cargs;
+    cargs.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargs.push_back(const_cast<char*>(a.c_str()));
+    cargs.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) return false;
+    ::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    pid_t pid = -1;
+    int rc = ::posix_spawnp(&pid, cargs[0], &actions, nullptr, cargs.data(), environ);
+    ::posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0 || pid <= 0) return false;
+
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) return false;
@@ -97,6 +108,39 @@ std::string slugify(const std::string& s) {
     }
     while (!out.empty() && out.back() == '-') out.pop_back();
     return out.empty() ? "webapp" : out;
+}
+
+std::string extractOriginUrl(const std::string& url) {
+    auto scheme_pos = url.find("://");
+    if (scheme_pos == std::string::npos) return "";
+    auto slash_pos = url.find('/', scheme_pos + 3);
+    return (slash_pos == std::string::npos) ? url : url.substr(0, slash_pos);
+}
+
+/// Detects downloaded image magic bytes so ImageMagick never misinterprets `.raw` as an Adobe DNG camera file!
+std::string detectImageExtension(const fs::path& file_path) {
+    std::ifstream in(file_path, std::ios::binary);
+    if (!in.is_open()) return "";
+    unsigned char hdr[64]{};
+    in.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    auto n = in.gcount();
+    if (n < 4) return "";
+
+    if (hdr[0] == 0x89 && hdr[1] == 'P' && hdr[2] == 'N' && hdr[3] == 'G') return ".png";
+    if (hdr[0] == 0x00 && hdr[1] == 0x00 && (hdr[2] == 0x01 || hdr[2] == 0x02) && hdr[3] == 0x00) return ".ico";
+    if (hdr[0] == 0xFF && hdr[1] == 0xD8 && hdr[2] == 0xFF) return ".jpg";
+    if (hdr[0] == 'G' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == '8') return ".gif";
+    if (n >= 12 && hdr[0] == 'R' && hdr[1] == 'I' && hdr[2] == 'F' && hdr[3] == 'F' &&
+        hdr[8] == 'W' && hdr[9] == 'E' && hdr[10] == 'B' && hdr[11] == 'P') {
+        return ".webp";
+    }
+    std::string prefix(reinterpret_cast<const char*>(hdr), static_cast<size_t>(n));
+    if (prefix.find("<svg") != std::string::npos || prefix.find("<?xml") != std::string::npos) {
+        if (prefix.find("<html") == std::string::npos && prefix.find("<!DOCTYPE html") == std::string::npos) {
+            return ".svg";
+        }
+    }
+    return "";
 }
 
 }  // namespace
@@ -130,28 +174,62 @@ InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
     std::string app_id = makeAppId(clean_name, clean_url);
     std::string icon_name = "io.explorer.Browser";
 
-    // Best-effort favicon download & crisp 256px PNG icon generation via fork+execvp (ZERO shell!).
+    // Best-effort favicon download & crisp multi-size PNG icon generation via posix_spawnp (ZERO shell!).
+    std::vector<std::string> icon_candidates;
     if (isValidHttpUrl(favicon_url)) {
+        icon_candidates.push_back(favicon_url);
+        std::string origin = extractOriginUrl(clean_url);
+        if (!origin.empty()) {
+            icon_candidates.push_back(origin + "/apple-touch-icon.png");
+            icon_candidates.push_back(origin + "/favicon.ico");
+            icon_candidates.push_back("https://www.google.com/s2/favicons?sz=256&domain_url=" + origin);
+        }
+    }
+
+    if (!icon_candidates.empty()) {
         fs::path png_dir = icons_dir_ / "256x256" / "apps";
         fs::create_directories(png_dir, ec);
-        fs::path tmp_raw = fs::temp_directory_path() / (app_id + "." + std::to_string(::getpid()) + ".raw");
         fs::path dest_png = png_dir / (app_id + ".png");
 
-        bool fetched = runProcessNoShell(
-            {"curl", "-fsSL", "--proto", "=http,https", "--max-time", "4", "--max-filesize", "2097152",
-             favicon_url, "-o", tmp_raw.string()});
-        if (fetched &&
-            runProcessNoShell({"magick", tmp_raw.string() + "[0]", "-background", "none",
-                               "-resize", "256x256", dest_png.string()}) &&
-            fs::exists(dest_png, ec) && fs::file_size(dest_png, ec) > 100) {
-            icon_name = app_id;
+        for (const auto& cand_url : icon_candidates) {
+            if (!isValidHttpUrl(cand_url)) continue;
+            fs::path tmp_dl = fs::temp_directory_path() / (app_id + "." + std::to_string(::getpid()) + ".dl");
+            bool fetched = runProcessNoShell(
+                {"curl", "-fsSL", "--proto", "=http,https", "--max-time", "5", "--max-filesize", "2097152",
+                 "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+                 cand_url, "-o", tmp_dl.string()});
+            std::string ext = fetched ? detectImageExtension(tmp_dl) : "";
+            if (!ext.empty()) {
+                fs::path tmp_typed = tmp_dl;
+                tmp_typed.replace_extension(ext);
+                fs::rename(tmp_dl, tmp_typed, ec);
+                // For multi-layer .ico files, [-1] selects the highest-resolution frame (e.g. 48x48/64x64 instead of 16x16).
+                std::string frame_sel = (ext == ".ico") ? "[-1]" : "[0]";
+                if (runProcessNoShell({"magick", tmp_typed.string() + frame_sel, "-background", "none",
+                                       "-resize", "256x256", dest_png.string()}) &&
+                    fs::exists(dest_png, ec) && fs::file_size(dest_png, ec) > 100) {
+                    icon_name = app_id;
+                    for (const char* sz : {"128x128", "64x64", "48x48"}) {
+                        fs::path sdir = icons_dir_ / sz / "apps";
+                        fs::create_directories(sdir, ec);
+                        runProcessNoShell({"magick", dest_png.string(), "-background", "none",
+                                           "-resize", sz, (sdir / (app_id + ".png")).string()});
+                    }
+                    fs::remove(tmp_typed, ec);
+                    break;
+                }
+                fs::remove(tmp_typed, ec);
+            }
+            fs::remove(tmp_dl, ec);
         }
-        fs::remove(tmp_raw, ec);
     }
 
     fs::path desktop_file = apps_dir_ / (app_id + ".desktop");
     {
         std::ofstream out(desktop_file, std::ios::trunc);
+        if (!out.is_open()) {
+            return InstalledWebApp{};
+        }
         out << "[Desktop Entry]\n"
             << "Version=1.0\n"
             << "Type=Application\n"
@@ -166,6 +244,10 @@ InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
             << "StartupNotify=true\n"
             << "StartupWMClass=" << app_id << "\n"
             << "X-Explorer-WebApp-URL=" << clean_url << "\n";
+        out.flush();
+        if (!out.good()) {
+            return InstalledWebApp{};
+        }
     }
 
     runProcessNoShell({"gtk-update-icon-cache", "-f", "-t", icons_dir_.string()});
@@ -206,20 +288,36 @@ bool LinuxWebAppInstaller::uninstall(const std::string& app_id) const {
     if (!isValidAppId(app_id)) return false;
     std::error_code ec;
     bool removed = fs::remove(apps_dir_ / (app_id + ".desktop"), ec);
-    fs::remove(icons_dir_ / "256x256" / "apps" / (app_id + ".png"), ec);
+    for (const char* sz : {"256x256", "128x128", "64x64", "48x48"}) {
+        fs::remove(icons_dir_ / sz / "apps" / (app_id + ".png"), ec);
+    }
     return removed;
 }
 
 void LinuxWebAppInstaller::launch(const InstalledWebApp& app) const {
     if (!isValidAppId(app.app_id) || !isValidHttpUrl(app.url)) return;
+    // Pre-allocate strings BEFORE fork() so the child performs only async-signal-safe syscalls,
+    // and double-fork + waitpid so the launched WebApp never leaves a zombie process.
+    std::string bin_str = browser_bin_.string();
+    std::string app_arg = "--app=" + app.url;
+    std::string id_arg = "--app-id=" + app.app_id;
+    const char* bin = bin_str.c_str();
+    const char* arg1 = app_arg.c_str();
+    const char* arg2 = id_arg.c_str();
+
     pid_t pid = ::fork();
+    if (pid < 0) return;
     if (pid == 0) {
         ::setsid();
-        std::string app_arg = "--app=" + app.url;
-        std::string id_arg = "--app-id=" + app.app_id;
-        ::execl(browser_bin_.c_str(), browser_bin_.c_str(), app_arg.c_str(), id_arg.c_str(), nullptr);
-        ::_exit(127);
+        pid_t grandchild = ::fork();
+        if (grandchild == 0) {
+            ::execl(bin, bin, arg1, arg2, nullptr);
+            ::_exit(127);
+        }
+        ::_exit(0);
     }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
 }
 
 }  // namespace explorer::webapp

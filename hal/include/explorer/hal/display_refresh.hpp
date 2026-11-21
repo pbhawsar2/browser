@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -29,7 +30,11 @@ public:
     void shutdown() override;
 
 private:
-    std::atomic<int> last_hz_{-1};
+    std::mutex mu_;
+    int desired_hz_ = -1;
+    int applied_hz_ = -1;
+    bool apply_in_flight_ = false;
+    std::thread apply_thread_;
     std::atomic<bool> stop_watcher_{false};
     int wake_fd_ = -1;
     std::thread watcher_thread_;

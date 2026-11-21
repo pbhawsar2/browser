@@ -1,0 +1,740 @@
+DeepSeak Review — Explorer Browser
+Date: 2026-11-21
+Scope: Independent full-source review of hal/, policy/, shield/, shield-brave/, vault/, webapp/, engine/, app/, tests, CMake, installer/updater scripts, and README.
+Method: Read the non-generated sources and build files; built the Rust static library; built and ran the Release test suite; independently configured a Debug build at /tmp/opencode/review-debug and ran CTest there; inspected CEF callbacks, object lifetimes, persistence paths, and the security trust boundaries.
+Status of tree: No source files were modified by this review. `git status` showed only the pre-existing untracked BeamCodeReview.text. This review is independent of that document; several of its claims were checked and some are corrected below.
+
+================================================================================
+0. EXECUTIVE SUMMARY
+================================================================================
+
+The modular separation is generally good: HAL, policy, shield, vault, webapp, engine, and app are cleanly separated, and the shield/vault implementations are small enough to audit. The largest problems are not in the module boundaries; they are in lifecycle ownership, the test strategy, shutdown/session state, and a few security-sensitive validation paths.
+
+The most important conclusions:
+
+1. The Release test suite is largely vacuous. Release builds use -DNDEBUG, five of six test suites use assert(), and every call inside an assert is removed. The suite still reports 6/6 passing. A Debug build exposes a real failure in test_vault (javascript: origin accepted), proving the Release green result is not evidence of correctness.
+2. Normal window shutdown can overwrite a good session with an empty one. The close path saves the session, tabs are then erased as CEF closes them, and handleWindowDestroyed saves again from the now-empty tab list.
+3. The close state machine destroys the chrome/HUD before tab close confirmation and leaves `closing_` set if a page cancels unload. A cancelled close can leave a chromeless, partially stuck window.
+4. Detached threads and posted tasks capture raw `this` pointers and can outlive BrowserWindow or BraveAdblockShield. The filter updater can run for up to 60 seconds (three curl calls) after the user quits.
+5. Several fork/exec sites perform non-async-signal-safe work in the child of a multithreaded CEF process (malloc, std::string, std::vector, execlp/execvp). This can deadlock the child before exec.
+6. Downloads are accepted automatically with no user confirmation, and the engine-builder disables Safe Browsing. A page can cause files to be written to ~/Downloads; the HUD can then open them with xdg-open.
+7. Origin validation in the vault accepts scheme-like strings that do not contain "://" (javascript:, data:, mailto:). The Debug test fails on `javascript:alert(1)`.
+8. The local CEF installer reuses a world-writable /tmp directory if present and neither installer nor updater verifies a checksum/signature. This is a local supply-chain risk.
+9. Widevine is not actually registered with CEF. Adding an `enable-widevine` command-line switch is not sufficient; CefRegisterWidevineCdm is absent.
+10. The PPD performance-hold code can acquire duplicate holds because `ppd_cookie_` remains empty until the asynchronous acquire completes.
+
+Severity key: HIGH = security/data-loss/stability issue that should be fixed before calling the browser production-ready; MEDIUM = functional, privacy, performance, or portability defect with a realistic user impact; LOW = hardening, cleanup, or documentation issue.
+
+================================================================================
+1. VERIFICATION PERFORMED
+================================================================================
+
+1.1 Rust shield
+- `cargo build --release --manifest-path shield-brave/Cargo.toml` completed successfully.
+
+1.2 Release C++ build and tests
+- `cmake --build build` completed with no pending work.
+- `ctest --test-dir build --output-on-failure` reported 6/6 suites passing.
+- `build/CMakeCache.txt` shows `CMAKE_BUILD_TYPE=Release` and `CMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG`.
+- `nm -C build/test_vault | grep -c __assert_fail` returned 0. The assertion machinery is compiled out.
+
+1.3 Independent Debug build
+- Configured `/tmp/opencode/review-debug` with `-DCMAKE_BUILD_TYPE=Debug -DCEF_ROOT=/nonexistent` (HAL/policy/shield/vault/webapp/app-store tests only) and built it.
+- CTest result: 5/6 pass. `explorer_vault_tests` aborts with:
+
+    test_vault: /home/piyush/Documents/browser/vault/tests/test_vault.cpp:24:
+    int main(): Assertion `!v.saveOrUpdate("javascript:alert(1)", "u", "p")' failed.
+
+- This is a real defect in `AesGcmPasswordVault::normalizeOrigin`, not a test-only issue: the function returns `https://javascript:alert(1)`.
+
+1.4 Sandbox / packaging observation
+- `/home/piyush/.local/share/explorer-cef/Release/chrome-sandbox` exists with mode 0755, not setuid 4755.
+- On this host `/proc/sys/user/max_user_namespaces` is 60409, so Chromium's user-namespace sandbox may still work. On distributions that disable unprivileged user namespaces, the browser will fail to start unless the helper is setuid root or `EXPLORER_NO_SANDBOX=1` is set. The installer does not check or explain this.
+
+================================================================================
+2. HIGH-SEVERITY FINDINGS
+================================================================================
+
+[H1] Release tests are compiled with assertions removed; the green CTest result is misleading
+Files: CMakeLists.txt:6-8,26,89-113; hal/tests/test_hal.cpp; policy/tests/test_policy.cpp;
+       shield/tests/test_shield.cpp; vault/tests/test_vault.cpp; webapp/tests/test_webapp.cpp
+Evidence:
+- CMake defaults to Release and uses `-O3`; CMake's Release configuration adds `-DNDEBUG`.
+- Five of the six test executables use plain `assert()`. Only app/tests/test_app_stores.cpp defines a custom `CHECK`.
+- With NDEBUG, the assert expressions are not evaluated. That removes not just the checks but the calls:
+  * test_vault never calls saveOrUpdate/remove/findForOrigin inside asserts.
+  * test_shield never calls evaluate() for its block/allow cases.
+  * test_webapp never calls uninstall() for its traversal cases.
+  * test_hal never applies or verifies throttling.
+  * test_policy never exercises most policy assertions.
+- The test binaries still print "ALL PASSED" and return 0, so install.sh's ctest step gives false confidence.
+- The Debug run proves the suite is not actually green: test_vault fails at line 24.
+Impact: regressions in the most security-sensitive code (vault origin handling, shield decisions, webapp path validation) can ship while CI says everything passed.
+Recommendation:
+- Build tests in Debug (or at least without NDEBUG) in CI and in install.sh.
+- Replace assert() with an always-on test macro/check framework in all suites.
+- Never put side-effecting calls inside an assertion.
+- Add a CTest label/configuration for Debug and run both Debug and Release.
+- Consider `-DNDEBUG` only for the browser target, not for test targets.
+
+[H2] Vault origin validation accepts non-URL schemes and fails its own test
+File: vault/src/password_vault.cpp:113-137; vault/tests/test_vault.cpp:22-26
+Evidence:
+- `normalizeOrigin` defaults the scheme to "https" whenever the input does not contain "://".
+- `javascript:alert(1)` therefore becomes `https://javascript:alert(1)`, and saveOrUpdate succeeds.
+- `data:text/html,...` becomes `https://data:text`, and `mailto:user@example.com` becomes a bogus https authority (the '@' check then rejects mailto, but data: without '@' is accepted).
+- The comment says non-web schemes are rejected, but the implementation only rejects them when they contain "://".
+- The Debug test fails exactly on the javascript case. The Release test hides it because the assert is removed.
+Impact:
+- The vault's origin key is not guaranteed to be a real web origin.
+- A future caller that trusts `normalizeOrigin` (for example autofill or a credential UI) can be confused by invalid origins.
+- The test suite's own security contract is violated.
+Recommendation:
+- Use a real URL parser (CEF's GURL, or a small strict parser) and require a valid http/https scheme and non-empty host.
+- Reject any input whose scheme is not exactly http or https, even when "://" is absent.
+- Canonicalize host (lowercase, IDNA/punycode), drop default ports, reject userinfo, invalid ports, and control characters.
+- Add tests for javascript:, data:, mailto:, file:, chrome:, `https://`, invalid ports, Unicode hosts, and default-port duplicates.
+
+[H3] Normal shutdown can overwrite the saved session with an empty tab list
+Files: app/src/browser_window.cpp:381-384,399-436,1388-1416,1494-1506
+Evidence:
+- `handleCanClose()` sets `closing_ = true`, calls `flushSessionNow()` (line 403), then calls `TryCloseBrowser()` on every tab.
+- As CEF closes each tab, `ExplorerCefClient::OnBeforeClose` calls `onTabClosed()`, which erases the tab from `tabs_` (lines 1400-1406).
+- `handleWindowDestroyed()` unconditionally calls `flushSessionNow()` again (line 384).
+- `flushSessionNow()` serializes the current `tabs_`; if the tabs have already been erased, it writes an empty URL list.
+- The last-tab path is especially exposed: `closeTab()` calls `window_->Close()` without removing the tab, then the same sequence runs.
+Impact: Session restore silently loses the user's tabs on a normal exit. The saved state depends on CEF's internal close ordering, so it may be intermittent and hard to reproduce.
+Recommendation:
+- Save the session once, at the start of close, and do not save again from `handleWindowDestroyed` (or guard the second save with `if (!closing_)`).
+- Better: snapshot the session data into a local struct in `handleCanClose` and write that snapshot, independent of tab teardown.
+- Add an integration test that closes a window with N tabs and verifies session.json still has N URLs.
+
+[H4] Close state machine can leave a chromeless, stuck window and is re-entrant
+Files: app/src/browser_window.cpp:399-436,520-563,1346-1386
+Evidence:
+- `handleCanClose()` destroys the HUD overlay and chrome view before it knows whether all tabs will close (lines 405-417).
+- If a tab's beforeunload handler cancels, `TryCloseBrowser()` returns false, `handleCanClose()` returns false, but `closing_` is never reset.
+- Once `closing_` is true:
+  * `closeTab()` returns immediately (line 522), so the user cannot close the remaining tabs normally.
+  * `onTabDoClose()` returns false for every tab (line 1348), which sends CEF's standard close notification back to the same top-level window.
+- `handleCanClose()` iterates `tabs_` and `retiring_tabs_` while calling `TryCloseBrowser()`; if CEF delivers `OnBeforeClose` synchronously, `onTabClosed()` can erase the current element and invalidate the iteration.
+- The result can be a window with no chrome/HUD, tabs that cannot be closed through the normal path, or a shutdown that depends on an OnBeforeClose callback that never arrives.
+Impact: A page can cancel the window close and leave the browser in a broken UI state. This is a realistic user flow (a site with an unload confirmation).
+Recommendation:
+- Do not destroy chrome/HUD until every tab has confirmed close.
+- Reset `closing_` when the close is cancelled.
+- Do not return false from `onTabDoClose()` merely because `closing_` is set; distinguish "window close in progress" from "tab close in progress".
+- Copy the tab IDs to close into a local vector before calling TryCloseBrowser, so callback-driven erasure cannot invalidate iteration.
+- Add a timeout/fallback for OnBeforeClose and a test with a beforeunload handler.
+
+[H5] Detached threads and posted tasks capture raw `this` and can outlive their owners
+Files:
+- shield/src/content_shield.cpp:117-122,164-224
+- app/src/browser_window.cpp:226-234,381-384,899-906,1014-1023,1458-1474
+- hal/src/power_governor.cpp:150-186,189-246,249-272
+- hal/src/display_refresh.cpp:251-260
+Evidence:
+- `BraveAdblockShield::updateFilterListsAsync()` starts `std::thread([this, ...]{ ... }).detach()`.
+  The thread reads `filters_dir_`, calls `loadCombinedRules()`, calls `ruleCount()`/`handle_`, and invokes the completion callback. The destructor frees `handle_`. Three curl downloads can run for up to 20 seconds each, so quitting during an update leaves the thread using freed state.
+- The completion callback captures `BrowserWindow* this` and checks `alive_` before posting an `Unretained(this)` task. There is a race between the check and task execution.
+- `webapp_install` starts a detached thread that captures `this`, then posts `onWebAppInstallFinished` with `Unretained(this)` after checking `alive_`. The same race exists.
+- `LinuxPowerGovernor::setPerformanceHoldAsync()` starts detached acquire/release threads; `shutdown()` joins only the watcher, not these workers.
+- `MutterDisplayRefreshCtrl::setEdpRefreshRateAsync()` starts detached threads; the lambda itself captures only `target_hz`, so it is not a UAF, but multiple threads can apply modes out of order.
+- `BrowserWindow::~BrowserWindow()` detaches clients but does not call `power_gov->shutdown()` or `display_ctrl->shutdown()`; those are only called from `handleWindowDestroyed()`. If the object is destroyed through another path, the watcher callbacks still capture a dead `this`.
+- The constructor posts `syncSystemPower` and `onTelemetryTick` with `Unretained(this)`; those tasks can outlive the window.
+Impact: Use-after-free/crash on quit, especially during a filter update or webapp install; possible shutdown hang or corrupted state. This is undefined behavior, not just a leak.
+Recommendation:
+- Introduce a refcounted lifetime token (shared_ptr<Lifetime>) captured by every async task; check it on the UI thread before touching BrowserWindow.
+- Own all workers in a small executor/thread pool; provide `cancel()`/`shutdown()` and join.
+- Do not detach threads that touch object state.
+- Make `shutdown()` idempotent and call it from the destructor as well as the window-destroyed path.
+- Use `CefPostTask` with a refcounted helper rather than `base::Unretained(this)`.
+
+[H6] fork() followed by non-async-signal-safe child code in a multithreaded process
+Files:
+- webapp/src/webapp_installer.cpp:63-86,213-223
+- shield/src/content_shield.cpp:192-209
+- app/src/browser_window.cpp:96-105
+Evidence:
+- CEF runs many threads. After fork(), POSIX only guarantees async-signal-safe functions in the child before exec.
+- `runProcessNoShell()` builds `std::vector<char*>` in the child (heap allocation), then calls `execvp()` (PATH search and possibly allocation).
+- `launch()` builds `std::string app_arg` and `std::string id_arg` in the child (heap allocation), then calls `execl()`.
+- `content_shield.cpp` and `spawnDetachedXdgOpen()` call `execlp()` in the child (not async-signal-safe).
+- If another thread holds the malloc/stdio lock at the moment of fork, the child can deadlock before exec.
+Impact: Intermittent hangs when installing a webapp, updating filters, or opening a downloaded file. The parent may wait forever in `waitpid()`.
+Recommendation:
+- Use `posix_spawn()` (or `posix_spawnp()`) for all helper processes.
+- If fork must be used, pre-build argv/envp before fork and use `execv()`/`execve()` with absolute paths; use only async-signal-safe calls in the child.
+- Reap children (or double-fork) and handle SIGCHLD.
+
+[H7] Downloads are auto-accepted with no user confirmation; Safe Browsing is disabled
+Files:
+- engine/src/cef_client.cpp:290-299
+- engine-builder/args.gn:17-22
+- app/src/browser_window.cpp:992-1000
+Evidence:
+- `OnBeforeDownload()` immediately calls `callback->Continue(dest.string(), false)` for every download. There is no prompt, no content-type/size check, and no user gesture requirement.
+- The custom engine build sets `safe_browsing_mode = 0`, so Chromium's download protection is not available.
+- `dl_open` opens any completed download path with `xdg-open`; an executable or `.desktop` file can be launched with one click from the HUD.
+Impact:
+- A page can write files to the user's Downloads directory without an explicit save dialog (drive-by download).
+- The user may be social-engineered into opening an executable.
+- This is a meaningful security regression compared with mainstream browsers.
+Recommendation:
+- Ask the user before starting a download; show source URL, filename, size, and type.
+- Reject or warn on executable/MIME types; do not auto-open them.
+- Enable Safe Browsing or implement a download allowlist/warning.
+- Keep the "Open File" action behind an explicit confirmation and validate the path is still the same file (inode/hash) before opening.
+
+[H8] PPD performance-hold acquisition can leak duplicate holds and reorder release/acquire
+File: hal/src/power_governor.cpp:150-186,249-272
+Evidence:
+- `setPerformanceHoldAsync(true)` checks `ppd_cookie_.has_value()` under the mutex, but the cookie is only stored after the asynchronous `holdPpdProfileSync()` returns.
+- Two rapid `true` calls both see an empty cookie and both acquire a hold. The second completion overwrites `ppd_cookie_`; the first cookie is lost and never released.
+- `shutdown()` releases only the single stored cookie.
+- A release thread and a subsequent acquire thread are both detached, so the final PPD state depends on which D-Bus call completes last, not on the requested state.
+Impact: The CPU can remain pinned in the performance profile after the UI says battery/zero-fan mode, or the requested hold can be lost. Repeated toggles can accumulate holds.
+Recommendation:
+- Serialize hold/release operations through one worker and a desired-state state machine.
+- Track a set of outstanding cookies (or acquire only when no request is in flight).
+- Join/cancel the worker in shutdown and release every cookie.
+- Verify the final state after each transition if PPD exposes a property.
+
+[H9] Local CEF installer reuses a world-writable /tmp path and downloads without integrity verification
+Files:
+- install-cef.sh:17-35
+- update.sh:47-69
+Evidence:
+- If `/tmp/explorer-v2-poc/cef/Release` and `/tmp/explorer-v2-poc/cef/cmake/FindCEF.cmake` exist, `install-cef.sh` copies them into `~/.local/share/explorer-cef` and the build links against that `libcef.so`.
+- `/tmp` is world-writable. On a multi-user machine, another user can create `/tmp/explorer-v2-poc/cef` with a malicious library and wait for the victim to run the installer.
+- The normal download path uses `curl -fL` with no checksum or signature check.
+- `update.sh` also downloads a CEF archive and extracts it with no checksum/signature verification.
+Impact: Local privilege escalation to the installing user (code execution in the browser process) or a supply-chain compromise if the download host/CDN is compromised.
+Recommendation:
+- Remove the `/tmp` reuse path entirely, or require an explicit opt-in plus a checksum/signature.
+- Pin SHA-256 checksums for the CEF archive and verify before extraction.
+- Prefer a signed package/repository or a user-owned cache directory with 0700 permissions.
+- Validate the extracted tree (libcef.so, chrome-sandbox, resources) before use.
+
+[H10] Widevine is not actually registered with CEF
+Files: engine/src/cef_flags.cpp:140-145; README.md:3,13; engine-builder/args.gn:20
+Evidence:
+- The code only appends the `enable-widevine` command-line switch when `/opt/google/chrome/WidevineCdm/manifest.json` exists.
+- CEF requires the embedder to call `CefRegisterWidevineCdm()` with the CDM path and version; a command-line switch alone does not load a CDM.
+- The hardcoded path only covers Google Chrome on some distributions; Fedora/Arch/Chromium paths are not checked.
+- The README claims Netflix/Prime/Hotstar DRM parity.
+Impact: DRM-protected streaming will fail even when a Widevine CDM is installed. The feature claim is misleading.
+Recommendation:
+- Call `CefRegisterWidevineCdm()` after CEF initialization (or before, per CEF version) with a discovered CDM path/version.
+- Search common locations (`/opt/google/chrome/WidevineCdm`, `/usr/lib64/chromium/WidevineCdm`, `/usr/lib/chromium/WidevineCdm`, user data dirs).
+- If no CDM is found, remove or qualify the DRM claim.
+
+================================================================================
+3. MEDIUM-SEVERITY FINDINGS
+================================================================================
+
+[M1] Adblock resource-type mapping misses media, fonts, objects, workers, and ping
+Files: engine/src/cef_client.cpp:14-27; shield/include/explorer/shield/content_shield.hpp:15-23; shield/src/content_shield.cpp:96-107
+Evidence:
+- `ResourceKind` has only MainFrame, SubFrame, Script, Image, Stylesheet, XhrOrFetch, Other.
+- `mapCefResourceType()` maps only those; RT_MEDIA, RT_FONT_RESOURCE, RT_OBJECT, RT_WORKER, RT_SHARED_WORKER, RT_PREFETCH, RT_FAVICON, RT_PLUGIN_RESOURCE all become Other.
+- RT_PING and RT_CSP_REPORT are mapped to `xmlhttprequest`, so `$ping`/`$csp` rules do not match their real types.
+Impact: EasyList/EasyPrivacy rules that use `$media`, `$font`, `$object`, `$worker`, `$ping`, or `$websocket` are less effective. Video ads and font/beacon trackers can slip through.
+Recommendation:
+- Extend ResourceKind and the mapping to the full CEF resource type set.
+- Pass "ping", "media", "font", "object", "websocket", "worker", etc. to adblock-rust.
+- Add tests with `$media`, `$font`, `$object`, and `$ping` rules.
+
+[M2] "Secure origin" checks use prefix matching, not host equality
+Files: app/src/browser_window.cpp:959-965; app/src/main.cpp:116-118
+Evidence:
+- `live_origin.rfind("http://localhost", 0) == 0` accepts `http://localhost.evil.com`.
+- `live_origin.rfind("http://127.0.0.1", 0) == 0` accepts `http://127.0.0.1.evil.com`.
+- The login-capture bridge uses the same prefix test on the frame URL.
+- The exact `live_origin == req_origin` comparison limits the blast radius, but a credential saved for the attacker-controlled host can still be autofilled over plaintext HTTP, and the code labels the origin "secure" when it is not.
+Recommendation:
+- Parse the host and require exactly `localhost` or a loopback IP literal, or require `https://`.
+- Do not use string prefixes for origin/security decisions.
+- Reuse the same strict origin parser for vault save, vault fill, and login capture.
+
+[M3] Vault key creation and persistence are not safe against concurrent instances
+File: vault/src/password_vault.cpp:161-180,228-268
+Evidence:
+- `ensureKey()` generates a random key when the key file is missing, then `writeSecretFileAtomic0600()` unlinks the temp path and creates it with O_EXCL.
+- If two processes start with the same profile and no key, both generate a key. The second write replaces the first key. The first process then encrypts `vault.enc` with a key that is no longer on disk.
+- If `vault.key` exists but is short/corrupt, `ensureKey()` silently generates a new key and overwrites the old one, orphaning all existing credentials.
+- `persistToDisk()` has no interprocess lock; two instances can overwrite each other's vault.enc (last writer wins).
+- The file is fsynced, but the parent directory is not, so the rename may not survive a crash.
+Impact: Credential loss or a vault that cannot be decrypted after two instances run concurrently or after key corruption.
+Recommendation:
+- Create the key with O_CREAT|O_EXCL and never unlink an existing key path.
+- If the key exists but cannot be read/validated, fail closed and preserve it for recovery; do not silently rekey.
+- Use a lock file/flock around key creation and vault writes.
+- fsync the directory after rename; keep a backup of the previous vault.
+- Consider a single-instance lock for the profile.
+
+[M4] `--profile` does not isolate the vault or filter lists
+Files: app/src/main.cpp:357-377,398-408
+Evidence:
+- Session and prefs use `cfg_.profile_dir`, but `services.vault` is constructed with `defaultProfileDir()` and the shield filters use `defaultProfileDir() / "filters"`.
+- `--profile=/tmp/foo` therefore changes session/prefs/CEF cache but leaves credentials and filter state in the default profile.
+- WebApp profiles under `profile_dir/webapps/<id>` still share the default vault and filters.
+Impact: Profile isolation is incomplete; two profiles can share or overwrite credentials, and `--profile` does not provide the privacy boundary a user expects.
+Recommendation:
+- Pass `launch_cfg.profile_dir` to the vault and shield (or a dedicated `profile_dir/security` subdir).
+- Decide explicitly whether webapps should share or isolate the vault; document it.
+
+[M5] HUD updates rebuild all lists every two seconds and perform filesystem I/O on the UI thread
+Files: app/src/browser_window.cpp:757-841,1458-1474; app/include/explorer/app/chrome_ui.hpp:715-841
+Evidence:
+- `onTelemetryTick()` runs every 2 s (5 s on battery) and calls `pushHudState()` when the HUD is open.
+- `pushHudState()` serializes every credential, download, and installed webapp, then executes a large JS payload.
+- `__updateHud()` clears `innerHTML` for the vault, download, and app lists and recreates every DOM node on each update (lines 746, 780, 811).
+- `listInstalled()` scans `~/.local/share/applications` and reads each desktop file on the UI thread during every HUD update.
+Impact: Focus and scroll position in the HUD lists are lost every 2 seconds; GC churn and disk I/O cause visible jank, especially with many credentials/downloads/apps.
+Recommendation:
+- Send only changed fields and update existing DOM nodes in place.
+- Cache `listInstalled()` and invalidate on install/uninstall.
+- Pause list refresh while the user is interacting with the HUD, or refresh only when the corresponding tab is opened.
+- Move filesystem scans off the UI thread.
+
+[M6] Download progress triggers full chrome and HUD state pushes
+Files: engine/src/cef_client.cpp:301-329; app/src/browser_window.cpp:1218-1231
+Evidence:
+- `OnDownloadUpdated()` calls `observer_->onTabDownloadUpdated(rec)` on every progress update.
+- `onTabDownloadUpdated()` calls `pushChromeState()` and, if the HUD is visible, `pushHudState()`.
+- `pushChromeState()` rebuilds the full tab/vault/download JSON and executes JS; `pushHudState()` rebuilds all HUD lists.
+Impact: Large downloads can cause many full UI updates per second, high CPU, and lost HUD focus. This compounds M5.
+Recommendation:
+- Throttle/coalesce download updates to ~4 Hz or on meaningful percentage changes.
+- Update only the affected download row.
+- Do not push the full chrome state for progress changes.
+
+[M7] Background audio/video tabs are still throttled
+Files: app/src/browser_window.cpp:1458-1474; policy/src/throttle_planner.cpp:14-37
+Evidence:
+- `reconcileRendererPriorities()` always passes an empty `media` set.
+- `PidThrottlePlanner::reconcile()` throttles any tab not in `active_tabs` or `media_tabs` when on battery.
+- There is no CEF audible-state integration, despite the planner's comment that it never throttles an audio tab.
+Impact: Background music/video playback can stutter or be deprioritized on battery. Conversely, the planner's intended protection is not implemented.
+Recommendation:
+- Track audible tabs (CEF/Chromium audible state or a renderer-side hook) and feed them into `media_tabs`.
+- If audible state is unavailable, be conservative and do not throttle background tabs that may be playing media.
+- Add a policy test for shared PIDs and media tabs.
+
+[M8] `PR_SET_TIMERSLACK` is per-thread, not process-wide
+File: hal/src/power_governor.cpp:145-148; app/src/main.cpp:346-352; app/src/browser_window.cpp:1438-1450
+Evidence:
+- `applyTimerSlackNs()` calls `prctl(PR_SET_TIMERSLACK, ...)`, which affects only the calling thread.
+- It is called on the main/UI thread and on the subprocess main thread, not on CEF's renderer, GPU, IO, or worker threads.
+- The initial value (1 ns on turbo) and the later policy value (50 µs on AC) are inconsistent.
+Impact: The power optimization is mostly ineffective, and the initial/later values differ without explanation.
+Recommendation:
+- Document that Linux timer slack is per-thread; apply it in each thread that should be affected (via a thread-start hook) or drop the claim.
+- Align the initial and steady-state values.
+- Measure the actual effect before keeping the tuning.
+
+[M9] Refresh-rate control hardcodes 144 Hz, assumes eDP/GNOME, and races asynchronous applies
+Files: policy/src/power_policy.cpp:37-39; hal/src/display_refresh.cpp:45-233,251-260
+Evidence:
+- `targetRefreshHz()` returns 60 on battery/cinema or 144 otherwise.
+- `applyEdpRefreshSync()` only considers connectors starting with `eDP` and only talks to `org.gnome.Mutter.DisplayConfig`; KDE/Sway/X11 users get no effect.
+- A 120 Hz panel on AC stays at 120 (best distance 24 > 20), a 165 Hz panel stays at 165 (distance 21 > 20), and a 144 Hz panel is the only one reliably switched.
+- `setEdpRefreshRateAsync()` sets `last_hz_` before the apply completes; a failure is not retried, and rapid toggles spawn concurrent threads that can apply modes out of order.
+Impact: The "60↔144 Hz" feature is machine-specific and can leave the display at an unintended rate after rapid AC/battery changes.
+Recommendation:
+- Discover the panel's supported modes and choose the highest rate ≤ a configured cap, or 60 on battery.
+- Serialize applies through one worker; only update `last_hz_` after success; retry on failure.
+- Support KDE/Sway or make the feature explicitly GNOME-only.
+- Test with 120/144/165 Hz modes and rapid toggles.
+
+[M10] GPU isolation fallback can select a discrete GPU; libva paths are Fedora-specific
+Files: hal/src/gpu_isolator.cpp:35-58,60-85
+Evidence:
+- If no AMD/Intel render node is found, `discoverIgpuRenderNode()` falls back to `/dev/dri/renderD128` or the first node, which may be NVIDIA.
+- `applyIsolationEnv()` only sets `LIBVA_DRIVER_NAME=radeonsi` when vendor == 0x1002; an NVIDIA fallback is not isolated.
+- `LIBVA_DRIVERS_PATH` is hardcoded to `/usr/lib64/dri-freeworld:/usr/lib64/dri` (Fedora layout). On Debian/Arch, setting this to nonexistent directories can prevent libva from finding the real driver.
+Impact: Hardware decode can fail or the dGPU can remain powered on non-Fedora systems. The "Optimus D3cold" claim is not portable.
+Recommendation:
+- Return an empty/unknown node when no integrated GPU is found and let the caller decide.
+- Detect the distro's libva driver directory or leave `LIBVA_DRIVERS_PATH` unset.
+- Verify the selected node is the intended iGPU before passing `render-node-override`.
+
+[M11] `isOnBatteryBoot()` treats a battery-less desktop with mains offline as battery-powered
+File: hal/src/power_governor.cpp:121-143
+Evidence:
+- The function returns false immediately if any Mains supply is online.
+- Otherwise it sets `mains_offline = true` and returns true if any battery is discharging **or** `mains_offline`.
+- A desktop with no battery and an offline/unplugged mains supply is reported as on battery.
+Impact: The browser enters 60 Hz/zero-fan/throttled mode on a desktop with no battery, reducing performance.
+Recommendation:
+- Require at least one Battery supply to be present and discharging, or mains offline **and** a battery present.
+- Treat "no battery" as AC/unknown.
+
+[M12] Cookie preference is dead code; site-data clearing is incomplete
+Files: app/include/explorer/app/prefs_store.hpp:10-14,21-54; app/src/browser_window.cpp:1035-1054
+Evidence:
+- `UserPrefs::save_cookies` is loaded/saved and tested, but never used to configure CEF or the cookie manager.
+- `clear_site_data` calls `CefCookieManager::DeleteCookies(t->url, "", ...)` with the full page URL; CEF expects a URL used to identify the origin/path, and this may not delete cookies for all paths.
+- It only clears localStorage/sessionStorage for the current document; it does not clear IndexedDB, CacheStorage, service workers, HSTS, or other site data.
+- `clear_all_data` uses `DeleteCookies("", "", ...)`, which is broad, but still does not clear all storage types.
+Impact: The "persistent cookies & explicit clear-site-data" claim is only partially true; users may believe site data is gone when it is not.
+Recommendation:
+- Wire `save_cookies` to CEF settings/cookie manager (or remove the pref).
+- Delete cookies by origin, not by full URL.
+- Use CEF/Chromium APIs to clear cache, storage, service workers, and other site data; document what is not covered.
+
+[M13] WebApp install can report success when nothing was written
+Files: webapp/src/webapp_installer.cpp:118-175; app/src/browser_window.cpp:1009-1023
+Evidence:
+- `install()` creates directories but ignores `ec`; it opens the desktop file with `std::ofstream` and never checks `is_open()` or write success.
+- It returns a populated `InstalledWebApp` even if the desktop file could not be created.
+- The caller's detached thread always passes `true` to `onWebAppInstallFinished`, so the HUD says "Installed app: <name>" even on failure.
+- `launch()` does not wait for the child; a failed exec leaves a zombie.
+Impact: Users see a success message for an app that is not installed; failures are silent. Long sessions accumulate zombies.
+Recommendation:
+- Check directory creation, `ofstream` state, and close/flush errors; return an empty result on failure.
+- Pass the actual success flag to `onWebAppInstallFinished`.
+- Reap the launch child or use posix_spawn with a SIGCHLD handler.
+- Add tests for unwritable apps/icons directories.
+
+[M14] WebApp paths ignore `PREFIX`/`XDG_DATA_HOME`; desktop `Exec` does not quote paths
+Files: app/src/main.cpp:409-414; webapp/src/webapp_installer.cpp:152-168
+Evidence:
+- `main.cpp` hardcodes `$HOME/.local/bin/explorer`, `$HOME/.local/share/applications`, and `$HOME/.local/share/icons/hicolor`.
+- `install.sh` installs to `${PREFIX:-$HOME/.local}/bin/explorer`; if `PREFIX` is `/usr/local` or another path, the generated WebApp desktop entries point at a nonexistent binary.
+- `XDG_DATA_HOME` is ignored for WebApps even though `defaultProfileDir()` honors it.
+- `Exec=` writes the browser path and URL without quoting; a home directory containing spaces produces a broken desktop entry.
+Impact: WebApps fail to launch for non-default install prefixes, custom XDG layouts, or paths with spaces.
+Recommendation:
+- Pass the actual browser binary path and XDG data dirs from `main`/installer configuration.
+- Quote/escape `Exec` arguments per the Desktop Entry spec (double quotes, backslash escaping).
+- Add a test with a path containing spaces.
+
+[M15] Trusted chrome/HUD bridge is tied to browser ID, not URL or navigation state
+Files: app/src/main.cpp:182-219; app/src/browser_window.cpp:270-360,598-615; app/include/explorer/app/chrome_bridge.hpp:67-81
+Evidence:
+- `OnBrowserCreated()` inserts the browser ID into `trusted_chrome_ids_` when `extra_info` says `is_explorer_chrome`.
+- `OnContextCreated()` exposes `window.explorerHost.post()` to any main frame of that browser, without checking the frame URL.
+- The chrome/HUD views are loaded from data: URLs, but no `OnBeforeBrowse` guard prevents them from navigating elsewhere (drag/drop, a link, a renderer compromise, or a future UI change).
+- `ChromeUiClient` also marks the view ready on any main-frame load end.
+Impact: If a privileged chrome/HUD view ever navigates to remote content, that content inherits a privileged command bridge (webapp install, downloads, vault operations). This is a defense-in-depth failure in the most sensitive trust boundary.
+Recommendation:
+- In `OnContextCreated`, require the main frame URL to match the expected data: URL/scheme (or a per-browser nonce) before exposing `explorerHost`.
+- Implement `OnBeforeBrowse` for chrome/HUD clients to block all non-internal navigations.
+- Add a command allowlist in the browser process, not only in the WebUI JS.
+- Keep the trusted and untrusted renderer processes/request contexts separate.
+
+[M16] Login capture has no gesture requirement and uses the same prefix check
+Files: app/src/main.cpp:105-133,260-280; app/src/browser_window.cpp:1247-1256
+Evidence:
+- Any HTTPS page can call `window.__expLoginCapture(user, pass)`; the bridge accepts it as long as the frame URL starts with https:// (or the loose localhost prefix).
+- The injected submit listener does not require a user gesture or verify that the form is a login form.
+- `onTabLoginSubmitted()` stores the plaintext password in `pending_login_` until the user accepts/dismisses it; it is not cleansed on destruction or navigation.
+Impact: A malicious page can spam a "Save Login" prompt with attacker-chosen credentials, and the plaintext password remains in memory longer than necessary.
+Recommendation:
+- Require a recent user gesture and a trusted form-submit event; validate the form's action/origin.
+- Clear `pending_login_` on navigation, tab switch, and window close; cleanse the password buffer.
+- Use the strict origin parser from M2.
+
+[M17] Hand-rolled JSON parsing/escaping is incomplete
+Files: app/src/browser_window.cpp:73-112; app/src/session_store.cpp:14-25; app/include/explorer/app/prefs_store.hpp:21-36
+Evidence:
+- `extractJsonField()` handles `\n`, `\r`, `\t`, `\"`, and `\\`, but not `\uXXXX`; a password containing a JSON unicode escape is silently corrupted.
+- `jsonEscape()` does not escape U+2028/U+2029, which can terminate a JS string literal in older engines.
+- `SessionStore::escapeJson()` does not escape most control characters; `SessionStore::load()` does not decode `\uXXXX`.
+- `PrefsStore::load()` uses substring matching (`line.find("true")`) instead of parsing field values.
+Impact: Corrupted credentials, invalid JSON, and brittle persistence. These are not remote-code issues, but they are avoidable correctness bugs.
+Recommendation:
+- Use a small JSON library (nlohmann/json, RapidJSON, or simdjson) for HUD commands and persistence.
+- If a hand-rolled parser is retained, implement the full JSON string grammar and add round-trip tests with quotes, backslashes, control chars, U+2028/U+2029, and emoji.
+- Validate schemas and reject unknown/malformed fields.
+
+[M18] `EXPLORER_DISABLE_TUNING=1` also disables the adblock shield
+Files: app/src/main.cpp:403-406; engine/src/cef_flags.cpp:31-33
+Evidence:
+- The shield is only constructed when `!hw.tuning_disabled`.
+- `applyHardwareEngineFlags()` returns early when tuning is disabled, before adding feature flags.
+- The README describes `EXPLORER_DISABLE_TUNING` as a hardware/power/VA-API/V8 escape hatch, not a privacy/security switch.
+Impact: A user who disables hardware tuning for troubleshooting silently loses ad/tracker blocking.
+Recommendation:
+- Always construct the shield (and vault/webapp services); gate only hardware-specific tuning.
+- If a full "vanilla" mode is desired, add a separate `EXPLORER_DISABLE_SHIELD` and document it.
+
+[M19] Build/install hardening is missing
+Files: CMakeLists.txt:26,40,53,64,74,84,112,131,145; install.sh; install-cef.sh; update.sh
+Evidence:
+- `-O3 -march=native` is applied to all modules; the binary is not portable across CPUs and can crash with SIGILL on older machines.
+- No `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, PIE/`-fPIE`, RELRO, or `-Werror` are set.
+- `install.sh` builds Release and runs the vacuous Release tests (H1).
+- `install.sh` does not set/verify `chrome-sandbox` permissions or explain the userns fallback.
+- `install-cef.sh`/`update.sh` do not verify checksums/signatures (H9).
+Impact: Reduced exploit mitigations, non-portable binaries, and false confidence in the install.
+Recommendation:
+- Use a portable baseline (`-march=x86-64-v3` or runtime dispatch) for distributed binaries; keep `-march=native` only for local experiments.
+- Add the standard hardening flags and `-Werror` in CI.
+- Run Debug/ASan/UBSan tests in CI.
+- Verify/set the sandbox helper and document the requirement.
+- Add checksum/signature verification to both installers.
+
+[M20] Missing CEF handlers leave permission, dialog, auth, and external-protocol behavior undefined
+Files: engine/include/explorer/engine/cef_client.hpp:22-29,36-42; engine/src/cef_client.cpp
+Evidence:
+- The client implements LifeSpan, Display, Load, Request/ResourceRequest, Download, and Keyboard handlers only.
+- There is no `CefPermissionHandler`, `CefJSDialogHandler`, `CefDialogHandler`, `CefContextMenuHandler` for content, `CefFindHandler`, `CefPrintHandler`, `CefAudioHandler`, or `CefRequestHandler::OnBeforeBrowse`/`OnCertificateError`/`GetAuthCredentials`/`OnProtocolExecution`.
+- As a result, geolocation/notifications/camera/mic requests, `alert/confirm/prompt`, HTTP auth, certificate errors, and `mailto:`/`tel:` links rely on CEF defaults (often deny/suppress).
+Impact: Sites that depend on dialogs or permissions may appear broken; users have no visible permission prompts; external protocol links may do nothing.
+Recommendation:
+- Implement explicit permission prompts (or document that all permissions are denied).
+- Implement JS dialog handling or document suppression.
+- Handle HTTP auth and certificate errors.
+- Decide external-protocol behavior (`mailto:`, `tel:`) and implement `OnProtocolExecution`.
+- Add UI/tests for these flows.
+
+[M21] GPC/DNT headers are not applied to top-level navigation
+Files: engine/src/cef_client.cpp:240-273
+Evidence:
+- `GetResourceRequestHandler()` returns nullptr when `is_navigation` is true, so `OnBeforeResourceLoad()` is not called for the main document.
+- The GPC/DNT header code therefore runs only for subresources.
+Impact: The top-level request does not carry `Sec-GPC: 1`/`DNT: 1`, weakening the privacy claim.
+Recommendation:
+- Return `this` for navigation requests but skip shield evaluation for MainFrame, so the header code runs.
+- Or set the headers via a request context / `OnBeforeBrowse` equivalent.
+- Test the main document request headers.
+
+[M22] Favicons are loaded by the chrome renderer and bypass the shield
+Files: app/include/explorer/app/chrome_ui.hpp:48,425-433; app/src/browser_window.cpp:1160-1168
+Evidence:
+- The top chrome CSP allows `img-src https: http: data:`.
+- `__updateChrome` sets `img.src = t.favicon` for the tab icon.
+- The chrome view has no `ExplorerCefClient`/shield; the request is made by the privileged chrome renderer.
+Impact: A page can cause the browser chrome to fetch an arbitrary http(s) favicon URL, leaking IP/referrer and bypassing adblock/tracker blocking. It can also mixed-content-load http images in the data: chrome page.
+Recommendation:
+- Fetch favicons through the content tab's network stack/shield, or only allow data: icons.
+- Restrict `img-src` to `data:` and proxy approved favicons.
+- Validate the favicon URL scheme and size.
+
+[M23] Session/prefs persistence is not durable and prefs are world-readable
+Files: app/src/session_store.cpp:74-97; app/include/explorer/app/prefs_store.hpp:38-54
+Evidence:
+- `SessionStore::saveAtomic()` writes a temp file, chmods 0600, renames, chmods 0600; it does not fsync the file or directory.
+- `PrefsStore::save()` writes a temp file with default permissions (typically 0644) and renames without chmod/fsync.
+- Both ignore rename/write errors.
+Impact: A crash/power loss can lose session/prefs; prefs (including the adblock/autohide settings) are readable by other local users. Errors are silent.
+Recommendation:
+- Create temp files with 0600, fsync file and parent directory, then rename.
+- Check and report errors.
+- Use the same atomic-write helper for session and prefs.
+
+[M24] `resolveDownloadPath` can overwrite after 999 collisions
+File: engine/src/cef_client.cpp:58-68
+Evidence:
+- The loop tries `stem (1..999)`; if all exist, it returns the original `candidate` path, which already exists.
+Impact: A download can overwrite an existing file in the collision-heavy case.
+Recommendation:
+- Add a random/unique suffix or fail the download with an error.
+- Use O_EXCL when creating the destination if CEF allows it.
+
+[M25] `--app=` and omnibar scheme handling are broader than web-content navigation policy
+Files: policy/src/navigation_policy.cpp:31-56; app/src/main.cpp:363-395; app/src/browser_window.cpp:1197-1210
+Evidence:
+- `normalizeOmnibarInput()` allows `file://`, `chrome://`, `data:`, `explorer://`, and `about:`.
+- `--app=` accepts any string and loads it; `--app=file:///etc/passwd` is accepted.
+- Web-content popups are filtered to http/https, which is good, but there is no `OnBeforeBrowse` policy for in-page navigation.
+Impact: User-typed file/chrome URLs are intentional, but a malicious desktop file/CLI invocation or a future navigation path can load privileged/local content. The browser relies on Chromium's own scheme blocks rather than an explicit policy.
+Recommendation:
+- Keep file:// for explicit omnibar input, but add an `OnBeforeBrowse` allowlist for web-initiated navigation.
+- Validate `--app=` to http/https (or a documented set).
+- Log/confirm local-file navigation.
+
+[M26] Error handling is inconsistent and often silent
+Files: webapp/src/webapp_installer.cpp; app/src/session_store.cpp; app/include/explorer/app/prefs_store.hpp; vault/src/password_vault.cpp; hal/src/display_refresh.cpp; hal/src/power_governor.cpp
+Evidence:
+- Many `std::error_code` results are ignored (`create_directories`, `rename`, `file_size`).
+- `webapp install` ignores ofstream failure.
+- `ensureKey` silently rekeys on corruption.
+- Several `sd_bus_*` return values are unchecked.
+- `spawnDetachedXdgOpen`/`launch` do not report exec failure.
+Impact: Failures are invisible to the user and to tests; the browser can claim success while doing nothing.
+Recommendation:
+- Adopt a consistent error-handling policy: return/propagate errors, log at the call site, and surface user-visible failures for install/save/update operations.
+- Add negative tests for unwritable paths and failed helper processes.
+
+================================================================================
+4. LOW-SEVERITY / CLEANUP FINDINGS
+================================================================================
+
+[L1] Rule count is a line count, not a compiled-rule count
+Files: shield-brave/src/lib.rs:17-25; shield/src/content_shield.cpp:140-142
+- `build_engine_from_rules` counts non-empty/non-comment/non-'[' lines, not the rules adblock-rust actually compiled. The HUD "N rules" is approximate.
+
+[L2] Invalid UTF-8 and lock poisoning fail open in the Rust shield
+File: shield-brave/src/lib.rs:128-153
+- `from_utf8(...).unwrap_or("")` turns an invalid URL into an empty string; `Request::new` then fails and returns 0 (allow).
+- If a panic poisons the RwLock, `evaluate` returns 0 (allow).
+- Recommendation: fail closed or log; use `parking_lot`/handle poisoning explicitly.
+
+[L3] Filter update concurrency is not serialized
+File: shield/src/content_shield.cpp:164-224
+- Two update clicks write the same `*.tmp` files and call `reload` concurrently; `loadCombinedRules()` can read a partially written file. Add a mutex/in-flight flag and an atomic staging directory.
+
+[L4] Blocked count is never reset and is not tied to a ruleset
+Files: shield/src/content_shield.cpp:157-159; app/src/browser_window.cpp:700-705
+- The HUD count accumulates for the process lifetime, including across filter reloads. Label it "since launch" or reset on reload.
+
+[L5] `std::hash` app IDs are not stable across standard-library versions and truncate to 32 bits
+File: webapp/src/webapp_installer.cpp:104-109
+- Different libstdc++ versions may produce different hashes; a 32-bit truncation can collide. Use a stable hash (SHA-256 prefix) and handle collisions.
+
+[L6] WebApp desktop files store the full URL, including query tokens, world-readable
+File: webapp/src/webapp_installer.cpp:152-169
+- Installing an app on a URL with OAuth/session query parameters writes them to a 0644 `.desktop` file and the `Exec` line. Consider stripping query/fragment or warning.
+
+[L7] `uninstall.sh --purge-data` leaves WebApp desktop entries/icons
+Files: uninstall.sh:16-28; webapp/src/webapp_installer.cpp:204-211
+- It removes the main browser files but not `~/.local/share/applications/explorer-app-*.desktop` or their icons. Add a globbed cleanup or a manifest.
+
+[L8] `open_browser_count_` is dead state
+Files: app/include/explorer/app/browser_window.hpp:182; app/src/browser_window.cpp:1091-1122,1388-1391
+- It is incremented/decremented but never read for shutdown decisions; `checkFinishShutdown` uses `tabs_`/`retiring_tabs_`. Remove or use it consistently.
+
+[L9] `onTabFaviconChanged` only updates the chrome when more than one tab exists
+File: app/src/browser_window.cpp:1160-1168
+- With a single tab the tab bar is hidden, so this is mostly harmless, but it means the favicon state is stale if a second tab is opened later. Push state unconditionally or on tab-bar visibility change.
+
+[L10] App-mode title changes do not refresh chrome state
+File: app/src/browser_window.cpp:1143-1158
+- In app mode it only sets the window title; that is intentional because there is no chrome, but the HUD/other UI may still show stale titles if it is opened later.
+
+[L11] `pending_login_` is plaintext in memory and not cleansed
+Files: app/src/browser_window.cpp:1247-1256; app/include/explorer/app/browser_window.hpp:165
+- Clear it on navigation/tab switch/close and cleanse the password buffer. Consider a secure string type.
+
+[L12] `resolveDownloadPath` trusts `XDG_DOWNLOAD_DIR` and existing symlinks
+File: engine/src/cef_client.cpp:29-68
+- The path is checked with `exists()` and then handed to CEF; a local attacker who can create a symlink at the destination could redirect the write. Use O_NOFOLLOW/O_EXCL where possible.
+
+[L13] Downloads list is capped at 30 entries
+File: app/src/browser_window.cpp:1225-1229
+- Older completed downloads disappear from the HUD and cannot be opened via `dl_open`. Use a persistent download history or a larger cap.
+
+[L14] `clear_site_data` does not clear cache/service workers/IndexedDB
+See M12. This is a functional/privacy gap rather than a code defect.
+
+[L15] `EXPLORER_DISABLE_TUNING` still samples telemetry
+File: app/src/main.cpp:402; hal/src/telemetry.cpp
+- `services.telemetry` is created regardless of tuning; `onTelemetryTick` still reads sysfs. If the escape hatch is meant to disable hardware access, gate telemetry too.
+
+[L16] `readablePath()` opens every candidate file during telemetry construction
+File: hal/src/telemetry.cpp:14-21,45-89
+- This is a one-time cost, but it can touch many hwmon/power_supply files. Consider lazy detection or caching.
+
+[L17] `sampleLite()` is not the "2-file" sample described by the comment
+File: app/src/browser_window.cpp:1466-1468; hal/src/telemetry.cpp:140-163
+- `sampleLite()` also reads every fan input and battery power. Update the comment or reduce the work.
+
+[L18] RAPL counter wrap/resume can produce a huge wattage spike
+File: hal/src/telemetry.cpp:165-180
+- `prev_rapl_` is not reset after suspend/resume or counter wrap; `*energy >= prev` only guards one direction. Clamp/ignore implausible deltas.
+
+[L19] `MutterDisplayRefreshCtrl` parsing ignores some `sd_bus_message_read` failures
+File: hal/src/display_refresh.cpp:120-142
+- The logical-monitor read result is unchecked; malformed replies can desynchronize the message cursor. Check every read/skip return.
+
+[L20] `install.sh` deletes `/tmp/explorer_*` broadly
+File: install.sh:15
+- `rm -rf /tmp/explorer_v2_* /tmp/explorer_test_* /tmp/explorer_e2e_*` can remove another user's files (subject to permissions) and is broader than necessary. Use a private temp dir.
+
+[L21] `install.sh`/`update.sh` `pkill -f` patterns are broad
+Files: install.sh:12-13; update.sh:29,84; uninstall.sh:13
+- A process whose command line contains `explorer-cef/Release/explorer` can be killed. Prefer PID files or exact executable matching.
+
+[L22] README claims exceed the implementation
+File: README.md:3,9,12,15,35
+- "atomic session restore" is undermined by H3; "Widevine" is not registered (H10); "rock-solid multi-tab stability" is undermined by H4/H5; "zero Chrome bloat" is a marketing statement, not a measurable guarantee.
+- Align the README with the actual behavior or fix the underlying issues.
+
+================================================================================
+5. KEY DESIGN ISSUES
+================================================================================
+
+[D1] Async work has no ownership model
+The code uses detached std::thread, raw `this`, `base::Unretained`, fork, and CefPostTask without a shared lifetime/cancellation abstraction. This is the root cause of H5/H6/H8. A small `TaskRunner`/executor owned by RuntimeServices, with `weak_ptr` tokens and join-on-shutdown, would remove a whole class of bugs.
+
+[D2] The close state machine is implicit
+`closing_`, `retiring_tabs_`, `open_browser_count_`, `DoClose`, `CanClose`, and `OnBeforeClose` interact without an explicit state enum or timeout. H3/H4 are symptoms. Model the window lifecycle as an explicit state machine (Open -> ClosingTabs -> ClosingWindow -> Destroyed) with cancellation and a timeout.
+
+[D3] Test strategy is not trustworthy
+The Release suite is vacuous (H1), tests are not hermetic (test_hal depends on the host GPU and `/bin/sleep`), and there are no integration tests for BrowserWindow/CEF, no Rust tests in CTest, and no sanitizer/fuzz jobs. A browser needs at least:
+- Debug and Release test runs;
+- ASan/UBSan/TSan CI;
+- a headless CEF integration harness for tab lifecycle, session save/restore, downloads, and vault autofill;
+- negative tests for every parser and origin check.
+
+[D4] The security trust boundary is identified by browser ID, not by URL/context
+H5/M15/M16 show the same pattern: a privileged capability is granted to a browser/view and then trusted for its lifetime. Prefer a capability token bound to the exact frame URL/context, with a navigation guard and a command allowlist.
+
+[D5] Persistence is ad-hoc and duplicated
+Session, prefs, vault, and webapp metadata each use their own hand-rolled format and error handling. A shared atomic-write + JSON/schema layer would fix M17/M23 and make migrations possible.
+
+[D6] Hardware tuning is hardcoded to one machine
+144 Hz, eDP/GNOME, Fedora libva paths, Ryzen 7 5800H V8 flags, `-march=native`, and AMD-only telemetry make the browser fragile on other hardware. The escape hatch (`EXPLORER_DISABLE_TUNING`) is useful, but the default path should degrade gracefully rather than assume Cezanne.
+
+[D7] UI update strategy is "rebuild everything"
+The HUD/chrome state pushes serialize and rebuild full lists on a timer and on every download progress event (M5/M6). A diff-based update model (or a small reactive store) would improve responsiveness and reduce IPC.
+
+[D8] Error handling is not part of the design
+Many operations can fail silently (M26). For a browser, install/update/save/clear operations need explicit user-visible outcomes and logs.
+
+================================================================================
+6. RECOMMENDED PRIORITY ORDER
+================================================================================
+
+1. Fix the test infrastructure (H1): Debug tests, always-on checks, no side effects in asserts, CI matrix.
+2. Fix vault origin validation and key/persistence races (H2, M3), then add the missing origin/key tests.
+3. Fix shutdown/session/close state (H3, H4): single session snapshot, explicit close state machine, reset on cancel, timeout for OnBeforeClose.
+4. Fix async lifetimes and fork safety (H5, H6): executor + lifetime tokens; posix_spawn.
+5. Fix download UX and Safe Browsing (H7).
+6. Fix PPD hold serialization (H8) and refresh-rate worker (M9).
+7. Fix installer/updater integrity and sandbox packaging (H9, M19).
+8. Register Widevine or remove the claim (H10).
+9. Address the medium security/functional items: M1, M2, M4, M12, M15, M16, M21.
+10. Address performance/UI items: M5, M6, M7, M8.
+11. Clean up low-severity items and align the README.
+
+================================================================================
+7. WHAT IS GOOD
+================================================================================
+
+- The module boundaries are clear and mostly enforced: HAL has no CEF/UI dependency, policy is pure, shield is behind an interface, vault is behind an interface, and webapp/engine/app are separated.
+- The shield uses Brave's adblock-rust rather than a homemade matcher; the C ABI is small and the slice-based hot path avoids copies.
+- The vault uses AES-256-GCM with a random 96-bit IV, a 128-bit tag, a 0600 key, atomic temp-file writes, and a tamper test.
+- The webapp installer avoids shell invocation and validates app IDs/URLs against traversal/injection.
+- The UI has a clear visual system and the documented 44 px bezel / 38 px tab bar / 1.05 zoom invariants are present in code.
+- The privacy defaults (GPC/DNT, background networking disabled, no history, no sync) are sensible; the gaps are in coverage and validation, not intent.
+- The Debug build exposed a real bug that the Release build hid; adding Debug CI is a high-leverage improvement.
+
+================================================================================
+8. VERIFICATION NOTES / REPRODUCTION
+================================================================================
+
+Release:
+  cmake --build build
+  ctest --test-dir build --output-on-failure
+  # 6/6 pass, but assertions are compiled out:
+  grep CMAKE_CXX_FLAGS_RELEASE build/CMakeCache.txt   # -O3 -DNDEBUG
+  nm -C build/test_vault | grep -c __assert_fail      # 0
+
+Debug:
+  cmake -S . -B /tmp/opencode/review-debug -DCMAKE_BUILD_TYPE=Debug -DCEF_ROOT=/nonexistent
+  cmake --build /tmp/opencode/review-debug -j"$(nproc)"
+  ctest --test-dir /tmp/opencode/review-debug --output-on-failure
+  # 5/6 pass; explorer_vault_tests aborts at vault/tests/test_vault.cpp:24
+
+Sandbox:
+  ls -l ~/.local/share/explorer-cef/Release/chrome-sandbox   # 0755, not 4755
+  cat /proc/sys/user/max_user_namespaces                     # 60409 on this host
+
+No source changes were made for this review. Do not commit or push without explicit user approval.
+
+END OF REVIEW

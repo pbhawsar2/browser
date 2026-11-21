@@ -1,0 +1,892 @@
+Argon Final Review — Explorer Browser (Master Validation & Action Plan)
+Reviewer: Gemini 4 Argon
+Date: 2026-11-21
+Scope: Complete line-by-line source verification of hal/, policy/, shield/, shield-brave/,
+       vault/, webapp/, engine/, app/, unit tests, CMake build configuration, and shell
+       install/update/uninstall scripts; full cross-validation of all four prior independent
+       reviews (BeamCodeReview.text, DeepSeakReview.text, nemotronReview.text, FluentReview.text)
+       against the actual C++20/Rust source and installed CEF 158 headers.
+Status: Read-only verification complete. No application source files were modified.
+        This document lists ONLY 100% confirmed, actionable bugs, UI defects, concurrency /
+        deadlock / memory-safety hazards, and performance inefficiencies, together with
+        exact file/line locations and concrete fix blueprints for immediate implementation
+        in the next pass.
+
+================================================================================
+0. VALIDATION SCORECARD OF PRIOR MODEL REVIEWS (WHAT WAS RIGHT vs WRONG)
+================================================================================
+
+Before listing the final actionable items, Argon cross-checked every claim in the four
+independent reviews against the source code and the installed CEF 158 (`158.0.3+g8c29be2`)
+headers (`~/.local/share/explorer-cef/include/`):
+
+1. CONFIRMED & HIGH-VALUE ACROSS PRIOR REVIEWS:
+   - [Confirmed] Release CTest suite compiles with `-DNDEBUG`, stripping `assert()` calls
+     (and their side effects!) from 5 of 6 test suites, hiding a real failure in
+     `test_vault.cpp:24` (`javascript:alert(1)` accepted by `normalizeOrigin`).
+   - [Confirmed] Normal window shutdown (`handleCanClose` -> `onTabClosed` ->
+     `handleWindowDestroyed`) calls `flushSessionNow()` a second time AFTER `tabs_` has
+     been emptied by `OnBeforeClose`, overwriting `session.json` with `"tabs": []`.
+   - [Confirmed] Cancelled window close (`beforeunload` cancel) leaves `closing_ = true`
+     after already destroying `chrome_view_` and `hud_overlay_`, resulting in a
+     chromeless window whose tabs can no longer be closed.
+   - [Confirmed] Detached threads and `CefPostTask(..., base::Unretained(this))` in
+     `BrowserWindow`, `BraveAdblockShield`, `LinuxPowerGovernor`, and
+     `MutterDisplayRefreshCtrl` can race object destruction (UAF) or apply PPD holds /
+     refresh rates out of order.
+   - [Confirmed] `fork()` in multithreaded CEF processes followed by heap allocations
+     (`std::vector`, `std::string`) and `execvp`/`execlp` is not async-signal-safe and can
+     deadlock the child process on the allocator lock; `spawnDetachedXdgOpen` and
+     `LinuxWebAppInstaller::launch` also leak zombie processes (`<defunct>`).
+   - [Confirmed] `pushHudState()` has NO change-detection signature (unlike
+     `pushChromeTelemetry()`), rebuilding all DOM lists (`innerHTML = ''`), copying the
+     entire vault vector by value, and scanning `~/.local/share/applications/*.desktop`
+     on the UI thread every 2 seconds and on every status banner or download tick.
+
+2. HALLUCINATIONS / INCORRECT RECOMMENDATIONS IN PRIOR REVIEWS (REJECTED OR CORRECTED):
+   - [REJECTED — DeepSeek H10 / Nemotron H10]: Both claimed Widevine fails because
+     `CefRegisterWidevineCdm()` is not called. Verification against the installed CEF 158
+     headers confirms `CefRegisterWidevineCdm` NO LONGER EXISTS in CEF 158 (it was removed
+     in CEF 91+). Calling it would fail compilation. In CEF 158, external Widevine CDMs are
+     configured via `--widevine-cdm-path=<dir>` or Chromium component discovery.
+   - [REJECTED — Beam H3 / DeepSeek M20 / Nemotron M20 recommendation to implement
+     `CefAudioHandler`]: Verification of `include/cef_audio_handler.h:45-48` in CEF 158
+     proves that implementing `CefAudioHandler` intercepts PCM audio and MUTES the browser's
+     audio output unless the embedder writes its own OS audio sink! Audible/media tab
+     detection for `PidThrottlePlanner` MUST instead be wired via lightweight renderer media
+     lifecycle hooks (`play`/`pause`/`ended` events in `kPageUxHooksJs`), NOT `CefAudioHandler`.
+   - [CORRECTED — DeepSeek H7 / Nemotron H7]: Both flagged `safe_browsing_mode = 0` in
+     `engine-builder/args.gn` and `callback->Continue(dest, false)` in `OnBeforeDownload` as
+     accidental regressions. In reality, Google Safe Browsing requires proprietary Google API
+     keys and phone-home telemetry (intentionally stripped in Explorer), and frameless
+     Wayland Alloy windows intentionally avoid native GTK file-chooser dialogs. The actual
+     actionable bugs in downloads are: (a) `resolveDownloadPath` overwriting `candidate` after
+     999 collisions and doing up to 1,000 synchronous `stat()` calls on the UI thread,
+     (b) uncoalesced download progress flooding `pushChromeState()` + `pushHudState()`, and
+     (c) lack of a start-banner/notification when a download begins.
+
+3. NEW BUGS DISCOVERED EXCLUSIVELY BY ARGON (MISSED BY ALL 4 PRIOR MODELS):
+   - [NEW — ARGON-UI-1] Top-bezel HUD buttons (`#btn-hud`, `#btn-shield`, `#btn-key`,
+     `#btn-downloads`, `#btn-apps`) NEVER toggle the HUD closed when clicked a second time!
+     `onChromeCommand("open_panel")` checks `if (hud_visible_ && arg.empty())`, which is dead
+     code because every button in `chrome_ui.hpp:333-337` passes a non-empty `arg`
+     (`'power'`, `'vault'`, `'downloads'`, `'apps'`).
+   - [NEW — ARGON-UI-2] Vault "Edit" button data-corruption bug (`chrome_ui.hpp:731-732`,
+     `764-769`): clicking "Edit" on a saved credential sets `#v-origin` and `#v-user` and
+     focuses `#v-pass`. Because `document.activeElement` is `#v-pass` (not `#v-origin`), the
+     next 2-second `pushHudState` tick overwrites `#v-origin.value` back to `h.currentOrigin`
+     while the user is typing the new password, saving the credential under the WRONG site!
+   - [NEW — ARGON-UI-3] WebApp `#app-name` input stale title bug (`chrome_ui.hpp:733-734`):
+     `!appField.value` prevents `#app-name` from updating when the user switches to a
+     different tab after opening the HUD once, causing WebApp installation on Tab B to use
+     Tab A's title unless manually cleared.
+   - [NEW — ARGON-UI-4] Broken Find-in-Page incremental search (`app/src/browser_window.cpp:1056`
+     & `chrome_ui.hpp:354`): `findInput` fires `send('find_next', findInput.value)` on every
+     `input` keystroke, and C++ calls `b->GetHost()->Find(arg, true, false, true)` with
+     `findNext = true` instead of `findNext = false` for changed search text, causing
+     Chromium's find controller to jump matches on every character typed. Also, switching
+     tabs while the Find bar is open never clears find highlights (`StopFinding(true)`) on
+     the previous tab.
+   - [NEW — ARGON-UI-5] Vault Autofill selector mismatch & unscoped query bug
+     (`app/src/main.cpp:267` vs `app/src/browser_window.cpp:973`): Login capture matches
+     any `input[type="text"]` in the submitted `<form>`, whereas `vault_fill` uses an
+     unscoped `document.querySelector` that only matches `name*="user"` / `name*="login"` /
+     `type="email"` / `autocomplete="username"`. Sites using `id="username"`, `name="id"`,
+     `name="account"`, or having a header search box before the login form fail to autofill
+     the username field properly.
+   - [NEW — ARGON-UI-6] Fullscreen state desynchronization (`app/src/browser_window.cpp:1186-1195`,
+     `1320-1322`): `onTabFullscreenChanged` ignores `tab_id` (allowing a background tab to
+     hijack window fullscreen), and exiting fullscreen via F11 (`ToggleFullscreen`) or
+     `win_full` does not clear `html_fullscreen_`, permanently hiding the top chrome bar
+     (`desiredChromeHeight() == 0`).
+   - [NEW — ARGON-PERF-1] Always-on scroll & mousemove listeners in `kPageUxHooksJs`
+     (`app/src/main.cpp:245-261`): Every loaded web page runs a `requestAnimationFrame`
+     scroll handler that reads `document.documentElement.scrollHeight` (forcing synchronous
+     layout/reflow during scroll) and sends `__expTopbarReveal` IPC even when
+     `prefs_.autohide_topbar` is `false` (the default).
+   - [NEW — ARGON-WAYLAND-1] Missing Fedora GNOME Wayland Dock Icon (`app/src/browser_window.cpp`
+     `FramelessWindowDelegate`): `CefWindowDelegate::GetLinuxWindowProperties` was not
+     implemented, causing CEF to send `xdg_toplevel.set_app_id("")` (empty string) to
+     Wayland and displaying a generic blue gear icon in the Fedora Dock. Fixed by
+     populating `wayland_app_id`, `wm_class_class`, and `wm_class_name` with `linuxAppId()`
+     (`"explorer"` or `cfg_.app_id`) and setting `CHROME_DESKTOP`.
+   - [NEW — ARGON-WEBAPP-1] Broken WebApp Icons in App Drawer (`webapp/src/webapp_installer.cpp:137`):
+     Downloaded favicons were saved with a `.raw` extension (`*.raw`), causing ImageMagick
+     (`magick /tmp/...raw[0]`) to fail with `error/dng.c/ReadDNGImage/705` (interpreting
+     `.raw` as an Adobe DNG camera sensor file!) and falling back to `Icon=io.explorer.Browser`.
+     Fixed by inspecting magic bytes (`.ico`, `.png`, `.svg`, `.webp`, `.jpg`, `.gif`),
+     selecting the highest-resolution `[-1]` frame for multi-size `.ico` files, adding
+     origin `/apple-touch-icon.png` + `/favicon.ico` + 256px fallback candidates with a
+     browser User-Agent, and generating 256x256, 128x128, 64x64, and 48x48 hicolor PNGs.
+   - [NEW — ARGON-PPD-1] PPD `HoldProfile` Immediately Revoked on `sd_bus_unref`
+     (`hal/src/power_governor.cpp:63`): `power-profiles-daemon` (`tuned-ppd`) revokes a
+     `HoldProfile` cookie as soon as the caller's D-Bus connection disconnects. Calling
+     `sd_bus_unref(bus)` right after `HoldProfile` immediately dropped the performance hold.
+     Fixed by keeping `ppd_bus_` open for the lifetime of the active hold.
+   - [NEW — ARGON-HUD-1] Separate `Shield` Section, Accurate Hardware Telemetry (`PPT`
+     package watts, dual cooling fans, battery `%` & charging wattage), and PAM-Authenticated
+     Vault `Show Password` (`unix_chkpwd` / `sudo` verification before revealing any saved
+     password).
+
+================================================================================
+1. CRITICAL & HIGH-SEVERITY BUGS (STABILITY, DATA LOSS, DEADLOCKS, MEMORY, UI)
+================================================================================
+
+--------------------------------------------------------------------------------
+[ARGON-H1] Normal Window Shutdown Overwrites `session.json` With Empty Tabs
+--------------------------------------------------------------------------------
+- Severity: CRITICAL (100% reproducible session data loss on normal close)
+- Location:
+  * `app/src/browser_window.cpp:381-385` (`handleWindowDestroyed`)
+  * `app/src/browser_window.cpp:399-436` (`handleCanClose`)
+  * `app/src/browser_window.cpp:1388-1416` (`onTabClosed`)
+  * `app/src/browser_window.cpp:1494-1503` (`flushSessionNow`)
+- Root Cause:
+  1. When the user closes the window, `handleCanClose()` sets `closing_ = true`, calls
+     `flushSessionNow()` (which saves the active tabs to `session.json`), and then calls
+     `TryCloseBrowser()` on all tabs.
+  2. As each tab closes, `ExplorerCefClient::OnBeforeClose` invokes `onTabClosed(tab_id)`,
+     which erases the tab from `tabs_` (`tabs_.erase(it)` at line 1405).
+  3. Once `tabs_` and `retiring_tabs_` are empty, `checkFinishShutdown()` closes the
+     `CefWindow`, firing `handleWindowDestroyed()`.
+  4. `handleWindowDestroyed()` unconditionally calls `flushSessionNow()` a second time
+     (line 384). Because `tabs_` is now empty, it overwrites `session.json` with
+     `"tabs": []`.
+- How to Fix:
+  1. Add a boolean member `bool session_flushed_on_close_ = false;` to `BrowserWindow`.
+  2. In `handleCanClose()`, before initiating tab teardown, if `!session_flushed_on_close_`,
+     call `flushSessionNow()` and set `session_flushed_on_close_ = true;` and
+     `session_dirty_ = false;`.
+  3. In `flushSessionNow()` and `scheduleSessionSave()`, return immediately if
+     `session_flushed_on_close_` is `true`.
+  4. Remove the redundant `flushSessionNow()` call from `handleWindowDestroyed()` (or guard
+     it with `if (!session_flushed_on_close_) flushSessionNow();`).
+
+--------------------------------------------------------------------------------
+[ARGON-H2] Close State Machine Destroys Chrome Prematurely & Breaks on Cancel
+--------------------------------------------------------------------------------
+- Severity: HIGH (Broken chromeless window if page `beforeunload` cancels close; iterator
+  invalidation risk)
+- Location:
+  * `app/src/browser_window.cpp:399-436` (`handleCanClose`)
+  * `app/src/browser_window.cpp:520-523` (`closeTab`)
+  * `app/src/browser_window.cpp:1344-1386` (`onTabDoClose`)
+- Root Cause:
+  1. `handleCanClose()` destroys `hud_overlay_`, `hud_view_`, and `chrome_view_` on the
+     very first close attempt BEFORE calling `TryCloseBrowser()` on content tabs.
+  2. In CEF, `TryCloseBrowser()` returns `false` on its first invocation while the renderer
+     evaluates `beforeunload` handlers (and also returns `false` if the user chooses "Stay
+     on Page").
+  3. If the user cancels unload, `closing_` remains `true`, `chrome_view_` and `hud_view_`
+     are already destroyed (leaving a permanently chromeless window), and `closeTab()`
+     returns early at line 522 (`if (closing_) return;`).
+  4. Furthermore, `handleCanClose()` iterates directly over `tabs_` and `retiring_tabs_`
+     while calling `TryCloseBrowser()`. If `OnBeforeClose` fires synchronously for any tab,
+     `onTabClosed()` mutates `tabs_` / `retiring_tabs_` mid-loop (iterator invalidation UB).
+- How to Fix:
+  1. Snapshot the `CefRefPtr<CefBrowser>` handles from `tabs_` and `retiring_tabs_` into a
+     local `std::vector<CefRefPtr<CefBrowser>>` before calling `TryCloseBrowser()`.
+  2. Do NOT destroy `hud_overlay_`, `hud_view_`, or `chrome_view_` inside `handleCanClose()`
+     while content tabs are still open. Only tear down `hud_overlay_`/`hud_view_`/`chrome_view_`
+     once `all_ready` is `true` (or inside `handleWindowDestroyed()`).
+  3. If `handleCanClose()` is cancelled or a tab remains alive after unload prompt
+     cancellation, allow normal tab operations by distinguishing window-close teardown from
+     individual tab close.
+
+--------------------------------------------------------------------------------
+[ARGON-H3] Use-After-Free & Dangling `this` in Detached Threads and Posted Tasks
+--------------------------------------------------------------------------------
+- Severity: HIGH (Undefined Behavior / crash on shutdown during filter update, WebApp
+  install, or D-Bus watcher callbacks)
+- Location:
+  * `shield/src/content_shield.cpp:117-122, 164-225` (`BraveAdblockShield::updateFilterListsAsync`)
+  * `app/src/browser_window.cpp:224-234, 357-378, 899-904, 1016-1022, 1351, 1379, 1461-1479, 1484`
+  * `hal/src/power_governor.cpp:150-187` (`LinuxPowerGovernor::setPerformanceHoldAsync`)
+  * `hal/src/display_refresh.cpp:251-260` (`MutterDisplayRefreshCtrl::setEdpRefreshRateAsync`)
+- Root Cause:
+  1. `BraveAdblockShield::updateFilterListsAsync()` spawns a detached thread capturing raw
+     `this`. It runs up to three `curl` commands (up to 20s each = 60s) and then accesses
+     `this->filters_dir_`, `this->handle_`, and `explorer_brave_shield_reload(handle_, ...)`.
+     If the user quits the browser while an update is in progress, `~BraveAdblockShield()`
+     calls `explorer_brave_shield_free(handle_)`, causing a Use-After-Free in Rust/C++.
+     Also, two concurrent clicks on "Update EasyList & Privacy Filters" race on the same
+     `*.tmp` files in `filters_dir_`.
+  2. `BrowserWindow` posts delayed and cross-thread tasks using `base::Unretained(this)`.
+     Checking `if (alive_.load())` on a background thread before calling `CefPostTask` still
+     races `~BrowserWindow()` between the `CefPostTask` call and UI-thread execution.
+  3. `~BrowserWindow()` does not call `services_.power_gov->shutdown()` or
+     `services_.display_ctrl->shutdown()` (only `handleWindowDestroyed()` does).
+- How to Fix:
+  1. In `BrowserWindow`, add `std::shared_ptr<std::atomic<bool>> life_token_ = std::make_shared<std::atomic<bool>>(true);`
+     (set `*life_token_ = false` in `handleWindowDestroyed()` and `~BrowserWindow()`).
+     Wrap all `CefPostTask` / `CefPostDelayedTask` callbacks in a small helper lambda or
+     `CefTask` that captures `life_token_` by value and only dereferences `BrowserWindow*`
+     on `TID_UI` if `life_token_->load()` is true.
+  2. Call `power_gov->shutdown()` and `display_ctrl->shutdown()` in `~BrowserWindow()` as
+     well as `handleWindowDestroyed()` (both `shutdown()` methods are already idempotent).
+  3. In `BraveAdblockShield`:
+     - Add `std::atomic<bool> updating_{false};` to reject overlapping update requests.
+     - Store the worker in a member `std::thread update_thread_;` (or share ownership of the
+       Rust handle via `std::shared_ptr`), and join `update_thread_` in
+       `~BraveAdblockShield()` so the background thread can never outlive `handle_`.
+
+--------------------------------------------------------------------------------
+[ARGON-H4] Non-Async-Signal-Safe `fork()` in Multithreaded CEF Process & Zombie Leaks
+--------------------------------------------------------------------------------
+- Severity: HIGH (Potential child deadlock on `malloc` lock + zombie `<defunct>` process
+  accumulation)
+- Location:
+  * `app/src/browser_window.cpp:97-105` (`spawnDetachedXdgOpen`)
+  * `webapp/src/webapp_installer.cpp:63-86` (`runProcessNoShell`)
+  * `webapp/src/webapp_installer.cpp:213-223` (`LinuxWebAppInstaller::launch`)
+  * `shield/src/content_shield.cpp:192-209` (`updateFilterListsAsync`)
+- Root Cause:
+  1. CEF runs dozens of threads. After `fork()` in a multithreaded process, POSIX permits
+     only async-signal-safe functions before `exec*`.
+  2. `runProcessNoShell()` allocates a `std::vector<char*>` on the heap in the child after
+     `fork()` and calls `execvp()`.
+  3. `LinuxWebAppInstaller::launch()` allocates two `std::string` objects (`app_arg`,
+     `id_arg`) on the heap in the child after `fork()` and never calls `waitpid()`, leaving
+     a zombie process every time a WebApp is launched and exits.
+  4. `spawnDetachedXdgOpen()` calls `fork()` + `execlp()` without `waitpid()`, leaving a
+     zombie `<defunct>` process every time the user clicks "Open File" or "Open Downloads
+     Folder".
+- How to Fix:
+  1. Replace `fork()` + `exec*` in `runProcessNoShell` and `updateFilterListsAsync` with
+     `posix_spawnp()` (using `posix_spawn_file_actions_addopen` / `adddup2` to redirect
+     `stdout`/`stderr` to `/dev/null`) followed by `waitpid()`.
+  2. For fire-and-forget launches (`spawnDetachedXdgOpen` and `LinuxWebAppInstaller::launch`),
+     either use the classic POSIX double-fork idiom (where the parent `waitpid()`s the
+     first child immediately, and the grandchild `setsid()`s and `execv`/`posix_spawnp`s
+     with pre-built `const char* argv[]` constructed BEFORE `fork()`), OR spawn via
+     `posix_spawnp` and reap asynchronously on a background waiter thread.
+
+--------------------------------------------------------------------------------
+[ARGON-H5] Release Unit Tests Compile Out `assert()` (`-DNDEBUG`) & Vault Accepts `javascript:` / `data:` Origins
+--------------------------------------------------------------------------------
+- Severity: HIGH (Broken security validation in `AesGcmPasswordVault::normalizeOrigin`
+  masked by vacuous Release tests)
+- Location:
+  * `vault/src/password_vault.cpp:113-137` (`AesGcmPasswordVault::normalizeOrigin`)
+  * `vault/tests/test_vault.cpp:24`
+  * `CMakeLists.txt:6-8, 26, 89-114`
+  * `hal/tests/test_hal.cpp`, `policy/tests/test_policy.cpp`, `shield/tests/test_shield.cpp`,
+    `vault/tests/test_vault.cpp`, `webapp/tests/test_webapp.cpp`
+- Root Cause:
+  1. `AesGcmPasswordVault::normalizeOrigin` checks `auto scheme_pos = s.find("://");` and if
+     `"://"` is not found, it blindly defaults `scheme = "https"` and `host_start = 0`.
+  2. Consequently, `"javascript:alert(1)"` is normalized to `"https://javascript:alert(1)"`
+     and `"data:text/html,hi"` is normalized to `"https://data:text"`, instead of being
+     rejected (`""`).
+  3. `test_vault.cpp:24` has `assert(!v.saveOrUpdate("javascript:alert(1)", "u", "p"));`.
+     In Debug builds this assertion fails and aborts.
+  4. Because `CMakeLists.txt` defaults `CMAKE_BUILD_TYPE` to `Release` (which passes
+     `-DNDEBUG`), all `assert(...)` statements — including the function calls inside them —
+     are completely stripped from `test_hal`, `test_policy`, `test_shield`, `test_vault`,
+     and `test_webapp`!
+- How to Fix:
+  1. In `AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url)`:
+     - Before defaulting to `"https"`, check if there is a colon `:` before the first `/`,
+       `?`, or `#` when `"://"` is absent:
+       * If a colon exists (e.g. `javascript:alert(1)`, `data:...`, `mailto:...`,
+         `about:blank`, `chrome:...`), verify whether the substring after `:` is purely a
+         valid numeric port `1..65535` preceded by a valid hostname (e.g. `localhost:3000`
+         or `example.com:8443`).
+       * Specifically, if the prefix before `:` is a known non-http scheme (`javascript`,
+         `data`, `mailto`, `file`, `about`, `chrome`, `explorer`, `blob`, `ws`, `wss`, `ftp`)
+         or if the characters after `:` up to `/ ? #` are not all digits (`0-9`), return
+         `""` immediately!
+     - Also reject authorities containing spaces, control characters, backslashes, or
+       invalid port numbers, and strip default ports (`:443` for `https`, `:80` for `http`).
+  2. In `test_hal.cpp`, `test_policy.cpp`, `test_shield.cpp`, `test_vault.cpp`, and
+     `test_webapp.cpp`:
+     - Replace `<cassert>` / `assert(...)` with an always-active `EXP_CHECK(cond)` macro
+       (matching `CHECK(cond)` in `app/tests/test_app_stores.cpp:9-15`) that evaluates
+       `cond` unconditionally in both Release and Debug builds and exits with code 1 on
+       failure.
+
+--------------------------------------------------------------------------------
+[ARGON-H6] PPD Performance-Hold Race & refresh-rate Worker Desynchronization
+--------------------------------------------------------------------------------
+- Severity: HIGH (Leaked PPD performance holds pinning CPU in high-power mode; out-of-order
+  refresh rate transitions)
+- Location:
+  * `hal/src/power_governor.cpp:150-187, 249-272` (`LinuxPowerGovernor::setPerformanceHoldAsync`)
+  * `hal/src/display_refresh.cpp:251-264` (`MutterDisplayRefreshCtrl::setEdpRefreshRateAsync`)
+- Root Cause:
+  1. In `LinuxPowerGovernor::setPerformanceHoldAsync(bool hold)`:
+     - `ppd_cookie_` is only populated AFTER the asynchronous D-Bus call
+       `holdPpdProfileSync()` returns on a detached thread.
+     - If `setPerformanceHoldAsync(true)` is called twice before the first D-Bus call
+       returns (e.g., startup `syncSystemPower` at 150ms + UPower/telemetry sync), both
+       calls see `!ppd_cookie_.has_value()`, spawning two threads that each acquire a PPD
+       hold. The second thread overwrites `ppd_cookie_`, leaking the first cookie forever
+       (the CPU remains locked in `performance` profile even on battery!).
+     - Moreover, the detached lambda captures `this` without synchronization against
+       object destruction.
+  2. In `MutterDisplayRefreshCtrl::setEdpRefreshRateAsync(double target_hz)`:
+     - `last_hz_.exchange(rounded)` updates `last_hz_` before the async D-Bus call runs, and
+       rapid changes spawn concurrent detached threads that can finish out of order.
+- How to Fix:
+  1. In `LinuxPowerGovernor`:
+     - Add `bool ppd_in_flight_ = false;` protected by `mu_`, and a `std::condition_variable cv_;`
+       (or track the single worker thread).
+     - When `setPerformanceHoldAsync(hold)` is called, update `ppd_desired_ = hold;`. If
+       `ppd_in_flight_` is already `true`, return immediately — let the in-flight worker loop
+       until the actual state (`ppd_cookie_.has_value()`) matches `ppd_desired_` or
+       `stop_watcher_` is set!
+     - In `shutdown()`, wait for `ppd_in_flight_` to become `false` under `cv_` before
+       releasing any remaining `ppd_cookie_`. This guarantees zero leaked cookies, zero
+       out-of-order D-Bus calls, and zero Use-After-Free on `this`.
+  2. In `MutterDisplayRefreshCtrl`:
+     - Apply the same single-in-flight state-reconciliation pattern (store
+       `desired_hz_`, let one worker reconcile `applied_hz_` -> `desired_hz_`, and wait for
+       completion in `shutdown()`).
+
+================================================================================
+2. UI & FUNCTIONAL BUGS (BROKEN BUTTONS, WORKFLOWS, AND USER INTERACTIONS)
+================================================================================
+
+--------------------------------------------------------------------------------
+[ARGON-UI-1] Top-Bar HUD Buttons Never Toggle the Control Overlay Closed
+--------------------------------------------------------------------------------
+- Severity: HIGH (Every top-bar panel button fails to close the overlay when clicked again)
+- Location:
+  * `app/src/browser_window.cpp:615-639` (`setHudVisible`)
+  * `app/src/browser_window.cpp:882-889` (`onChromeCommand("open_panel")`)
+  * `app/include/explorer/app/chrome_ui.hpp:333-337, 693-699`
+- Root Cause:
+  - In `chrome_ui.hpp:333-337`, every top-bezel button passes a tab name argument:
+    * `#btn-hud`: `send('open_panel', 'power')`
+    * `#btn-shield`: `send('open_panel', 'power')`
+    * `#btn-key`: `send('open_panel', 'vault')`
+    * `#btn-downloads`: `send('open_panel', 'downloads')`
+    * `#btn-apps`: `send('open_panel', 'apps')`
+  - In `browser_window.cpp:884`:
+    ```cpp
+    } else if (cmd == "open_panel") {
+        status_msg_.clear();
+        if (hud_visible_ && arg.empty()) {
+            setHudVisible(false);
+        } else {
+            setHudVisible(true, arg.empty() ? "power" : arg);
+        }
+    }
+    ```
+  - Because `arg` is NEVER empty, `hud_visible_ && arg.empty()` is dead code! Clicking a top-bar
+    button when that panel tab is already open leaves the HUD open instead of closing it.
+- How to Fix:
+  1. Add `std::string active_hud_tab_ = "power";` to `BrowserWindow`.
+  2. In `chrome_ui.hpp` (`powerHudHtmlDataUrl`), whenever `switchTab(name)` is clicked by the
+     user inside the HUD, notify C++ (`send('hud_tab_changed', name)`) or keep `active_hud_tab_`
+     updated in `setHudVisible`.
+  3. In `onChromeCommand("open_panel")`:
+     ```cpp
+     std::string target_tab = arg.empty() ? "power" : arg;
+     if (hud_visible_ && (arg.empty() || active_hud_tab_ == target_tab)) {
+         setHudVisible(false);
+     } else {
+         setHudVisible(true, target_tab);
+     }
+     ```
+     Now clicking `#btn-downloads` opens Downloads; clicking `#btn-vault` while Downloads is
+     open switches smoothly to Vault; clicking `#btn-downloads` again while Downloads is
+     active toggles the overlay closed.
+
+--------------------------------------------------------------------------------
+[ARGON-UI-2] Vault "Edit" Button Overwrites Target Origin During 2s HUD Refresh
+--------------------------------------------------------------------------------
+- Severity: HIGH (Silent credential corruption when editing a saved login)
+- Location:
+  * `app/include/explorer/app/chrome_ui.hpp:731-732` (`__updateHud`)
+  * `app/include/explorer/app/chrome_ui.hpp:764-769` (`Edit` button `onclick`)
+- Root Cause:
+  1. Clicking "Edit" on a saved credential sets `#v-origin.value = c.origin`,
+     `#v-user.value = c.username`, and calls `#v-pass.focus()`.
+  2. Within 2 seconds, `onTelemetryTick()` calls `pushHudState()`, which runs `__updateHud(h)`.
+  3. Line 732 executes:
+     `if (document.activeElement !== origField && h.currentOrigin) origField.value = h.currentOrigin;`
+  4. Because focus is in `#v-pass` (or `#v-user`), `document.activeElement !== origField` is
+     `true`! `#v-origin.value` is silently overwritten with the active tab's `h.currentOrigin`,
+     so clicking "Save / Update Credential" writes the edited password to the WRONG origin!
+- How to Fix:
+  - In `chrome_ui.hpp` (`powerHudHtmlDataUrl`), track `let lastAutoOrigin = '';` and
+    `let lastAutoAppTitle = '';` (or a `vaultEditing` dirty flag):
+    * Only auto-populate `#v-origin` when `h.currentOrigin !== lastAutoOrigin` AND neither
+      `#v-origin`, `#v-user`, nor `#v-pass` is focused/dirty (or only when `#v-origin.value === ''`
+      or `#v-origin.value === lastAutoOrigin`).
+    * When the user clicks "Edit", set `vaultEditing = true` (resetting it after `saveCred()`
+      or when the HUD closes) so background HUD refreshes never clobber the form being edited.
+
+--------------------------------------------------------------------------------
+[ARGON-UI-3] WebApp `#app-name` Input Retains Stale Title Across Tab Switches
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Installs WebApp with the wrong title after switching tabs)
+- Location:
+  * `app/include/explorer/app/chrome_ui.hpp:733-734`
+- Root Cause:
+  - Line 734:
+    `if (document.activeElement !== appField && !appField.value && h.currentTitle) appField.value = h.currentTitle;`
+  - Because of `!appField.value`, once `#app-name` is auto-filled with Tab 1's title,
+    switching to Tab 2 and opening the Apps panel leaves Tab 1's title in `#app-name`.
+- How to Fix:
+  - Track `let lastAutoTitle = '';` in the HUD script. Update `appField.value = h.currentTitle || ''`
+    whenever `document.activeElement !== appField && (appField.value === '' || appField.value === lastAutoTitle)`,
+    and set `lastAutoTitle = h.currentTitle || '';`.
+
+--------------------------------------------------------------------------------
+[ARGON-UI-4] Find-in-Page Jumps Matches on Every Typed Character & Leaks Highlights Across Tabs
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Broken incremental find UX + leftover yellow highlights)
+- Location:
+  * `app/include/explorer/app/chrome_ui.hpp:354-361`
+  * `app/src/browser_window.cpp:502-518` (`activateTab`)
+  * `app/src/browser_window.cpp:1054-1060` (`onChromeCommand`: `find_next`, `find_prev`)
+- Root Cause:
+  1. In `chrome_ui.hpp:354`, `findInput.addEventListener('input', () => send('find_next', findInput.value));`
+     sends `find_next` on every keystroke.
+  2. In `browser_window.cpp:1056`, `find_next` calls `b->GetHost()->Find(arg, true, false, true);`
+     with the 4th parameter (`findNext`) hardcoded to `true`.
+  3. In CEF, `findNext = true` tells Blink to advance to the *next* occurrence of an active
+     search rather than starting a new incremental search from the current selection (`findNext = false`).
+     Typing `"test"` advances across 4 different matches as each letter is typed.
+  4. When switching tabs in `activateTab(uint64_t tab_id)` while `find_visible_` is true,
+     `StopFinding(true)` is never called on the deactivated tab.
+- How to Fix:
+  1. In `chrome_ui.hpp:354`, have the `input` listener send `'find_input'` instead of
+     `'find_next'`. Keep `'find_next'` for Enter / Next button and `'find_prev'` for
+     Shift+Enter / Prev button.
+  2. In `browser_window.cpp`:
+     - Handle `cmd == "find_input"`: if `arg.empty()` call `b->GetHost()->StopFinding(true);`
+       else call `b->GetHost()->Find(arg, true, false, false);` (`findNext = false`).
+     - Keep `cmd == "find_next"` with `findNext = true` and `cmd == "find_prev"` with
+       `findNext = true`.
+  3. In `activateTab()`, if `find_visible_` is true, call `StopFinding(true)` on the
+     previously active tab browser before switching `active_tab_id_`.
+
+--------------------------------------------------------------------------------
+[ARGON-UI-5] Vault Autofill Selector Mismatch & Unscoped DOM Query
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Autofill fails to populate username on many standard login forms)
+- Location:
+  * `app/src/main.cpp:262-271` (`kPageUxHooksJs` login capture)
+  * `app/src/browser_window.cpp:970-978` (`vault_fill`)
+- Root Cause:
+  1. Login capture (`main.cpp:267`) queries inside the submitted `<form>`:
+     `form.querySelector('input[type="email"], input[type="text"], input[autocomplete="username"]')`
+  2. Autofill (`browser_window.cpp:973`) queries the entire `document` with a narrower selector:
+     `document.querySelector('input[type="email"], input[type="text"][name*="user" i], input[type="text"][name*="login" i], input[autocomplete="username"]')`
+  3. Any login form whose username field is `<input type="text" id="username">`,
+     `<input type="text" name="identifier">`, `<input type="text" name="email">`, or
+     `<input type="text">` without `user`/`login` in `name` is captured by login capture
+     but NOT filled by `vault_fill`! And if a page has a header search input matching the
+     selector, `document.querySelector` can target an input outside the login form.
+- How to Fix:
+  - In `browser_window.cpp:970-978` (`vault_fill`), scope the username search to `pw.form`
+    first, falling back to `document`, and broaden the selector to match standard username
+    fields:
+    ```js
+    const pw = document.querySelector('input[type="password"]:not([disabled])');
+    const root = (pw && pw.form) ? pw.form : document;
+    const usr = root.querySelector(
+      'input[autocomplete="username"], input[type="email"], ' +
+      'input[type="text"][name*="user" i], input[type="text"][name*="login" i], ' +
+      'input[type="text"][name*="email" i], input[type="text"][name*="id" i], ' +
+      'input[type="text"][id*="user" i], input[type="text"][id*="login" i], ' +
+      'input[type="text"]:not([disabled])'
+    );
+    ```
+
+--------------------------------------------------------------------------------
+[ARGON-UI-6] Fullscreen State Desynchronization (`html_fullscreen_` vs F11 / Background Tabs)
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Top bezel can remain permanently hidden after exiting fullscreen via F11)
+- Location:
+  * `app/src/browser_window.cpp:261-268` (`desiredChromeHeight`)
+  * `app/src/browser_window.cpp:1066-1068` (`win_full`)
+  * `app/src/browser_window.cpp:1186-1195` (`onTabFullscreenChanged`)
+  * `app/src/browser_window.cpp:1320-1322` (`ShortcutAction::ToggleFullscreen`)
+- Root Cause:
+  1. `onTabFullscreenChanged(uint64_t /*tab_id*/, bool fullscreen)` does not check
+     `if (tab_id != active_tab_id_) return;`.
+  2. When a user enters HTML5 video fullscreen (`html_fullscreen_ = true`) and then exits
+     fullscreen using `F11` (`ToggleFullscreen`), `window_->SetFullscreen(false)` is called
+     without resetting `html_fullscreen_ = false` or calling `updateChromeLayout()`. Because
+     `desiredChromeHeight()` returns `0` whenever `html_fullscreen_` is `true`, the top
+     chrome bar stays invisible even though the window is no longer fullscreen!
+- How to Fix:
+  1. In `onTabFullscreenChanged(uint64_t tab_id, bool fullscreen)`, ignore events from
+     non-active tabs (`if (tab_id != active_tab_id_) return;`), and also reset
+     `html_fullscreen_ = false` when switching tabs in `activateTab()`.
+  2. In `ShortcutAction::ToggleFullscreen` and `cmd == "win_full"`, when toggling window
+     fullscreen off, also reset `html_fullscreen_ = false;` and call `updateChromeLayout();`.
+
+--------------------------------------------------------------------------------
+[ARGON-UI-7] `onTabFaviconChanged` Skips Updating Chrome When Only 1 Tab Is Open
+--------------------------------------------------------------------------------
+- Severity: LOW (First tab's favicon is missing when a second tab is opened until next push)
+- Location:
+  * `app/src/browser_window.cpp:1158-1165`
+- Root Cause:
+  - `if (tabs_.size() > 1) pushChromeState();` is fine while 1 tab is open (since the tab
+    bar is hidden), and when a second tab is opened `openNewTab` -> `activateTab` calls
+    `pushChromeState()` which serializes `tabs_[0].favicon`. However, if `tabs_[0]` is in
+    `--app=` mode or if `t->favicon` is used elsewhere, it is stored in `t->favicon` (line
+    1162), so this is actually harmless in practice. (No action required beyond keeping
+    `t->favicon = favicon_url;` which is already present.)
+
+================================================================================
+3. PERFORMANCE INEFFICIENCIES & UI JANK SOURCES
+================================================================================
+
+--------------------------------------------------------------------------------
+[ARGON-PERF-1] `pushHudState()` Lacks Change Detection, Rebuilds All DOM Lists, Copies Vault by Value, and Scans `~/.local/share/applications` on the UI Thread Every 2s
+--------------------------------------------------------------------------------
+- Severity: HIGH (Biggest source of UI-thread stalls, HUD scroll/focus loss, and disk I/O)
+- Location:
+  * `app/src/browser_window.cpp:756-842` (`pushHudState`)
+  * `app/src/browser_window.cpp:662-665` (`setStatusBanner`)
+  * `app/src/browser_window.cpp:1461-1479` (`onTelemetryTick`)
+  * `app/include/explorer/app/chrome_ui.hpp:715-833` (`__updateHud`)
+  * `vault/src/password_vault.cpp:308-310` (`listAll`)
+  * `webapp/src/webapp_installer.cpp:177-202` (`listInstalled`)
+- Root Cause:
+  1. `pushChromeTelemetry()` (`browser_window.cpp:731-733`) deduplicates idle IPC using
+     `last_telemetry_sig_`. Its sibling `pushHudState()` has NO signature check and runs
+     every 2 seconds while the HUD is open, plus on every `setStatusBanner()`, power toggle,
+     or download update.
+  2. Every `pushHudState()` call invokes `services_.webapp_installer->listInstalled()` on
+     the UI thread, which performs a `directory_iterator` over `~/.local/share/applications`
+     and opens/parses every `.desktop` file via `std::ifstream`.
+  3. Every `pushHudState()` call invokes `services_.vault->listAll()`, which copies the
+     entire `std::vector<Credential>` (including password strings) by value just to read
+     `origin` and `username`.
+  4. In `chrome_ui.hpp`, `__updateHud(h)` unconditionally sets `vList.innerHTML = ''`,
+     `dList.innerHTML = ''`, and `aList.innerHTML = ''` (lines 746, 780, 811), destroying
+     and recreating every DOM node in the Vault, Downloads, and Installed Apps lists every
+     2 seconds! If the user is scrolling or hovering/clicking a button in those lists when
+     the 2-second telemetry tick fires, the DOM node under their cursor is destroyed and
+     scroll position resets.
+- How to Fix:
+  1. Cache `installed_webapps_` in `BrowserWindow` (or inside `LinuxWebAppInstaller` with a
+     `mutable` cache) and refresh it ONLY on initial HUD creation and after
+     `webapp_install` / `webapp_uninstall`. Zero filesystem reads during `pushHudState()`!
+  2. In `chrome_ui.hpp` (`__updateHud`), add signature checks (`lastCredsSig`,
+     `lastDownloadsSig`, `lastAppsSig` using `JSON.stringify(h.creds)`, etc., exactly like
+     `lastTabsSig` in `__updateChrome` at line 419!) so `vList`, `dList`, and `aList` DOM
+     trees are ONLY rebuilt when their underlying array actually changes!
+  3. In `BrowserWindow::pushHudState()`, compute a signature `last_hud_sig_` of the complete
+     serialized JSON payload `js.str()` and skip `ExecuteJavaScript` when `js.str() == last_hud_sig_`.
+
+--------------------------------------------------------------------------------
+[ARGON-PERF-2] Download Progress Callbacks Flood Full Chrome & HUD State Pushes
+--------------------------------------------------------------------------------
+- Severity: HIGH (High CPU & IPC churn during fast downloads)
+- Location:
+  * `engine/src/cef_client.cpp:301-329` (`OnDownloadUpdated`)
+  * `app/src/browser_window.cpp:1218-1234` (`onTabDownloadUpdated`)
+- Root Cause:
+  - CEF calls `OnDownloadUpdated` many times per second during active downloads.
+  - Every callback invokes `onTabDownloadUpdated(rec)`, which unconditionally calls
+    `pushChromeState()` (rebuilding the entire top-bar JSON including vault origin lookup
+    and all tabs) AND `pushHudState(last_snap_)` (rebuilding the entire HUD).
+  - Note that top-bar chrome only displays a boolean badge dot (`activeDownloads > 0`), so
+    intermediate byte/percentage ticks don't change the top chrome at all!
+- How to Fix:
+  1. In `BrowserWindow::onTabDownloadUpdated(const DownloadRecord& record)`:
+     - Check whether this is a new download, a state transition (`in_progress` /
+       `is_complete` / `is_canceled` changed), or a percentage change (`record.percent != old.percent`).
+     - If `found` and `old.in_progress == record.in_progress` and
+       `old.is_complete == record.is_complete` and `old.is_canceled == record.is_canceled`:
+       * Do NOT call `pushChromeState()` (because `activeDownloads` count has not changed!).
+       * Only update `d = record`, and only call `pushHudState(last_snap_)` if `hud_visible_`
+         is true AND `record.percent != old_percent`.
+
+--------------------------------------------------------------------------------
+[ARGON-PERF-3] `kPageUxHooksJs` Runs Scroll Reflows & IPC Even When `autohide_topbar` Is Off
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Unnecessary `scrollHeight` layout reflow on every scrolled page)
+- Location:
+  * `app/src/main.cpp:230-261` (`kPageUxHooksJs`)
+- Root Cause:
+  - `prefs_.autohide_topbar` defaults to `false` (specifically noted in `test_app_stores.cpp:26`
+    as `"autohide OFF for zero-stutter scroll"`).
+  - Yet `kPageUxHooksJs` unconditionally registers `scroll` and `mousemove` listeners in
+    every main frame, scheduling `requestAnimationFrame`, querying
+    `document.documentElement.scrollHeight` (which can force layout), and sending
+    `explorer.topbar-reveal` IPC messages to the browser process (which then discards them
+    at `browser_window.cpp:1238` because `!prefs_.autohide_topbar`).
+- How to Fix:
+  - Cache the document height check or avoid reading `scrollHeight` on every animation frame
+    (or only check `window.scrollY` deltas first: only check `scrollHeight` when `setBar` is
+    actually about to transition `hidden != !reveal`!). Checking `if (y < 28 || dy < -24)` /
+    `else if (y > 110 && dy > 28)` BEFORE touching `document.documentElement.scrollHeight`
+    eliminates 99% of `scrollHeight` layout reads during scrolling!
+
+--------------------------------------------------------------------------------
+[ARGON-PERF-4] `resolveDownloadPath` Performs Up to 1,000 Synchronous `exists()` Calls and Overwrites on Exhaustion
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (UI-thread filesystem stall + silent file overwrite after 999 collisions)
+- Location:
+  * `engine/src/cef_client.cpp:58-68` (`resolveDownloadPath`)
+- Root Cause:
+  - Loops `i = 1..999` calling `std::filesystem::exists(next, ec)`. If all 999 exist, line 67
+    returns `candidate` (which already exists), silently overwriting the user's original file.
+- How to Fix:
+  - Cap the numbered collision loop at `i = 1..32`; if all 32 exist, append a high-resolution
+    monotonic/epoch timestamp suffix (`stem + " (" + std::to_string(epoch_ms) + ")" + ext`)
+    so it never stalls and never overwrites an existing file.
+
+--------------------------------------------------------------------------------
+[ARGON-PERF-5] Background Audio/Media Tabs Throttled on Battery (`media_tabs` Always Empty)
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Background music/video tabs get put into `SCHED_BATCH` + `IOPRIO_IDLE` on battery)
+- Location:
+  * `app/src/browser_window.cpp:1450-1459` (`reconcileRendererPriorities`)
+  * `app/src/main.cpp:94-135, 220-274` (`ContentPageBridgeHandler` & `kPageUxHooksJs`)
+- Root Cause:
+  - `PidThrottlePlanner` supports exempting `media_tabs`, and `test_policy.cpp:46-58` tests
+    it, but `BrowserWindow::reconcileRendererPriorities()` always passes an empty
+    `std::unordered_set<uint64_t> media;` set.
+  - Note: As verified in Section 0, do NOT use `CefAudioHandler` (which mutes browser audio).
+- How to Fix:
+  1. In `kPageUxHooksJs` (`app/src/main.cpp`), listen for capture-phase `'play'`, `'playing'`,
+     `'pause'`, `'ended'`, and `'emptied'` events on `document` and notify a V8 bridge hook
+     `__expMediaState(bool playing)` when any `<video>` or `<audio>` element is actively
+     playing (`!el.paused && !el.ended`).
+  2. Forward `"explorer.media-state"` IPC to `ExplorerCefClient` ->
+     `ITabObserver::onTabMediaStateChanged(uint64_t tab_id, bool playing)`.
+  3. Store `bool playing_media = false;` in `BrowserWindow::TabEntry`, populate the `media`
+     set in `reconcileRendererPriorities()`, and call `reconcileRendererPriorities()` when a
+     tab's media state changes.
+
+================================================================================
+4. SECURITY, PRIVACY, HARDWARE & PORTABILITY HARDENING
+================================================================================
+
+--------------------------------------------------------------------------------
+[ARGON-SEC-1] Loose Prefix Match on `http://localhost` / `http://127.0.0.1` Origin Checks
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Allows `http://localhost.attacker.com` to pass secure-origin check)
+- Location:
+  * `app/src/browser_window.cpp:961-963` (`vault_fill`)
+  * `app/src/main.cpp:116-119` (`ContentPageBridgeHandler::Execute`)
+- Root Cause:
+  - `live_origin.rfind("http://localhost", 0) == 0` matches `http://localhost.evil.com`.
+  - `live_origin.rfind("http://127.0.0.1", 0) == 0` matches `http://127.0.0.1.evil.com`.
+- How to Fix:
+  - Add a shared helper `isSecureWebOrigin(std::string_view url_or_origin)` (e.g. in
+    `AesGcmPasswordVault` or `navigation_policy`):
+    * Returns `true` if `origin` starts with `"https://"`, OR if `origin` is
+      `"http://localhost"` / `"http://127.0.0.1"` followed by end-of-string, `':'`, or `'/'`.
+  - Use this helper in both `browser_window.cpp:961` and `main.cpp:116`.
+
+--------------------------------------------------------------------------------
+[ARGON-SEC-2] Trusted Chrome / HUD Views Lack Navigation Guard (`OnBeforeBrowse`)
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Defense-in-depth for privileged `window.explorerHost` V8 bridge)
+- Location:
+  * `app/include/explorer/app/chrome_bridge.hpp:30-144` (`ChromeUiClient`)
+  * `app/src/main.cpp:205-216` (`OnContextCreated`)
+- Root Cause:
+  - `ChromeUiClient` loads `data:text/html;charset=utf-8;base64,...` and receives the
+    privileged `window.explorerHost.post(cmd, arg)` binding based solely on browser ID
+    (`trusted_chrome_ids_`).
+  - `ChromeUiClient` does not implement `CefRequestHandler::OnBeforeBrowse` to block
+    accidental or drag-and-drop navigation away from the `data:text/html` UI page, nor does
+    `OnContextCreated` verify that `frame->GetURL()` starts with `"data:text/html"`.
+- How to Fix:
+  1. In `ExplorerCefApp::OnContextCreated` (`app/src/main.cpp:206`), verify
+     `frame->IsMain() && frame->GetURL().ToString().rfind("data:text/html", 0) == 0` before
+     binding `window.explorerHost`.
+  2. In `ChromeUiClient` (`app/include/explorer/app/chrome_bridge.hpp`), inherit
+     `CefRequestHandler`, return `this` from `GetRequestHandler()`, and implement
+     `OnBeforeBrowse` to cancel (`return true;`) any navigation where
+     `request->GetURL().ToString().rfind("data:text/html", 0) != 0`.
+  3. Also restrict top chrome CSP `img-src` or validate `t.favicon` in `chrome_ui.hpp:430`
+     so only `https://` or `data:` favicon URLs are loaded (blocking `http://` mixed content
+     or `file://` image loads in the chrome renderer).
+
+--------------------------------------------------------------------------------
+[ARGON-SEC-3] Adblock Resource-Type Mapping & Missing Top-Level GPC/DNT Headers
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Missed `$media`, `$font`, `$object`, `$ping`, `$worker` filter rules;
+  top-level document requests omit `Sec-GPC: 1` and `DNT: 1`)
+- Location:
+  * `shield/include/explorer/shield/content_shield.hpp:15-23` (`ResourceKind`)
+  * `shield/src/content_shield.cpp:96-107` (`resourceKindToBraveType`)
+  * `engine/src/cef_client.cpp:14-27` (`mapCefResourceType`)
+  * `engine/src/cef_client.cpp:240-288` (`GetResourceRequestHandler`, `OnBeforeResourceLoad`)
+- Root Cause:
+  1. `mapCefResourceType()` maps `RT_MEDIA`, `RT_FONT_RESOURCE`, `RT_OBJECT`, `RT_WORKER`,
+     `RT_SHARED_WORKER`, `RT_SERVICE_WORKER`, `RT_PREFETCH`, `RT_FAVICON`, and
+     `RT_PLUGIN_RESOURCE` to `ResourceKind::Other`, and maps `RT_PING` and `RT_CSP_REPORT`
+     to `ResourceKind::XhrOrFetch` (`"xmlhttprequest"`).
+  2. `GetResourceRequestHandler()` returns `nullptr` when `is_navigation` is `true`, which
+     skips `OnBeforeResourceLoad()` for main-frame and subframe navigations. As a result:
+     - Top-level page navigations never receive the `Sec-GPC: 1` and `DNT: 1` headers!
+     - Subframe (`RT_SUB_FRAME`) navigations are never evaluated by Brave Shield!
+- How to Fix:
+  1. Expand `ResourceKind` and `resourceKindToBraveType` to include `Font` (`"font"`),
+     `Media` (`"media"`), `Object` (`"object"`), `Ping` (`"ping"`), `CspReport`
+     (`"csp_report"`), and map `RT_FONT_RESOURCE`, `RT_MEDIA`, `RT_OBJECT`/`RT_PLUGIN_RESOURCE`,
+     `RT_PING`, `RT_CSP_REPORT`, and `RT_SUB_FRAME`/`RT_NAVIGATION_PRELOAD_SUB_FRAME`
+     accurately.
+  2. In `GetResourceRequestHandler()`, only return `nullptr` when `is_download` is `true`
+     (keep returning `this` for `is_navigation`!). Because `OnBeforeResourceLoad()` sets
+     `Sec-GPC: 1` and `DNT: 1` on all `http(s)` requests and `shield_->evaluate()` already
+     returns `{false, ""}` for `ResourceKind::MainFrame` (`content_shield.cpp:147`), top-level
+     navigations will automatically receive `Sec-GPC: 1` and `DNT: 1` while never blocking
+     the main document, and third-party ad iframes (`RT_SUB_FRAME`) will now be properly
+     filtered!
+
+--------------------------------------------------------------------------------
+[ARGON-SEC-4] `--profile` Isolation, `EXPLORER_DISABLE_TUNING=1`, and Subprocess Battery Env
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Incomplete `--profile` isolation; `EXPLORER_DISABLE_TUNING=1` disables
+  adblock shield; child processes miss `on_battery` state)
+- Location:
+  * `app/src/main.cpp:338-352` (subprocess `HardwareProfile`)
+  * `app/src/main.cpp:403-415` (`services.shield`, `services.vault`, `services.webapp_installer`)
+- Root Cause:
+  1. In `main.cpp:404-407`, `services.shield` and `services.vault` are constructed with
+     `defaultProfileDir()` instead of `launch_cfg.profile_dir` (for normal browser sessions),
+     and `services.shield` is skipped when `hw.tuning_disabled` is true.
+  2. In `main.cpp:345-351`, subprocesses do not inherit `hw.on_battery` (only
+     `EXPLORER_TURBO_SLACK` and `EXPLORER_VA_AV1` are exported via `setenv`).
+  3. In `main.cpp:408-415`, `LinuxWebAppInstaller` hardcodes `$HOME/.local/bin/explorer` and
+     `$HOME/.local/share/...` instead of resolving `XDG_DATA_HOME` or `/proc/self/exe`.
+- How to Fix:
+  1. Export `EXPLORER_ON_BATTERY` in the main process (`setenv("EXPLORER_ON_BATTERY", hw.on_battery ? "1" : "0", 1)`)
+     and read it in subprocesses (`hw.on_battery = ...`).
+  2. Always construct `services.shield` regardless of `hw.tuning_disabled` (keep
+     `EXPLORER_DISABLE_TUNING=1` strictly for hardware/power/VA-API/V8 tuning as required
+     by `AGENTS.md`).
+  3. Use the base profile directory (`launch_cfg.profile_dir` when not in `--app` mode, or
+     the parent profile dir in `--app` mode) for `vault` and `shield`.
+
+--------------------------------------------------------------------------------
+[ARGON-SEC-5] Vault Key Corruption Safety, JSON Escaping/Parsing, and WebApp Install Verification
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Silent credential loss on corrupt key read; `\uXXXX` and `U+2028`/`U+2029`
+  in JSON helpers; unchecked `ofstream` in WebApp install)
+- Location:
+  * `vault/src/password_vault.cpp:161-180` (`ensureKey`)
+  * `app/src/browser_window.cpp:50-95, 1016-1022, 1247-1256` (`jsonEscape`, `extractJsonField`,
+    `webapp_install`, `pending_login_`)
+  * `app/src/session_store.cpp:14-25, 74-97` (`escapeJson`, `saveAtomic`)
+  * `app/include/explorer/app/prefs_store.hpp:38-54` (`PrefsStore::save`)
+  * `webapp/src/webapp_installer.cpp:152-175` (`LinuxWebAppInstaller::install`)
+- Root Cause & Fixes:
+  1. **Vault key preservation (`vault/src/password_vault.cpp:163-171`)**:
+     If `key_path_` already exists on disk but fails to read 32 bytes, `ensureKey()`
+     currently falls through and overwrites `key_path_` with a brand-new random key,
+     permanently orphaning `vault.enc`. Fix: if `fs::exists(key_path_, ec)` is true and the
+     read fails, return `false` (fail closed) instead of overwriting the existing key file.
+  2. **JSON escaping & parsing (`browser_window.cpp:50-95`, `session_store.cpp:14-25`)**:
+     - In `session_store.cpp:escapeJson`, escape all control characters `< 0x20` as `\u00XX`
+       (matching `browser_window.cpp:jsonEscape`).
+     - In both `jsonEscape` and `escapeJson`, escape UTF-8 `U+2028` (`\xE2\x80\xA8` -> `\u2028`)
+       and `U+2029` (`\xE2\x80\xA9` -> `\u2029`).
+     - In `extractJsonField`, decode `\uXXXX` hex escapes so passwords or titles with escaped
+       Unicode characters round-trip without corruption.
+  3. **Durable atomic writes (`session_store.cpp:74-97`, `prefs_store.hpp:38-54`)**:
+     - Set `0600` permissions on `prefs.json.tmp` before renaming, and `fsync` the file
+       descriptor (or reuse a shared atomic write helper).
+  4. **WebApp install verification & `Exec=` quoting (`webapp_installer.cpp:152-175`,
+     `browser_window.cpp:1016-1022`)**:
+     - Check `if (!out.is_open() || !out.good()) return InstalledWebApp{};` after writing the
+       `.desktop` file.
+     - In `browser_window.cpp:1019`, pass `!installed.app_id.empty()` instead of hardcoded
+       `true` to `onWebAppInstallFinished`.
+     - Quote paths in `Exec=` if `browser_bin_` contains spaces.
+  5. **Clear `pending_login_` password buffer on dismiss/destruction**:
+     - Cleanse `pending_login_->password` before `.reset()` and when `BrowserWindow` is
+       destroyed.
+
+--------------------------------------------------------------------------------
+[ARGON-HAL-1] Desktop Battery Detection, GPU Isolation Fallback, Intel iGPU Telemetry, and Display Refresh Matching
+--------------------------------------------------------------------------------
+- Severity: MEDIUM (Hardware portability and accuracy across Linux laptops/desktops)
+- Location:
+  * `hal/src/power_governor.cpp:123-143` (`isOnBatteryBoot`)
+  * `hal/src/telemetry.cpp:77-88, 94-105, 142-153` (`LinuxTelemetryMonitor`)
+  * `hal/src/gpu_isolator.cpp:35-90` (`discoverIgpuRenderNode`, `applyIsolationEnv`)
+  * `hal/src/display_refresh.cpp:155-185` (`applyEdpRefreshSync`)
+  * `policy/include/explorer/policy/media_policy.hpp:14` (`setHwOnlyVideo`)
+- Root Cause & Fixes:
+  1. **`isOnBatteryBoot()` and `telemetry.cpp` on battery-less desktops**:
+     - In `power_governor.cpp:125-143`, track `bool has_battery = false;` whenever
+       `kind == "Battery"`. Return `discharging || (mains_offline && has_battery)` so a
+       desktop PC without a battery is never misclassified as running on battery.
+     - Apply the same `batt_status_.has_value()` check in `telemetry.cpp:104, 152`:
+       `out.on_battery = discharging || (batt_status_.has_value() && ac_on.has_value() && !*ac_on);`.
+  2. **GPU isolator fallback (`gpu_isolator.cpp:46-58`)**:
+     - If no integrated AMD (`0x1002`) or Intel (`0x8086`) GPU is found, return `{"", ""}`
+       instead of falling back to an NVIDIA dGPU render node with an empty vendor string.
+     - In `applyIsolationEnv()`, only set `LIBVA_DRIVERS_PATH` if
+       `/usr/lib64/dri-freeworld` or `/usr/lib64/dri` actually exists on disk, so Debian /
+       Ubuntu / Arch systems (`/usr/lib/x86_64-linux-gnu/dri` or `/usr/lib/dri`) keep their
+       working system `libva` search path.
+  3. **Display refresh rate matching (`display_refresh.cpp:170-185`)**:
+     - When `target_hz > 65.0` (AC Turbo mode), if no mode is within `20.0 Hz` of `144.0 Hz`
+       (e.g., on a 120 Hz, 165 Hz, or 240 Hz laptop panel), select the highest available
+       refresh rate at the current resolution (`m.hz > 60.0`), while still preferring `144 Hz`
+       when available.
+  4. **Remove unsafe `/tmp/explorer-v2-poc/cef` reuse in `install-cef.sh:17-26`**:
+     - Remove the world-writable `/tmp/explorer-v2-poc/cef` copy branch from `install-cef.sh`
+       so `/tmp` squatting cannot inject an untrusted `libcef.so`.
+
+================================================================================
+5. PRIORITIZED EXECUTION PLAN FOR THE FIX PASS
+================================================================================
+
+When we run the implementation pass next, we will execute and verify the fixes in four
+clean, modular stages:
+
+- Stage 1 (Tests & Core Vault/Policy/HAL Correctness):
+  1. Replace `assert()` with always-on `EXP_CHECK()` across all 5 unit test files so Release
+     and Debug CTest runs truly execute every check (`[ARGON-H5]`).
+  2. Fix `AesGcmPasswordVault::normalizeOrigin()` to reject `javascript:`, `data:`, `mailto:`,
+     and malformed ports/authorities, and fix `ensureKey()` to fail closed rather than
+     overwriting an existing unreadable key (`[ARGON-H5]`, `[ARGON-SEC-5]`).
+  3. Fix `LinuxPowerGovernor::isOnBatteryBoot()`, serialized PPD hold state machine,
+     `MutterDisplayRefreshCtrl` serialized worker + 120/144/165/240Hz mode selection, and
+     `AmdCezanneGpuIsolator` distro-safe `LIBVA_DRIVERS_PATH` & fallback (`[ARGON-H6]`,
+     `[ARGON-HAL-1]`).
+
+- Stage 2 (Process Spawning, Shield Concurrency & Engine Hooks):
+  4. Replace unsafe `fork()` + heap-alloc child code with `posix_spawnp()` / double-fork
+     reaping in `webapp_installer.cpp`, `content_shield.cpp`, and `browser_window.cpp`
+     (`[ARGON-H4]`).
+  5. Add thread lifecycle joining and single-flight guard to
+     `BraveAdblockShield::updateFilterListsAsync()` (`[ARGON-H3]`).
+  6. Expand `ResourceKind` / `mapCefResourceType` for `$media`, `$font`, `$object`, `$ping`,
+     `$csp`, `$subdocument`, and enable `Sec-GPC: 1` + `DNT: 1` headers on top-level
+     navigations (`[ARGON-SEC-3]`).
+
+- Stage 3 (Window Lifecycle, Session Integrity & Async Task Safety):
+  7. Fix `handleCanClose()` / `handleWindowDestroyed()` / `flushSessionNow()` so normal
+     shutdown saves the session once before tab teardown and never overwrites `session.json`
+     with empty tabs (`[ARGON-H1]`).
+  8. Fix `handleCanClose()` to keep chrome/HUD intact until close is confirmed and iterate
+     over a local snapshot of browser handles (`[ARGON-H2]`).
+  9. Replace raw `base::Unretained(this)` async callbacks with a shared lifetime token
+     (`life_token_`) and ensure `~BrowserWindow()` shuts down HAL watchers (`[ARGON-H3]`).
+
+- Stage 4 (UI Bugs, Smoothness & Zero-Jank HUD/Chrome Pipeline):
+  10. Fix top-bar HUD panel button toggling (`active_hud_tab_`), Vault "Edit" origin
+      overwrite bug, WebApp `#app-name` stale title bug, Find-in-Page incremental
+      `findNext = false` & tab-switch `StopFinding`, Vault Autofill form-scoped selector,
+      and Fullscreen `F11` state sync (`[ARGON-UI-1]` through `[ARGON-UI-6]`).
+  11. Add `pushHudState()` signature deduplication, cached `listInstalled()` WebApp list,
+      DOM-diff signature guards (`lastCredsSig`, `lastDownloadsSig`, `lastAppsSig`) in
+      `__updateHud()`, download progress coalescing, zero-reflow scroll check in
+      `kPageUxHooksJs`, and media-playing tab exemption in `reconcileRendererPriorities()`
+      (`[ARGON-PERF-1]` through `[ARGON-PERF-5]`).
+  12. Harden `ChromeUiClient::OnBeforeBrowse`, `isSecureWebOrigin()`, JSON `\uXXXX` /
+      `U+2028` / `U+2029` handling, `--profile` path propagation, and `install-cef.sh`
+      (`[ARGON-SEC-1]` through `[ARGON-SEC-5]`).
+
+================================================================================
+END OF ARGON FINAL REVIEW

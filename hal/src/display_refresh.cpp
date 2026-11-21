@@ -122,7 +122,11 @@ void applyEdpRefreshSync(double target_hz) {
         while (sd_bus_message_enter_container(reply, 'r', "iiduba(ssss)a{sv}") > 0) {
             LogicalMonitor lm;
             int prim = 0;
-            sd_bus_message_read(reply, "iidub", &lm.x, &lm.y, &lm.scale, &lm.transform, &prim);
+            if (sd_bus_message_read(reply, "iidub", &lm.x, &lm.y, &lm.scale, &lm.transform, &prim) < 0) {
+                parsed = false;
+                sd_bus_message_exit_container(reply);
+                break;
+            }
             lm.primary = (prim != 0);
             if (sd_bus_message_enter_container(reply, 'a', "(ssss)") >= 0) {
                 while (sd_bus_message_enter_container(reply, 'r', "ssss") > 0) {
@@ -177,6 +181,19 @@ void applyEdpRefreshSync(double target_hz) {
                 best_dist = d;
                 best_id = m.id;
                 best_is_cur = m.is_current;
+            }
+        }
+        // Fallback for non-144Hz high-refresh laptop panels (e.g. 120Hz / 165Hz / 240Hz) on AC Turbo:
+        if (target_hz > 65.0 && best_dist > 20.0) {
+            double max_hz = 65.0;
+            for (const auto& m : pm.modes) {
+                if (cur_w > 0 && (m.w != cur_w || m.h != cur_h)) continue;
+                if (m.hz > max_hz) {
+                    max_hz = m.hz;
+                    best_id = m.id;
+                    best_is_cur = m.is_current;
+                    best_dist = 0.0;
+                }
             }
         }
         if (!best_id.empty() && !best_is_cur && best_dist <= 20.0) {
@@ -253,14 +270,37 @@ void MutterDisplayRefreshCtrl::setEdpRefreshRateAsync(double target_hz) {
         return;
     }
     int rounded = static_cast<int>(std::lround(target_hz));
-    if (last_hz_.exchange(rounded) == rounded) {
-        return;
+    std::thread prev_worker;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        desired_hz_ = rounded;
+        if (stop_watcher_.load() || apply_in_flight_ || desired_hz_ == applied_hz_) {
+            return;
+        }
+        apply_in_flight_ = true;
+        if (apply_thread_.joinable()) {
+            prev_worker = std::move(apply_thread_);
+        }
+        apply_thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(mu_);
+            while (!stop_watcher_.load() && desired_hz_ > 0 && desired_hz_ != applied_hz_) {
+                int target = desired_hz_;
+                lock.unlock();
+                applyEdpRefreshSync(static_cast<double>(target));
+                lock.lock();
+                applied_hz_ = target;
+            }
+            apply_in_flight_ = false;
+        });
     }
-    std::thread([target_hz]() { applyEdpRefreshSync(target_hz); }).detach();
+    if (prev_worker.joinable()) {
+        prev_worker.join();
+    }
 }
 
 void MutterDisplayRefreshCtrl::invalidateCache() {
-    last_hz_.store(-1);
+    std::lock_guard<std::mutex> lock(mu_);
+    applied_hz_ = -1;
 }
 
 void MutterDisplayRefreshCtrl::startMonitorsChangedWatcher(std::function<void()> on_changed) {
@@ -338,6 +378,16 @@ void MutterDisplayRefreshCtrl::shutdown() {
     if (wake_fd_ >= 0) {
         ::close(wake_fd_);
         wake_fd_ = -1;
+    }
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (apply_thread_.joinable()) {
+            worker = std::move(apply_thread_);
+        }
+    }
+    if (worker.joinable()) {
+        worker.join();
     }
 }
 

@@ -10,6 +10,7 @@
 #include "include/cef_keyboard_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
+#include "include/cef_request_handler.h"
 
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ class ChromeUiClient : public CefClient,
                        public CefContextMenuHandler,
                        public CefDragHandler,
                        public CefLoadHandler,
+                       public CefRequestHandler,
                        public CefKeyboardHandler {
 public:
     ChromeUiClient(IChromeCommandSink* sink, bool is_hud)
@@ -41,7 +43,19 @@ public:
     CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
     CefRefPtr<CefDragHandler> GetDragHandler() override { return this; }
     CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+    CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
     CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
+
+    bool OnBeforeBrowse(CefRefPtr<CefBrowser> /*browser*/,
+                        CefRefPtr<CefFrame> /*frame*/,
+                        CefRefPtr<CefRequest> request,
+                        bool /*user_gesture*/,
+                        bool /*is_redirect*/) override {
+        if (!request) return true;
+        std::string url = request->GetURL().ToString();
+        // Defense-in-depth: block privileged Chrome/HUD views from navigating away from internal data: HTML.
+        return url.rfind("data:text/html;charset=utf-8;base64,", 0) != 0;
+    }
 
     void OnAfterCreated(CefRefPtr<CefBrowser> /*browser*/) override {
         if (sink_) sink_->onChromeBrowserCreated(is_hud_);

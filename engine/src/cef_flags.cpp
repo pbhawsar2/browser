@@ -54,13 +54,16 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         "V8VmFuture",
     };
 
+    const bool is_igpu_node = !hw.igpu_render_node.empty() &&
+                              (hw.igpu_vendor == "0x1002" || hw.igpu_vendor == "0x8086");
+
     if (std::getenv("EXPLORER_SW_RENDER") != nullptr) {
         cmd->AppendSwitch("disable-gpu");
     } else if (gpu_backend == "vulkan" || gpu_backend == "graphite") {
         cmd->AppendSwitchWithValue("ozone-platform-hint", "auto");
         cmd->AppendSwitchWithValue("use-gl", "angle");
         cmd->AppendSwitchWithValue("use-angle", "vulkan");
-        if (!hw.allow_dgpu && !hw.igpu_render_node.empty()) {
+        if (!hw.allow_dgpu && is_igpu_node) {
             cmd->AppendSwitchWithValue("render-node-override", hw.igpu_render_node);
         }
         cmd->AppendSwitch("enable-gpu-rasterization");
@@ -77,7 +80,7 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         cmd->AppendSwitchWithValue("ozone-platform-hint", "auto");
         cmd->AppendSwitchWithValue("use-gl", "angle");
         cmd->AppendSwitchWithValue("use-angle", "gl");
-        if (!hw.allow_dgpu && !hw.igpu_render_node.empty()) {
+        if (!hw.allow_dgpu && is_igpu_node) {
             cmd->AppendSwitchWithValue("render-node-override", hw.igpu_render_node);
         }
         cmd->AppendSwitch("disable-vulkan");  // Avoid Wayland Ozone Vulkan init warning/overhead
@@ -139,9 +142,18 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
 
     // 6. Optional Widevine CDM auto-discovery for DRM streaming (Netflix/Prime/Hotstar).
     std::error_code ec;
-    const std::filesystem::path wv_dir("/opt/google/chrome/WidevineCdm");
-    if (std::filesystem::exists(wv_dir / "manifest.json", ec)) {
-        cmd->AppendSwitch("enable-widevine");
+    const std::filesystem::path wv_candidates[] = {
+        "/opt/google/chrome/WidevineCdm",
+        "/usr/lib64/chromium-browser/WidevineCdm",
+        "/usr/lib/chromium/WidevineCdm",
+        "/usr/lib/chromium-browser/WidevineCdm",
+    };
+    for (const auto& wv_dir : wv_candidates) {
+        if (std::filesystem::exists(wv_dir / "manifest.json", ec)) {
+            cmd->AppendSwitch("enable-widevine");
+            cmd->AppendSwitchWithValue("widevine-cdm-path", wv_dir.string());
+            break;
+        }
     }
 
     cmd->AppendSwitchWithValue("enable-features", joinCsv(enable_features));

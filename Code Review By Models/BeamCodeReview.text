@@ -1,0 +1,207 @@
+Beam Code Review — Explorer Browser (master2)
+Date: 2026-11-21
+Scope: Full source review of hal/, policy/, shield/ (+shield-brave), vault/, webapp/, engine/, app/, tests, build system.
+Method: Read all non-generated source; ran `cmake --build build` (clean, zero warnings) and `ctest` (6/6 suites pass); inspected concurrency, security, performance, and design.
+
+================================================================================
+1. BUILD / TEST STATUS
+================================================================================
+- Build: PASS (C++20, -O3 -march=native -Wall -Wextra, zero warnings).
+- Unit tests: PASS (explorer_hal, explorer_policy, explorer_shield, explorer_vault, explorer_webapp, explorer_app_stores).
+- Rust shield (adblock-rust 0.13): builds staticlib; not covered by ctest.
+- Note: No integration/UI tests exist for BrowserWindow or CEF lifecycle paths.
+
+================================================================================
+2. HIGH-SEVERITY FINDINGS
+================================================================================
+[H1] Untracked detached threads can outlive their owning objects (UB risk)
+  Files: hal/src/power_governor.cpp (LinuxPowerGovernor::setPerformanceHoldAsync),
+         hal/src/display_refresh.cpp (MutterDisplayRefreshCtrl::setEdpRefreshRateAsync)
+  Detail: Both spawn `std::thread(...).detach()` that capture `this` (power governor) or call
+  into the controller's cache. `shutdown()` joins the watcher thread but never the detached
+  worker threads. If the governor/controller is destroyed while an async hold acquisition or
+  refresh switch is in flight, the worker dereferences a destroyed object / mutex -> UB.
+  Also, repeated rapid toggles spawn unbounded threads.
+  Rec: track workers (std::vector<std::thread> or a single serial worker queue) and join in
+  shutdown(); or dispatch through a shared executor.
+
+[H2] Zombie processes from fire-and-forget xdg-open
+  File: app/src/browser_window.cpp (spawnDetachedXdgOpen)
+  Detail: fork() + execlp() without waitpid(); every "Open file/folder" leaks a zombie until
+  reaped. Over a long session this accumulates.
+  Rec: waitpid() in a detached thread or set SIGCHLD handling.
+
+[H3] Audio/media tabs are never treated as "media" for CPU/I/O throttling
+  Files: app/src/browser_window.cpp (reconcileRendererPriorities),
+         policy/src/throttle_planner.cpp
+  Detail: reconcileRendererPriorities always passes an empty `media_tabs` set. The planner
+  therefore throttles any background tab even if it is playing audio/video. There is no
+  audible-tab tracking wired from CEF.
+  Rec: implement CEF audio callbacks / track audible state and feed media_tabs.
+
+[H4] Subprocesses inherit a non-battery HardwareProfile
+  File: app/src/main.cpp
+  Detail: In child processes (GPU/renderer), `hw.on_battery` defaults to false and turbo is
+  derived only from EXPLORER_TURBO_SLACK. Battery-saver Chromium features enabled in the
+  browser process are therefore not enabled in child processes. on_battery is not propagated.
+  Rec: set/read EXPLORER_ON_BATTERY (and turbo) env in all processes consistently.
+
+================================================================================
+3. MEDIUM-SEVERITY FINDINGS
+================================================================================
+[M1] Telemetry iGPU busy sampling is AMD-only
+  File: hal/src/telemetry.cpp (LinuxTelemetryMonitor constructor)
+  Detail: `igpu_busy_` is only populated for vendor 0x1002. On Intel iGPUs the busy percent
+  is never sampled, so the HUD shows no iGPU load on Intel systems.
+  Rec: detect vendor and read the appropriate busy node (e.g. i915).
+
+[M2] GPU isolator fallback can select a discrete GPU
+  File: hal/src/gpu_isolator.cpp (discoverIgpuRenderNode)
+  Detail: If no integrated (AMD/Intel) node is found, fallback is set to the first node seen
+  (often NVIDIA) and returned, defeating isolation. Fallback vendor string is also "" not
+  "unknown".
+  Rec: return an empty node when no integrated GPU is found and let caller decide.
+
+[M3] isOnBatteryBoot over-triggers on battery-less desktops
+  File: hal/src/power_governor.cpp
+  Detail: Returns true if mains is offline even when no Battery supply exists (mains_offline).
+  A desktop with AC unplugged (or no UPower battery) is treated as battery mode.
+  Rec: require at least one Battery whose status is Discharging (or mains offline AND a
+  battery present).
+
+[M4] Fragile line-based JSON parsing for prefs/session
+  Files: app/include/explorer/app/prefs_store.hpp (PrefsStore::load),
+         app/src/session_store.cpp (SessionStore::load)
+  Detail: Substring matching ("true" anywhere in line, "active": offset) is brittle and can
+  misparse or accept malformed data. No schema validation.
+  Rec: use a minimal strict parser or validate field boundaries.
+
+[M5] Naive JSON field extraction for trusted chrome commands
+  File: app/src/browser_window.cpp (extractJsonField)
+  Detail: Hand-rolled extraction used for vault_save/fill/delete. Trusted WebUI only, but
+  escaping edge cases (escaped quotes, unicode) are not fully handled.
+  Rec: route through a small JSON parser or ensure HUD uses a canonical serializer.
+
+[M6] Shutdown can hang if a tab's OnBeforeClose is not delivered
+  File: app/src/browser_window.cpp (handleCanClose, checkFinishShutdown, retiring_tabs_)
+  Detail: retiring_tabs_ entries are erased only in onTabClosed (OnBeforeClose). If CEF never
+  delivers OnBeforeClose for a tab, the map keeps the entry and open_browser_count_ never
+  reaches 0, so checkFinishShutdown never closes the window.
+  Rec: add a timeout/fallback cleanup or force-erase after TryCloseBrowser failure.
+
+[M7] jsonEscape does not escape U+2028/U+2029 (and session_store skips control chars)
+  Files: app/src/browser_window.cpp (jsonEscape),
+         app/src/session_store.cpp (escapeJson)
+  Detail: U+2028/U+2029 are valid in JSON strings but terminate JS string literals; session_store
+  escapeJson also does not escape characters < 0x20 other than \n/\r.
+  Rec: escape all control characters as \uXXXX in both helpers.
+
+[M8] ContentPageBridgeHandler login capture has no user-gesture requirement
+  File: app/src/main.cpp (ContentPageBridgeHandler)
+  Detail: Any HTTPS page can invoke __expLoginCapture; the browser stores a pending login
+  prompt. No user gesture or form-submit verification beyond a DOM submit listener.
+  Rec: require a recent user gesture / validate form submission context.
+
+================================================================================
+4. LOW-SEVERITY / INEFFICIENCY FINDINGS
+================================================================================
+[L1] Zombie/accumulating fork sites and detached workers
+  Files: app/src/browser_window.cpp (spawnDetachedXdgOpen),
+         shield/src/content_shield.cpp (updateFilterListsAsync fork+wait is fine),
+         webapp/src/webapp_installer.cpp (runProcessNoShell waits - OK)
+  Detail: spawnDetachedXdgOpen does not reap; see H2.
+
+[L2] Hardcoded hardware-specific tuning constants
+  Files: engine/src/cef_flags.cpp, hal/src/gpu_isolator.cpp, hal/src/telemetry.cpp
+  Detail: Ryzen 7 5800H-specific values (4 raster threads, 8 renderer limit, 2G shader cache,
+  16MB L3 comments) and AMD-only paths. Not adaptive to other CPUs/GPUs.
+
+[L3] resolveDownloadPath collision fallback can overwrite
+  File: engine/src/cef_client.cpp
+  Detail: After 999 collisions returns the existing candidate path, allowing overwrite.
+  Rec: append a stronger unique suffix or fail.
+
+[L4] Vault passwords linger in std::string memory
+  File: vault/src/password_vault.cpp
+  Detail: Credential passwords are held in std::string in memory and returned by findForOrigin
+  / listAll without cleansing on read. mlock/secure allocator not used.
+  Rec: document threat model; consider secure_string for in-memory secrets.
+
+[L5] Rule count metric conflates source lines with compiled rules
+  Files: shield-brave/src/lib.rs (build_engine_from_rules),
+         shield/src/content_shield.cpp (ruleCount)
+  Detail: count is number of non-comment lines, not adblock-compiled rule count.
+  Rec: report adblock's actual parsed rule count if available.
+
+[L6] Telemetry fan collection can duplicate inputs
+  File: hal/src/telemetry.cpp
+  Detail: Up to 4 fanN_input per hwmon are pushed; sample() takes max, so duplicates are
+  harmless but wasteful.
+
+[L7] MediaCodecPolicy::setHwOnlyVideo semantics are unclear
+  File: policy/src/media_policy.cpp
+  Detail: disable_sw_av1_ = enabled && !va_av1_ ignores allow_dgpu and the original
+  constructor logic; surprising when dGPU is allowed.
+  Rec: align with constructor (also consider allow_dgpu).
+
+[L8] Desktop files are world-readable and not fsynced
+  File: webapp/src/webapp_installer.cpp
+  Detail: Installed .desktop entries and icons are created with default perms; not a secret
+  but inconsistent with vault's 0600 handling.
+
+[L9] Blocked count is not reset on filter reload
+  File: shield/src/content_shield.cpp
+  Detail: blocked_count_ accumulates across reloads (acceptable) but never exposed as
+  "since session start" vs "current ruleset".
+
+================================================================================
+5. KEY DESIGN ISSUES
+================================================================================
+[D1] Lifetime/ownership of async work is not modeled
+  - Detached threads (H1) and forked helpers (H2) have no cancellation or completion tracking.
+  - Recommend a small task executor / thread pool owned by the services container.
+
+[D2] Service graph is null-heavy in subprocesses
+  - RuntimeServices holds shared_ptr for every service; subprocesses leave most null and
+    call sites scatter null checks. Prefer std::optional or a variant keyed by process role.
+
+[D3] Throttle planner lacks media awareness (H3)
+  - No CEF audio callback integration; background media tabs get throttled.
+
+[D4] Hardware assumptions are baked in
+  - Tuning constants and AMD-only code paths assume a specific machine (Ryzen 7 5800H +
+    AMD Cezanne). Reduces portability and makes EXPLORER_DISABLE_TUNING the only escape.
+
+[D5] Persistence parsing is ad-hoc
+  - Prefs/session use hand-rolled line parsing (M4). A tiny JSON reader would remove a class
+    of bugs and enable richer prefs.
+
+[D6] No integration test coverage
+  - Only pure-logic modules are tested. BrowserWindow, CEF wiring, vault autofill flow, and
+    shield reload are untested. Regressions there are caught only at runtime.
+
+[D7] Security boundary for WebUI bridge
+  - Trusted chrome (explorerHost.post) vs untrusted page (__exp* hooks) separation exists
+    and is good. But login capture (M8) and vault_fill JS string building (M7) deserve
+    hardening. Vault origin checks in vault_fill are a good pattern; reuse for all privileged
+    commands.
+
+================================================================================
+6. RECOMMENDED PRIORITY ORDER
+================================================================================
+1. Fix H1 (thread lifetime) and H2 (zombie reaping) — correctness/stability.
+2. Fix H3 (media-aware throttling) and H4 (subprocess battery propagation) — behavior.
+3. Address M4/M5/M7 (parsing/escaping) — robustness.
+4. Address M1/M2/M3 (hardware detection) — portability.
+5. L-series and D-series refactors — maintainability.
+
+================================================================================
+7. VERIFICATION NOTES
+================================================================================
+- `cmake --build build`: PASS, 0 warnings.
+- `ctest --test-dir build`: 6/6 PASS.
+- Rust crate not executed in ctest; recommend adding a smoke test for reload + check_slices.
+- Recommend adding sanitizers (ASan/UBSan/TSan) to CI for the detached-thread and vault
+  paths.
+
+END OF REVIEW

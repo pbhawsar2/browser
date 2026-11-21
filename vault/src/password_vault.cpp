@@ -116,6 +116,10 @@ std::string AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     if (s.empty()) return "";
 
+    for (unsigned char c : s) {
+        if (c <= 0x20 || c == 0x7f || c == '\\') return "";
+    }
+
     auto scheme_pos = s.find("://");
     std::string scheme = "https";
     size_t host_start = 0;
@@ -123,7 +127,8 @@ std::string AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url) {
         scheme = s.substr(0, scheme_pos);
         host_start = scheme_pos + 3;
     }
-    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     // Reject non-web schemes (file://, javascript:, data:, chrome://) to prevent credential confusion.
     if (scheme != "https" && scheme != "http") return "";
 
@@ -131,9 +136,40 @@ std::string AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url) {
     std::string authority = (path_pos == std::string::npos)
                                 ? s.substr(host_start)
                                 : s.substr(host_start, path_pos - host_start);
-    std::transform(authority.begin(), authority.end(), authority.begin(), ::tolower);
+    std::transform(authority.begin(), authority.end(), authority.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (authority.empty() || authority.find('@') != std::string::npos) return "";
-    return scheme + "://" + authority;
+
+    std::string host = authority;
+    std::string port_str;
+    auto colon_pos = authority.find(':');
+    if (colon_pos != std::string::npos) {
+        // Reject multiple colons (non-bracketed) or scheme-like prefixes when "://" was omitted
+        if (authority.find(':', colon_pos + 1) != std::string::npos) return "";
+        host = authority.substr(0, colon_pos);
+        port_str = authority.substr(colon_pos + 1);
+        if (host.empty() || port_str.empty() || port_str.size() > 5) return "";
+        for (unsigned char c : port_str) {
+            if (!std::isdigit(c)) return "";
+        }
+        unsigned long port = std::stoul(port_str);
+        if (port == 0 || port > 65535) return "";
+        // If "://" was omitted and a colon was present, require host to be localhost or a dotted domain/IP
+        // so scheme-like strings (e.g. "javascript:123", "data:123") are never misinterpreted as host:port.
+        if (scheme_pos == std::string::npos && host != "localhost" && host.find('.') == std::string::npos) {
+            return "";
+        }
+        if ((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+            port_str.clear();
+        }
+    }
+
+    if (host.empty() || host.front() == '.' || host.back() == '.') return "";
+    for (unsigned char c : host) {
+        if (!(std::isalnum(c) || c == '.' || c == '-')) return "";
+    }
+
+    return port_str.empty() ? (scheme + "://" + host) : (scheme + "://" + host + ":" + port_str);
 }
 
 AesGcmPasswordVault::AesGcmPasswordVault(fs::path storage_dir)
@@ -168,6 +204,9 @@ bool AesGcmPasswordVault::ensureKey() {
             ::chmod(key_path_.c_str(), 0600);
             return true;
         }
+        // Fail closed if an existing key file is short or unreadable — never overwrite it and orphan vault.enc!
+        key_.clear();
+        return false;
     }
 
     key_.resize(kKeyLen);

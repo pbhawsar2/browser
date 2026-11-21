@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace explorer::shield {
 
@@ -18,7 +20,12 @@ enum class ResourceKind {
     Script,
     Image,
     Stylesheet,
+    Font,
+    Media,
+    Object,
     XhrOrFetch,
+    Ping,
+    CspReport,
     Other,
 };
 
@@ -66,6 +73,10 @@ private:
     void* handle_ = nullptr;
     std::filesystem::path filters_dir_;
     std::atomic<bool> enabled_{true};
+    std::atomic<bool> updating_{false};
+    std::atomic<bool> shutting_down_{false};
+    std::mutex update_mu_;
+    std::thread update_thread_;
     mutable std::atomic<uint64_t> blocked_count_{0};
 };
 

@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -14,12 +15,26 @@ namespace {
 std::string escapeJson(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
-    for (char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
         if (c == '"') out += "\\\"";
         else if (c == '\\') out += "\\\\";
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
-        else out.push_back(c);
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        } else if (c == 0xE2 && i + 2 < s.size() &&
+                   static_cast<unsigned char>(s[i + 1]) == 0x80 &&
+                   (static_cast<unsigned char>(s[i + 2]) == 0xA8 ||
+                    static_cast<unsigned char>(s[i + 2]) == 0xA9)) {
+            out += (static_cast<unsigned char>(s[i + 2]) == 0xA8) ? "\\u2028" : "\\u2029";
+            i += 2;
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
     }
     return out;
 }

@@ -331,7 +331,7 @@ inline std::string topChromeHtmlDataUrl() {
   document.getElementById('btn-reload').onclick = () => send('reload_or_stop');
   document.getElementById('btn-newtab').onclick = () => send('new_tab');
   document.getElementById('btn-hud').onclick = () => send('open_panel', 'power');
-  document.getElementById('btn-shield').onclick = () => send('open_panel', 'power');
+  document.getElementById('btn-shield').onclick = () => send('open_panel', 'shield');
   document.getElementById('btn-key').onclick = () => send('open_panel', 'vault');
   document.getElementById('btn-downloads').onclick = () => send('open_panel', 'downloads');
   document.getElementById('btn-apps').onclick = () => send('open_panel', 'apps');
@@ -351,7 +351,7 @@ inline std::string topChromeHtmlDataUrl() {
   });
   urlInput.addEventListener('focus', () => urlInput.select());
 
-  findInput.addEventListener('input', () => send('find_next', findInput.value));
+  findInput.addEventListener('input', () => send('find_input', findInput.value));
   findInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); send(e.shiftKey ? 'find_prev' : 'find_next', findInput.value); }
     else if (e.key === 'Escape') { e.preventDefault(); send('find_close'); }
@@ -427,7 +427,7 @@ inline std::string topChromeHtmlDataUrl() {
           pill.dataset.tabId = String(t.id);
           pill.onmousedown = (ev) => { if (ev.button === 1) { ev.preventDefault(); send('close_tab', t.id); } };
           pill.onclick = (ev) => { if (!ev.target.closest('.tab-close')) send('activate_tab', t.id); };
-          if (t.favicon) {
+          if (t.favicon && (t.favicon.startsWith('https://') || t.favicon.startsWith('data:image/'))) {
             const img = document.createElement('img');
             img.className = 'tab-fav'; img.src = t.favicon; img.onerror = () => { img.style.display = 'none'; };
             pill.appendChild(img);
@@ -577,6 +577,7 @@ inline std::string powerHudHtmlDataUrl() {
   <div class="top">
     <div class="tabs">
       <button class="tab active" id="tab-power" type="button" onclick="switchTab('power')">Power</button>
+      <button class="tab" id="tab-shield" type="button" onclick="switchTab('shield')">Shield</button>
       <button class="tab" id="tab-vault" type="button" onclick="switchTab('vault')">Vault</button>
       <button class="tab" id="tab-downloads" type="button" onclick="switchTab('downloads')">Downloads</button>
       <button class="tab" id="tab-apps" type="button" onclick="switchTab('apps')">Apps</button>
@@ -587,45 +588,53 @@ inline std::string powerHudHtmlDataUrl() {
   </div>
 
   <div class="body">
-    <!-- TAB 1: POWER & BRAVE SHIELD -->
+    <!-- TAB 1: HARDWARE & POWER SUPERVISOR -->
     <div class="pane active" id="pane-power">
       <div class="card">
-        <div class="card-title">Brave Adblock Shield (adblock-rust)</div>
-        <div class="toggle-row" onclick="send('toggle_adblock')">
-          <span>Block Ads &amp; Trackers</span>
-          <button class="sw green" id="sw-adblock" type="button"></button>
-        </div>
-        <div class="row"><span class="lbl">Active Rules / Blocked</span><span class="val cyan" id="v-shield">0</span></div>
-        <button class="btn" id="btn-upd-filters" type="button" onclick="send('update_filters')">Update EasyList &amp; Privacy Filters</button>
-      </div>
-
-      <div class="card">
         <div class="card-title">Ryzen 7 5800H Hardware Telemetry</div>
-        <div class="row"><span class="lbl">CPU / Temp</span><span class="val" id="v-cpu">—</span></div>
+        <div class="row"><span class="lbl">CPU / Package</span><span class="val" id="v-cpu">—</span></div>
         <div class="row"><span class="lbl">AMD Cezanne iGPU</span><span class="val cyan" id="v-igpu">—</span></div>
         <div class="row"><span class="lbl">VA-API VCN</span><span class="val ok" id="v-va">—</span></div>
         <div class="row"><span class="lbl">RTX 3050 Ti dGPU</span><span class="val ok" id="v-dgpu">—</span></div>
-        <div class="row"><span class="lbl">Fan / Power</span><span class="val" id="v-fan">—</span></div>
+        <div class="row"><span class="lbl">Cooling Fans</span><span class="val" id="v-fan">—</span></div>
+        <div class="row"><span class="lbl">Power / Battery</span><span class="val cyan" id="v-power">—</span></div>
       </div>
 
       <div class="card">
-        <div class="toggle-row" onclick="send('toggle_autohide')">
-          <span>Auto-Hide Top Bar on Scroll</span>
-          <button class="sw" id="sw-autohide" type="button"></button>
-        </div>
+        <div class="card-title">Power &amp; Display Governor</div>
         <div class="toggle-row" onclick="send('toggle_turbo')">
-          <span>AC Turbo Performance Hold</span>
+          <span>AC Turbo Performance Hold (PPD)</span>
           <button class="sw" id="sw-turbo" type="button"></button>
         </div>
         <div class="toggle-row" onclick="send('toggle_cinema60')">
           <span>Cinema 60 Hz Display Lock</span>
           <button class="sw" id="sw-cinema" type="button"></button>
         </div>
+        <div class="toggle-row" onclick="send('toggle_autohide')">
+          <span>Auto-Hide Top Bar on Scroll</span>
+          <button class="sw" id="sw-autohide" type="button"></button>
+        </div>
       </div>
       <button class="btn" type="button" onclick="send('open_devtools')">Open Developer Tools (F12)</button>
     </div>
 
-    <!-- TAB 2: ENCRYPTED PASSWORD VAULT (AES-256-GCM) -->
+    <!-- TAB 2: BRAVE ADBLOCK SHIELD -->
+    <div class="pane" id="pane-shield">
+      <div class="card">
+        <div class="card-title">Brave Adblock Shield (adblock-rust)</div>
+        <div class="toggle-row" onclick="send('toggle_adblock')">
+          <span>Block Ads &amp; Trackers</span>
+          <button class="sw green" id="sw-adblock" type="button"></button>
+        </div>
+        <div class="row"><span class="lbl">Active Filter Rules</span><span class="val cyan" id="v-shield-rules">0</span></div>
+        <div class="row"><span class="lbl">Blocked Requests</span><span class="val ok" id="v-shield-blocked">0</span></div>
+        <div class="row"><span class="lbl">Privacy Headers</span><span class="val ok">Sec-GPC: 1 · DNT: 1</span></div>
+        <div class="row"><span class="lbl">WebRTC IP Policy</span><span class="val cyan">LAN Leak Protected</span></div>
+        <button class="btn" id="btn-upd-filters" type="button" onclick="send('update_filters')">Update EasyList &amp; Privacy Filters</button>
+      </div>
+    </div>
+
+    <!-- TAB 3: ENCRYPTED PASSWORD VAULT (AES-256-GCM) -->
     <div class="pane" id="pane-vault">
       <div class="card" id="pending-box" style="display:none; border-color: rgba(52,211,153,0.5);">
         <div class="card-title" style="color:#6EE7B7;">Captured Login Ready</div>
@@ -633,6 +642,16 @@ inline std::string powerHudHtmlDataUrl() {
         <div class="btn-row">
           <button class="btn sm" type="button" onclick="send('vault_accept_pending')">Save Encrypted</button>
           <button class="btn sm danger" type="button" onclick="send('vault_dismiss_pending')">Dismiss</button>
+        </div>
+      </div>
+
+      <div class="card" id="auth-box" style="display:none; border-color: rgba(56,189,248,0.55);">
+        <div class="card-title" style="color:#7DD3FC;">Linux Login / Root Authentication Required</div>
+        <div class="item-sub" id="auth-target-text">Verify OS password to reveal credential</div>
+        <input class="field" id="auth-sys-pass" type="password" placeholder="Enter Linux login or root password">
+        <div class="btn-row">
+          <button class="btn sm" type="button" onclick="submitVaultAuth()">Unlock &amp; Show</button>
+          <button class="btn sm danger" type="button" onclick="cancelVaultAuth()">Cancel</button>
         </div>
       </div>
 
@@ -690,13 +709,87 @@ inline std::string powerHudHtmlDataUrl() {
     }
   };
 
-  function switchTab(name) {
-    for (const t of ['power', 'vault', 'downloads', 'apps']) {
+  let lastCredsSig = '';
+  let lastDownloadsSig = '';
+  let lastAppsSig = '';
+  let lastAutoOrigin = '';
+  let lastAutoTitle = '';
+  let vaultEditing = false;
+  let pendingAuthTarget = null;
+  const revealedPasswords = new Map();
+  let revealHideTimer = null;
+
+  function credKey(origin, username) {
+    return origin + '\n' + username;
+  }
+
+  function clearRevealedPasswords() {
+    if (revealedPasswords.size > 0) {
+      revealedPasswords.clear();
+      lastCredsSig = '';
+    }
+    if (revealHideTimer) {
+      clearTimeout(revealHideTimer);
+      revealHideTimer = null;
+    }
+  }
+
+  function promptVaultAuth(origin, username) {
+    pendingAuthTarget = { origin, username };
+    document.getElementById('auth-target-text').textContent = 'Reveal password for ' + username + ' @ ' + origin;
+    const inp = document.getElementById('auth-sys-pass');
+    inp.value = '';
+    document.getElementById('auth-box').style.display = 'flex';
+    inp.focus();
+  }
+
+  function cancelVaultAuth() {
+    pendingAuthTarget = null;
+    document.getElementById('auth-sys-pass').value = '';
+    document.getElementById('auth-box').style.display = 'none';
+  }
+
+  function submitVaultAuth() {
+    if (!pendingAuthTarget) return;
+    const sysPass = document.getElementById('auth-sys-pass').value;
+    if (!sysPass) return;
+    document.getElementById('auth-sys-pass').value = '';
+    document.getElementById('auth-box').style.display = 'none';
+    send('vault_reveal', JSON.stringify({
+      origin: pendingAuthTarget.origin,
+      username: pendingAuthTarget.username,
+      authPassword: sysPass
+    }));
+    pendingAuthTarget = null;
+  }
+
+  document.getElementById('auth-sys-pass').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitVaultAuth(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelVaultAuth(); }
+  });
+
+  window.__onVaultRevealResult = (ok, origin, username, password, msg) => {
+    document.getElementById('status-msg').textContent = msg || '';
+    if (ok && origin && username) {
+      revealedPasswords.set(credKey(origin, username), password);
+      if (revealHideTimer) clearTimeout(revealHideTimer);
+      revealHideTimer = setTimeout(() => {
+        clearRevealedPasswords();
+        if (window.__lastHudData) window.__updateHud(window.__lastHudData);
+      }, 30000);
+      lastCredsSig = '';
+      if (window.__lastHudData) window.__updateHud(window.__lastHudData);
+    }
+  };
+
+  function switchTab(name, notify = true) {
+    for (const t of ['power', 'shield', 'vault', 'downloads', 'apps']) {
       document.getElementById('tab-' + t).className = 'tab' + (t === name ? ' active' : '');
       document.getElementById('pane-' + t).className = 'pane' + (t === name ? ' active' : '');
     }
+    if (notify) send('hud_tab_select', name);
   }
-  window.__selectTab = switchTab;
+  window.__selectTab = (name) => switchTab(name, false);
 
   function saveCred() {
     const o = document.getElementById('v-origin').value.trim();
@@ -705,6 +798,7 @@ inline std::string powerHudHtmlDataUrl() {
     if (!o || !u || !p) return;
     send('vault_save', JSON.stringify({origin: o, username: u, password: p}));
     document.getElementById('v-pass').value = '';
+    vaultEditing = false;
   }
 
   function installApp() {
@@ -713,25 +807,41 @@ inline std::string powerHudHtmlDataUrl() {
   }
 
   window.__updateHud = (h) => {
+    window.__lastHudData = h;
     document.getElementById('sw-adblock').className = 'sw green' + (h.adblockOn ? ' on' : '');
     document.getElementById('sw-autohide').className = 'sw' + (h.autohide ? ' on' : '');
     document.getElementById('sw-turbo').className = 'sw' + (!h.batteryMode ? ' on' : '');
     document.getElementById('sw-cinema').className = 'sw' + (h.cinema60 ? ' on' : '');
 
-    document.getElementById('v-shield').textContent = (h.rules || 0) + ' rules · ' + (h.blocked || 0) + ' blocked';
+    document.getElementById('v-shield-rules').textContent = (h.rules || 0) + ' rules';
+    document.getElementById('v-shield-blocked').textContent = (h.blocked || 0) + ' blocked';
     document.getElementById('v-cpu').textContent = h.cpu || '—';
     document.getElementById('v-igpu').textContent = h.igpu || '—';
     document.getElementById('v-va').textContent = h.va || '—';
     const dgpuEl = document.getElementById('v-dgpu');
     dgpuEl.textContent = h.dgpu || '—';
-    dgpuEl.className = 'val ' + (h.dgpu === 'suspended' ? 'ok' : 'warn');
+    dgpuEl.className = 'val ' + ((h.dgpu || '').startsWith('suspended') ? 'ok' : 'warn');
     document.getElementById('v-fan').textContent = h.fan || '—';
+    document.getElementById('v-power').textContent = h.power || '—';
     document.getElementById('status-msg').textContent = h.statusMsg || '';
 
     const origField = document.getElementById('v-origin');
-    if (document.activeElement !== origField && h.currentOrigin) origField.value = h.currentOrigin;
+    const userField = document.getElementById('v-user');
+    const passField = document.getElementById('v-pass');
+    const formFocused = (document.activeElement === origField ||
+                         document.activeElement === userField ||
+                         document.activeElement === passField);
+    if (!vaultEditing && !formFocused && h.currentOrigin &&
+        (origField.value === '' || origField.value === lastAutoOrigin)) {
+      origField.value = h.currentOrigin;
+      lastAutoOrigin = h.currentOrigin;
+    }
     const appField = document.getElementById('app-name');
-    if (document.activeElement !== appField && !appField.value && h.currentTitle) appField.value = h.currentTitle;
+    if (document.activeElement !== appField &&
+        (appField.value === '' || appField.value === lastAutoTitle)) {
+      appField.value = h.currentTitle || '';
+      lastAutoTitle = h.currentTitle || '';
+    }
 
     const pBox = document.getElementById('pending-box');
     if (h.pendingOrigin && h.pendingUser) {
@@ -741,93 +851,126 @@ inline std::string powerHudHtmlDataUrl() {
       pBox.style.display = 'none';
     }
 
-    // Vault list (safe textContent + clean 2-line stacking -> zero horizontal collision)
-    const vList = document.getElementById('vault-list');
-    vList.innerHTML = '';
-    if (!h.creds || h.creds.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty'; empty.textContent = 'No saved passwords yet';
-      vList.appendChild(empty);
-    } else {
-      for (const c of h.creds) {
-        const el = document.createElement('div');
-        el.className = 'list-item';
-        const nm = document.createElement('div'); nm.className = 'item-name'; nm.textContent = c.username;
-        const sb = document.createElement('div'); sb.className = 'item-sub'; sb.textContent = c.origin;
-        el.appendChild(nm); el.appendChild(sb);
-        const row = document.createElement('div'); row.className = 'btn-row';
-        if (h.currentOrigin && c.origin === h.currentOrigin) {
-          const bf = document.createElement('button'); bf.className = 'btn sm'; bf.type = 'button'; bf.textContent = 'Autofill';
-          bf.onclick = () => send('vault_fill', JSON.stringify({origin: c.origin, username: c.username}));
-          row.appendChild(bf);
+    // Vault list (DOM rebuilt only when credentials or currentOrigin change)
+    const credsSig = JSON.stringify({c: h.creds || [], o: h.currentOrigin || ''});
+    if (credsSig !== lastCredsSig) {
+      lastCredsSig = credsSig;
+      const vList = document.getElementById('vault-list');
+      vList.innerHTML = '';
+      if (!h.creds || h.creds.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty'; empty.textContent = 'No saved passwords yet';
+        vList.appendChild(empty);
+      } else {
+        for (const c of h.creds) {
+          const el = document.createElement('div');
+          el.className = 'list-item';
+          const nm = document.createElement('div'); nm.className = 'item-name'; nm.textContent = c.username;
+          const sb = document.createElement('div'); sb.className = 'item-sub'; sb.textContent = c.origin;
+          const key = credKey(c.origin, c.username);
+          const isRevealed = revealedPasswords.has(key);
+          const pwLine = document.createElement('div');
+          pwLine.className = 'item-stat';
+          pwLine.style.color = isRevealed ? '#6EE7B7' : '#64748B';
+          pwLine.textContent = isRevealed ? ('Password: ' + revealedPasswords.get(key)) : 'Password: ••••••••••••';
+          el.appendChild(nm); el.appendChild(sb); el.appendChild(pwLine);
+          const row = document.createElement('div'); row.className = 'btn-row';
+          if (h.currentOrigin && c.origin === h.currentOrigin) {
+            const bf = document.createElement('button'); bf.className = 'btn sm'; bf.type = 'button'; bf.textContent = 'Autofill';
+            bf.onclick = () => send('vault_fill', JSON.stringify({origin: c.origin, username: c.username}));
+            row.appendChild(bf);
+          }
+          const bs = document.createElement('button'); bs.className = 'btn sm'; bs.type = 'button';
+          bs.textContent = isRevealed ? 'Hide' : 'Show';
+          bs.onclick = () => {
+            if (revealedPasswords.has(key)) {
+              revealedPasswords.delete(key);
+              lastCredsSig = '';
+              window.__updateHud(h);
+            } else {
+              promptVaultAuth(c.origin, c.username);
+            }
+          };
+          const be = document.createElement('button'); be.className = 'btn sm'; be.type = 'button'; be.textContent = 'Edit';
+          be.onclick = () => {
+            vaultEditing = true;
+            document.getElementById('v-origin').value = c.origin;
+            document.getElementById('v-user').value = c.username;
+            document.getElementById('v-pass').focus();
+          };
+          const bd = document.createElement('button'); bd.className = 'btn sm danger'; bd.type = 'button'; bd.textContent = 'Delete';
+          bd.onclick = () => {
+            revealedPasswords.delete(key);
+            send('vault_delete', JSON.stringify({origin: c.origin, username: c.username}));
+          };
+          row.appendChild(bs); row.appendChild(be); row.appendChild(bd);
+          el.appendChild(row);
+          vList.appendChild(el);
         }
-        const be = document.createElement('button'); be.className = 'btn sm'; be.type = 'button'; be.textContent = 'Edit';
-        be.onclick = () => {
-          document.getElementById('v-origin').value = c.origin;
-          document.getElementById('v-user').value = c.username;
-          document.getElementById('v-pass').focus();
-        };
-        const bd = document.createElement('button'); bd.className = 'btn sm danger'; bd.type = 'button'; bd.textContent = 'Delete';
-        bd.onclick = () => send('vault_delete', JSON.stringify({origin: c.origin, username: c.username}));
-        row.appendChild(be); row.appendChild(bd);
-        el.appendChild(row);
-        vList.appendChild(el);
       }
     }
 
-    // Downloads list
-    const dList = document.getElementById('dl-list');
-    dList.innerHTML = '';
-    if (!h.downloads || h.downloads.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty'; empty.textContent = 'No downloads in this session';
-      dList.appendChild(empty);
-    } else {
-      for (const d of h.downloads) {
-        const el = document.createElement('div');
-        el.className = 'list-item';
-        const head = document.createElement('div'); head.className = 'item-head';
-        const nm = document.createElement('span'); nm.className = 'item-name'; nm.textContent = d.name;
-        const st = document.createElement('span'); st.className = 'item-stat';
-        st.textContent = d.inProgress ? (d.percent + '%') : (d.complete ? 'Completed' : 'Canceled');
-        head.appendChild(nm); head.appendChild(st); el.appendChild(head);
-        const row = document.createElement('div'); row.className = 'btn-row';
-        if (d.inProgress) {
-          const bc = document.createElement('button'); bc.className = 'btn sm danger'; bc.type = 'button'; bc.textContent = 'Cancel';
-          bc.onclick = () => send('dl_cancel', String(d.id));
-          row.appendChild(bc);
-        } else if (d.complete) {
-          const bo = document.createElement('button'); bo.className = 'btn sm'; bo.type = 'button'; bo.textContent = 'Open File';
-          bo.onclick = () => send('dl_open', d.path);
-          row.appendChild(bo);
+    // Downloads list (DOM rebuilt only when download state/progress changes)
+    const dlSig = JSON.stringify(h.downloads || []);
+    if (dlSig !== lastDownloadsSig) {
+      lastDownloadsSig = dlSig;
+      const dList = document.getElementById('dl-list');
+      dList.innerHTML = '';
+      if (!h.downloads || h.downloads.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty'; empty.textContent = 'No downloads in this session';
+        dList.appendChild(empty);
+      } else {
+        for (const d of h.downloads) {
+          const el = document.createElement('div');
+          el.className = 'list-item';
+          const head = document.createElement('div'); head.className = 'item-head';
+          const nm = document.createElement('span'); nm.className = 'item-name'; nm.textContent = d.name;
+          const st = document.createElement('span'); st.className = 'item-stat';
+          st.textContent = d.inProgress ? (d.percent + '%') : (d.complete ? 'Completed' : 'Canceled');
+          head.appendChild(nm); head.appendChild(st); el.appendChild(head);
+          const row = document.createElement('div'); row.className = 'btn-row';
+          if (d.inProgress) {
+            const bc = document.createElement('button'); bc.className = 'btn sm danger'; bc.type = 'button'; bc.textContent = 'Cancel';
+            bc.onclick = () => send('dl_cancel', String(d.id));
+            row.appendChild(bc);
+          } else if (d.complete) {
+            const bo = document.createElement('button'); bo.className = 'btn sm'; bo.type = 'button'; bo.textContent = 'Open File';
+            bo.onclick = () => send('dl_open', d.path);
+            row.appendChild(bo);
+          }
+          if (row.childElementCount > 0) el.appendChild(row);
+          dList.appendChild(el);
         }
-        if (row.childElementCount > 0) el.appendChild(row);
-        dList.appendChild(el);
       }
     }
 
-    // Installed WebApps list
-    const aList = document.getElementById('apps-list');
-    aList.innerHTML = '';
-    if (!h.webapps || h.webapps.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty'; empty.textContent = 'No Web Apps installed yet';
-      aList.appendChild(empty);
-    } else {
-      for (const a of h.webapps) {
-        const el = document.createElement('div');
-        el.className = 'list-item';
-        const nm = document.createElement('div'); nm.className = 'item-name'; nm.textContent = a.name;
-        const sb = document.createElement('div'); sb.className = 'item-sub'; sb.textContent = a.url;
-        el.appendChild(nm); el.appendChild(sb);
-        const row = document.createElement('div'); row.className = 'btn-row';
-        const bl = document.createElement('button'); bl.className = 'btn sm'; bl.type = 'button'; bl.textContent = 'Launch App';
-        bl.onclick = () => send('webapp_launch', a.id);
-        const bu = document.createElement('button'); bu.className = 'btn sm danger'; bu.type = 'button'; bu.textContent = 'Uninstall';
-        bu.onclick = () => send('webapp_uninstall', a.id);
-        row.appendChild(bl); row.appendChild(bu);
-        el.appendChild(row);
-        aList.appendChild(el);
+    // Installed WebApps list (DOM rebuilt only when installed apps change)
+    const appsSig = JSON.stringify(h.webapps || []);
+    if (appsSig !== lastAppsSig) {
+      lastAppsSig = appsSig;
+      const aList = document.getElementById('apps-list');
+      aList.innerHTML = '';
+      if (!h.webapps || h.webapps.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty'; empty.textContent = 'No Web Apps installed yet';
+        aList.appendChild(empty);
+      } else {
+        for (const a of h.webapps) {
+          const el = document.createElement('div');
+          el.className = 'list-item';
+          const nm = document.createElement('div'); nm.className = 'item-name'; nm.textContent = a.name;
+          const sb = document.createElement('div'); sb.className = 'item-sub'; sb.textContent = a.url;
+          el.appendChild(nm); el.appendChild(sb);
+          const row = document.createElement('div'); row.className = 'btn-row';
+          const bl = document.createElement('button'); bl.className = 'btn sm'; bl.type = 'button'; bl.textContent = 'Launch App';
+          bl.onclick = () => send('webapp_launch', a.id);
+          const bu = document.createElement('button'); bu.className = 'btn sm danger'; bu.type = 'button'; bu.textContent = 'Uninstall';
+          bu.onclick = () => send('webapp_uninstall', a.id);
+          row.appendChild(bl); row.appendChild(bu);
+          el.appendChild(row);
+          aList.appendChild(el);
+        }
       }
     }
   };

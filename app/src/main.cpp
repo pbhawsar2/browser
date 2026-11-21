@@ -109,13 +109,18 @@ public:
             retval = CefV8Value::CreateBool(true);
             return true;
         }
+        if (name == "__expMediaState" && arguments.size() == 1 && arguments[0]->IsBool()) {
+            auto msg = CefProcessMessage::Create("explorer.media-state");
+            msg->GetArgumentList()->SetBool(0, arguments[0]->GetBoolValue());
+            browser_->GetMainFrame()->SendProcessMessage(PID_BROWSER, msg);
+            retval = CefV8Value::CreateBool(true);
+            return true;
+        }
         if (name == "__expLoginCapture" && arguments.size() >= 2 &&
             arguments[0]->IsString() && arguments[1]->IsString()) {
             // Security: NEVER trust origin from untrusted page JS; read browser-verified frame URL!
             std::string frame_url = browser_->GetMainFrame()->GetURL().ToString();
-            if (frame_url.rfind("https://", 0) != 0 &&
-                frame_url.rfind("http://localhost", 0) != 0 &&
-                frame_url.rfind("http://127.0.0.1", 0) != 0) {
+            if (!explorer::policy::isSecureWebOrigin(frame_url)) {
                 return false;
             }
             auto msg = CefProcessMessage::Create("explorer.login-capture");
@@ -204,7 +209,8 @@ public:
 
         // 1. Trusted Chrome/HUD WebUI: expose window.explorerHost.post(cmd, arg).
         if (trusted_chrome_ids_.count(browser->GetIdentifier()) != 0) {
-            if (frame->IsMain()) {
+            if (frame->IsMain() &&
+                frame->GetURL().ToString().rfind("data:text/html;charset=utf-8;base64,", 0) == 0) {
                 CefRefPtr<CefV8Value> global = context->GetGlobal();
                 CefRefPtr<CefV8Value> host = CefV8Value::CreateObject(nullptr, nullptr);
                 CefRefPtr<CefV8Handler> handler = new ChromeHostV8Handler(browser);
@@ -216,7 +222,7 @@ public:
         }
 
         // 2. Untrusted Web Content: NEVER expose explorerHost!
-        //    Register write-only passive hooks for scroll auto-hide & login-form save prompt.
+        //    Register write-only passive hooks for scroll auto-hide, media playback & login-form save prompt.
         if (frame->IsMain()) {
             CefRefPtr<CefV8Value> global = context->GetGlobal();
             CefRefPtr<CefV8Handler> cb = new ContentPageBridgeHandler(browser);
@@ -224,6 +230,8 @@ public:
                 V8_PROPERTY_ATTRIBUTE_DONTENUM | V8_PROPERTY_ATTRIBUTE_READONLY | V8_PROPERTY_ATTRIBUTE_DONTDELETE);
             global->SetValue("__expTopbarReveal",
                              CefV8Value::CreateFunction("__expTopbarReveal", cb), attr);
+            global->SetValue("__expMediaState",
+                             CefV8Value::CreateFunction("__expMediaState", cb), attr);
             global->SetValue("__expLoginCapture",
                              CefV8Value::CreateFunction("__expLoginCapture", cb), attr);
 
@@ -236,6 +244,10 @@ public:
                 let lastToggleTs = 0;
                 const setBar = (reveal) => {
                     if (hidden === !reveal) return;
+                    if (!reveal) {
+                        const docH = document.documentElement ? document.documentElement.scrollHeight : 0;
+                        if (docH < window.innerHeight + 450) return;
+                    }
                     const now = performance.now();
                     if (!reveal && (now - lastToggleTs) < 350) return;
                     lastToggleTs = now;
@@ -247,8 +259,6 @@ public:
                     ticking = true;
                     requestAnimationFrame(() => {
                         ticking = false;
-                        const docH = document.documentElement ? document.documentElement.scrollHeight : 0;
-                        if (docH < window.innerHeight + 450) { setBar(true); return; }
                         const y = window.scrollY || 0;
                         const dy = y - lastY;
                         if (y < 28 || dy < -24) setBar(true);
@@ -259,6 +269,26 @@ public:
                 window.addEventListener('mousemove', (e) => {
                     if (hidden && e.clientY <= 8) setBar(true);
                 }, { passive: true });
+                let lastMediaPlaying = false;
+                const syncMedia = () => {
+                    const els = document.querySelectorAll('video, audio');
+                    let playing = false;
+                    for (let i = 0; i < els.length; ++i) {
+                        if (!els[i].paused && !els[i].ended && els[i].readyState > 1) {
+                            playing = true;
+                            break;
+                        }
+                    }
+                    if (playing !== lastMediaPlaying) {
+                        lastMediaPlaying = playing;
+                        try { if (typeof __expMediaState === 'function') __expMediaState(playing); } catch {}
+                    }
+                };
+                document.addEventListener('play', syncMedia, true);
+                document.addEventListener('playing', syncMedia, true);
+                document.addEventListener('pause', syncMedia, true);
+                document.addEventListener('ended', syncMedia, true);
+                document.addEventListener('emptied', syncMedia, true);
                 document.addEventListener('submit', (e) => {
                     const form = e.target;
                     if (!form || !form.querySelector) return;
@@ -340,9 +370,12 @@ int main(int argc, char* argv[]) {
         hw.va_caps = va_prober.probe(node);
         bool turbo = !hw.on_battery || (std::getenv("EXPLORER_TURBO") != nullptr);
         power_gov->applyTimerSlackNs(turbo ? 1UL : 2'000'000UL);
+        ::setenv("EXPLORER_ON_BATTERY", hw.on_battery ? "1" : "0", 1);
         ::setenv("EXPLORER_TURBO_SLACK", turbo ? "1" : "0", 1);
         ::setenv("EXPLORER_VA_AV1", hw.va_caps.av1 ? "1" : "0", 1);
     } else {
+        const char* on_batt = std::getenv("EXPLORER_ON_BATTERY");
+        hw.on_battery = (on_batt != nullptr && on_batt[0] == '1');
         const char* va_av1 = std::getenv("EXPLORER_VA_AV1");
         hw.va_caps.av1 = (va_av1 != nullptr && va_av1[0] == '1');
         const char* ts = std::getenv("EXPLORER_TURBO_SLACK");
@@ -380,18 +413,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Installed WebApps get their own isolated cache/profile subdir under profile_dir/apps/<app_id>
+    std::filesystem::path base_profile_dir = launch_cfg.profile_dir;
+    // Installed WebApps get their own isolated cache/profile subdir under profile_dir/webapps/<app_id>
     // Sanitize --app-id strictly to prevent path traversal (e.g. --app-id=../../evil).
     if (!launch_cfg.app_mode_url.empty()) {
         std::string sub;
         for (unsigned char c : launch_cfg.app_id) {
-            if (std::isalnum(c) || c == '-' || c == '_') sub.push_back(static_cast<char>(c));
+            if (std::isalnum(c) || c == '-' || c == '_') {
+                sub.push_back(static_cast<char>(c));
+            } else if (c == '.' && !sub.empty() && sub.back() != '.') {
+                sub.push_back('.');
+            }
             if (sub.size() >= 80) break;
         }
+        while (!sub.empty() && sub.back() == '.') sub.pop_back();
         if (sub.empty()) sub = "default-app";
         launch_cfg.app_id = sub;
-        launch_cfg.profile_dir = launch_cfg.profile_dir / "webapps" / sub;
+        launch_cfg.profile_dir = base_profile_dir / "webapps" / sub;
     }
+
+    // Tell GNOME Wayland / XDG desktop shell which .desktop launcher owns this window
+    std::string desktop_id = (launch_cfg.app_id.empty() ? "explorer" : launch_cfg.app_id) + ".desktop";
+    ::setenv("CHROME_DESKTOP", desktop_id.c_str(), 1);
 
     explorer::app::RuntimeServices services;
     services.hw = hw;
@@ -400,17 +443,19 @@ int main(int argc, char* argv[]) {
         services.display_ctrl = std::make_shared<explorer::hal::MutterDisplayRefreshCtrl>();
         services.throttler = std::make_shared<explorer::hal::LinuxProcessThrottler>();
         services.telemetry = std::make_shared<explorer::hal::LinuxTelemetryMonitor>();
-        if (!hw.tuning_disabled) {
-            services.shield = std::make_shared<explorer::shield::BraveAdblockShield>(
-                defaultProfileDir() / "filters", true);
-        }
-        services.vault = std::make_shared<explorer::vault::AesGcmPasswordVault>(defaultProfileDir());
+        services.shield = std::make_shared<explorer::shield::BraveAdblockShield>(
+            base_profile_dir / "filters", true);
+        services.vault = std::make_shared<explorer::vault::AesGcmPasswordVault>(base_profile_dir);
         const char* home = std::getenv("HOME");
         if (home && home[0]) {
             std::filesystem::path h(home);
+            std::filesystem::path data_home = h / ".local/share";
+            if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0]) {
+                data_home = xdg;
+            }
             services.webapp_installer = std::make_shared<explorer::webapp::LinuxWebAppInstaller>(
-                h / ".local/share/applications",
-                h / ".local/share/icons/hicolor",
+                data_home / "applications",
+                data_home / "icons/hicolor",
                 h / ".local/bin/explorer");
         }
     }

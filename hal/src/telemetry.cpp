@@ -52,6 +52,7 @@ LinuxTelemetryMonitor::LinuxTelemetryMonitor() {
             ac_online_ = readablePath(e.path() / "online");
         } else if (kind == "Battery" && !batt_status_) {
             batt_status_ = readablePath(e.path() / "status");
+            batt_capacity_ = readablePath(e.path() / "capacity");
             batt_power_uw_ = readablePath(e.path() / "power_now");
             batt_volt_uv_ = readablePath(e.path() / "voltage_now");
             batt_curr_ua_ = readablePath(e.path() / "current_now");
@@ -82,6 +83,10 @@ LinuxTelemetryMonitor::LinuxTelemetryMonitor() {
         std::transform(vendor.begin(), vendor.end(), vendor.begin(), ::tolower);
         if (vendor == "0x1002" && !igpu_busy_) {
             igpu_busy_ = readablePath(dev / "gpu_busy_percent");
+        } else if (vendor == "0x8086") {
+            if (!igpu_freq_hz_) {
+                igpu_freq_hz_ = readablePath(e.path() / "gt_act_freq_mhz");
+            }
         } else if (vendor == "0x10de" && !dgpu_runtime_status_) {
             dgpu_runtime_status_ = readablePath(dev / "power" / "runtime_status");
         }
@@ -98,10 +103,17 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
     bool discharging = false;
     if (batt_status_) {
         auto st = readTrimmed(*batt_status_).value_or("");
-        std::transform(st.begin(), st.end(), st.begin(), ::tolower);
-        discharging = (st == "discharging");
+        if (!st.empty()) out.batt_status_str = st;
+        std::string st_low = st;
+        std::transform(st_low.begin(), st_low.end(), st_low.begin(), ::tolower);
+        discharging = (st_low == "discharging");
     }
-    out.on_battery = discharging || (ac_on.has_value() && !*ac_on);
+    if (batt_capacity_) {
+        if (auto cap = readU64(*batt_capacity_)) {
+            out.batt_capacity_pct = static_cast<uint32_t>(std::min<uint64_t>(*cap, 100ULL));
+        }
+    }
+    out.on_battery = discharging || (batt_status_.has_value() && ac_on.has_value() && !*ac_on);
 
     if (auto pct = sampleCpuPercent()) out.cpu_percent = *pct;
     if (cpu_temp_mc_) {
@@ -111,7 +123,10 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
         if (auto mc = readU64(*igpu_temp_mc_)) out.igpu_temp_c = static_cast<float>(*mc) / 1000.0f;
     }
     if (igpu_freq_hz_) {
-        if (auto hz = readU64(*igpu_freq_hz_)) out.igpu_mhz = static_cast<uint32_t>(*hz / 1'000'000ULL);
+        if (auto hz = readU64(*igpu_freq_hz_)) {
+            // hwmon freq1_input is in Hz (> 100000), DRM gt_act_freq_mhz is already in MHz.
+            out.igpu_mhz = static_cast<uint32_t>(*hz > 100'000ULL ? (*hz / 1'000'000ULL) : *hz);
+        }
     }
     if (igpu_power_uw_) {
         if (auto uw = readU64(*igpu_power_uw_)) out.igpu_watts = static_cast<float>(*uw) / 1'000'000.0f;
@@ -121,11 +136,16 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
     }
 
     out.pkg_watts = sampleRaplWatts();
+    // On AMD Ryzen APUs where intel-rapl is 0400 root-only, amdgpu power1_input (PPT) reports APU package power.
+    if (!out.pkg_watts.has_value() && out.igpu_watts.has_value()) {
+        out.pkg_watts = out.igpu_watts;
+    }
     out.batt_watts = sampleBattWatts();
 
     for (const auto& f : fan_inputs_) {
         if (auto rpm = readU64(f)) {
             uint32_t r = static_cast<uint32_t>(*rpm);
+            out.fan_rpms.push_back(r);
             out.fan_rpm = out.fan_rpm.has_value() ? std::max(*out.fan_rpm, r) : r;
         }
     }
@@ -149,13 +169,16 @@ TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
         std::transform(st.begin(), st.end(), st.begin(), ::tolower);
         discharging = (st == "discharging");
     }
-    out.on_battery = discharging || (ac_on.has_value() && !*ac_on);
+    out.on_battery = discharging || (batt_status_.has_value() && ac_on.has_value() && !*ac_on);
+    // Keep /proc/stat delta warm every 2s/5s tick so opening the Power HUD shows immediate 2s CPU load!
+    if (auto pct = sampleCpuPercent()) out.cpu_percent = *pct;
     if (out.on_battery) {
         out.batt_watts = sampleBattWatts();
     }
     for (const auto& f : fan_inputs_) {
         if (auto rpm = readU64(f)) {
             uint32_t r = static_cast<uint32_t>(*rpm);
+            out.fan_rpms.push_back(r);
             out.fan_rpm = out.fan_rpm.has_value() ? std::max(*out.fan_rpm, r) : r;
         }
     }
@@ -171,8 +194,11 @@ std::optional<float> LinuxTelemetryMonitor::sampleRaplWatts() {
     std::optional<float> watts;
     if (prev_rapl_) {
         double dt = std::chrono::duration<double>(now - prev_rapl_->second).count();
-        if (dt > 0.15 && *energy >= prev_rapl_->first) {
-            watts = static_cast<float>(static_cast<double>(*energy - prev_rapl_->first) / (dt * 1'000'000.0));
+        if (dt > 0.15 && dt < 30.0 && *energy >= prev_rapl_->first) {
+            float w = static_cast<float>(static_cast<double>(*energy - prev_rapl_->first) / (dt * 1'000'000.0));
+            if (w >= 0.0f && w <= 250.0f) {
+                watts = w;
+            }
         }
     }
     prev_rapl_ = {*energy, now};
