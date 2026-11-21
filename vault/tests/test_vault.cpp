@@ -20,6 +20,11 @@ int main() {
         // Update existing credential cleanly
         assert(v.saveOrUpdate("https://github.com/settings", "piyush", "NewP@ss456"));
 
+        // Security: reject non-web schemes (javascript:, file://, data:) and userinfo (@) spoofing
+        assert(!v.saveOrUpdate("javascript:alert(1)", "u", "p"));
+        assert(!v.saveOrUpdate("file:///etc/passwd", "u", "p"));
+        assert(!v.saveOrUpdate("https://evil.com@bank.com", "u", "p"));
+
         auto gh = v.findForOrigin("https://github.com/repo");
         assert(gh.size() == 1 && gh[0].username == "piyush" && gh[0].password == "NewP@ss456");
     }

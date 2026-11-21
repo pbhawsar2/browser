@@ -13,12 +13,15 @@ class ITelemetryMonitor {
 public:
     virtual ~ITelemetryMonitor() = default;
     virtual TelemetrySnapshot sample() = 0;
+    /// Ultra-lightweight sample for the closed-HUD top bezel pill (ac/battery + fan RPM only).
+    virtual TelemetrySnapshot sampleLite() { return sample(); }
 };
 
 class LinuxTelemetryMonitor final : public ITelemetryMonitor {
 public:
     LinuxTelemetryMonitor();
     TelemetrySnapshot sample() override;
+    TelemetrySnapshot sampleLite() override;
 
 private:
     std::optional<std::filesystem::path> ac_online_;

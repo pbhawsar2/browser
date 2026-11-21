@@ -1,10 +1,16 @@
 #include "explorer/hal/power_governor.hpp"
 #include "explorer/hal/types.hpp"
 
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <systemd/sd-bus.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -184,6 +190,9 @@ void LinuxPowerGovernor::startBatteryWatcher(std::function<void(bool)> on_change
     if (isTuningDisabled() || watcher_thread_.joinable()) return;
 
     stop_watcher_.store(false);
+    if (wake_fd_ < 0) {
+        wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    }
     watcher_thread_ = std::thread([this, cb = std::move(on_change)]() mutable {
         sd_bus* bus = nullptr;
         if (sd_bus_open_system(&bus) < 0 || !bus) return;
@@ -200,11 +209,36 @@ void LinuxPowerGovernor::startBatteryWatcher(std::function<void(bool)> on_change
             onUpowerPropsChanged,
             &ctx);
 
+        const int bus_fd = sd_bus_get_fd(bus);
         while (!stop_watcher_.load()) {
             int r = sd_bus_process(bus, nullptr);
             if (r < 0) break;
             if (r > 0) continue;
-            sd_bus_wait(bus, 250'000);  // 250ms poll for clean shutdown
+
+            if (bus_fd < 0) {
+                sd_bus_wait(bus, 250'000);
+                continue;
+            }
+            int events = sd_bus_get_events(bus);
+            uint64_t timeout_usec = UINT64_MAX;
+            sd_bus_get_timeout(bus, &timeout_usec);
+            int timeout_ms = -1;  // Infinite wait -> 0 idle CPU wakeups/sec!
+            if (timeout_usec != UINT64_MAX) {
+                timespec ts{};
+                ::clock_gettime(CLOCK_MONOTONIC, &ts);
+                uint64_t now_usec = static_cast<uint64_t>(ts.tv_sec) * 1'000'000ULL +
+                                    static_cast<uint64_t>(ts.tv_nsec) / 1'000ULL;
+                timeout_ms = (timeout_usec > now_usec)
+                                 ? static_cast<int>(std::min<uint64_t>((timeout_usec - now_usec + 999ULL) / 1000ULL, 60'000ULL))
+                                 : 0;
+            }
+            pollfd fds[2]{};
+            fds[0].fd = bus_fd;
+            fds[0].events = static_cast<short>(events);
+            fds[1].fd = wake_fd_;
+            fds[1].events = POLLIN;
+            int pr = ::poll(fds, (wake_fd_ >= 0) ? 2 : 1, timeout_ms);
+            if (pr < 0 && errno != EINTR) break;
         }
 
         sd_bus_slot_unref(slot);
@@ -214,8 +248,16 @@ void LinuxPowerGovernor::startBatteryWatcher(std::function<void(bool)> on_change
 
 void LinuxPowerGovernor::shutdown() {
     stop_watcher_.store(true);
+    if (wake_fd_ >= 0) {
+        uint64_t one = 1;
+        (void)::write(wake_fd_, &one, sizeof(one));
+    }
     if (watcher_thread_.joinable()) {
         watcher_thread_.join();
+    }
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
     }
     std::optional<uint32_t> cookie;
     {

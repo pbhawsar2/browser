@@ -41,7 +41,19 @@ std::filesystem::path resolveDownloadPath(const std::string& suggested_name) {
     std::string clean = suggested_name.empty() ? "download" : suggested_name;
     auto slash = clean.find_last_of("/\\");
     if (slash != std::string::npos) clean = clean.substr(slash + 1);
-    if (clean.empty()) clean = "download";
+    // Strip control chars, path traversal, and leading dots (prevent hidden dotfiles like .bashrc).
+    std::string safe;
+    safe.reserve(clean.size());
+    for (unsigned char c : clean) {
+        if (c < 0x20 || c == 0x7f || c == '/' || c == '\\') continue;
+        safe.push_back(static_cast<char>(c));
+    }
+    while (!safe.empty() && safe.front() == '.') safe.erase(safe.begin());
+    while (safe.find("..") != std::string::npos) {
+        safe.replace(safe.find(".."), 2, "_");
+    }
+    if (safe.empty()) safe = "download";
+    clean = std::move(safe);
 
     std::filesystem::path candidate = dir / clean;
     if (!std::filesystem::exists(candidate, ec)) return candidate;
@@ -244,10 +256,25 @@ CefResourceRequestHandler::ReturnValue ExplorerCefClient::OnBeforeResourceLoad(
     CefRefPtr<CefFrame> frame,
     CefRefPtr<CefRequest> request,
     CefRefPtr<CefCallback> /*callback*/) {
-    if (!shield_ || !request) {
+    if (!request) {
         return RV_CONTINUE;
     }
     std::string url = request->GetURL().ToString();
+
+    // Send Global Privacy Control (Sec-GPC: 1) & Do-Not-Track (DNT: 1) on outgoing web requests.
+    if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
+        CefRequest::HeaderMap headers;
+        request->GetHeaderMap(headers);
+        headers.erase("Sec-GPC");
+        headers.erase("DNT");
+        headers.emplace("Sec-GPC", "1");
+        headers.emplace("DNT", "1");
+        request->SetHeaderMap(headers);
+    }
+
+    if (!shield_) {
+        return RV_CONTINUE;
+    }
     std::string initiator;
     if (frame) {
         initiator = frame->GetURL().ToString();

@@ -29,6 +29,7 @@ public:
 class AesGcmPasswordVault final : public IPasswordVault {
 public:
     explicit AesGcmPasswordVault(std::filesystem::path storage_dir);
+    ~AesGcmPasswordVault() override;
 
     bool saveOrUpdate(const std::string& origin,
                       const std::string& username,

@@ -36,6 +36,7 @@ private:
     std::optional<uint32_t> ppd_cookie_;
     bool ppd_desired_ = false;
     std::atomic<bool> stop_watcher_{false};
+    int wake_fd_ = -1;
     std::thread watcher_thread_;
 };
 

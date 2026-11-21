@@ -31,6 +31,7 @@ public:
 private:
     std::atomic<int> last_hz_{-1};
     std::atomic<bool> stop_watcher_{false};
+    int wake_fd_ = -1;
     std::thread watcher_thread_;
 };
 

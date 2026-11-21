@@ -110,6 +110,49 @@ pub extern "C" fn explorer_brave_shield_check(
     }
 }
 
+/// Zero-allocation slice-based network check for Chromium's hot IO thread (no strlen / no String copies).
+/// Returns 1 if the request must be blocked, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn explorer_brave_shield_check_slices(
+    handle: *const BraveShieldHandle,
+    url_ptr: *const u8,
+    url_len: usize,
+    source_ptr: *const u8,
+    source_len: usize,
+    rtype_ptr: *const u8,
+    rtype_len: usize,
+) -> i32 {
+    if handle.is_null() || url_ptr.is_null() || url_len == 0 {
+        return 0;
+    }
+    let url = unsafe {
+        std::str::from_utf8(std::slice::from_raw_parts(url_ptr, url_len)).unwrap_or("")
+    };
+    let source = if source_ptr.is_null() || source_len == 0 {
+        ""
+    } else {
+        unsafe { std::str::from_utf8(std::slice::from_raw_parts(source_ptr, source_len)).unwrap_or("") }
+    };
+    let rtype = if rtype_ptr.is_null() || rtype_len == 0 {
+        "other"
+    } else {
+        unsafe { std::str::from_utf8(std::slice::from_raw_parts(rtype_ptr, rtype_len)).unwrap_or("other") }
+    };
+
+    let Ok(req) = Request::new(url, source, rtype, "GET") else {
+        return 0;
+    };
+    let h = unsafe { &*handle };
+    let Ok(guard) = h.engine.read() else {
+        return 0;
+    };
+    if guard.check_network_request(&req).should_block() {
+        1
+    } else {
+        0
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn explorer_brave_shield_free(handle: *mut BraveShieldHandle) {
     if !handle.is_null() {

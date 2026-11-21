@@ -1,8 +1,11 @@
 #include "explorer/vault/password_vault.hpp"
 
+#include <fcntl.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -75,6 +78,36 @@ bool deserializeEntries(const std::string& plain, std::vector<Credential>& out) 
     return true;
 }
 
+/// Atomically writes bytes to a 0600-born, O_NOFOLLOW temp file and renames over dest (zero TOCTOU race).
+bool writeSecretFileAtomic0600(const fs::path& dest, const void* data, size_t len) {
+    fs::path tmp = dest;
+    tmp += ".tmp";
+    ::unlink(tmp.c_str());
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    const auto* ptr = static_cast<const unsigned char*>(data);
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = ::write(fd, ptr + written, len - written);
+        if (n <= 0) {
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        written += static_cast<size_t>(n);
+    }
+    ::fchmod(fd, 0600);
+    ::fsync(fd);
+    ::close(fd);
+    std::error_code ec;
+    fs::rename(tmp, dest, ec);
+    if (ec) {
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 std::string AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url) {
@@ -90,13 +123,16 @@ std::string AesGcmPasswordVault::normalizeOrigin(const std::string& raw_url) {
         scheme = s.substr(0, scheme_pos);
         host_start = scheme_pos + 3;
     }
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+    // Reject non-web schemes (file://, javascript:, data:, chrome://) to prevent credential confusion.
+    if (scheme != "https" && scheme != "http") return "";
+
     auto path_pos = s.find_first_of("/?#", host_start);
     std::string authority = (path_pos == std::string::npos)
                                 ? s.substr(host_start)
                                 : s.substr(host_start, path_pos - host_start);
-    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
     std::transform(authority.begin(), authority.end(), authority.begin(), ::tolower);
-    if (authority.empty()) return "";
+    if (authority.empty() || authority.find('@') != std::string::npos) return "";
     return scheme + "://" + authority;
 }
 
@@ -105,8 +141,20 @@ AesGcmPasswordVault::AesGcmPasswordVault(fs::path storage_dir)
       enc_path_(storage_dir / "vault.enc") {
     std::error_code ec;
     fs::create_directories(storage_dir, ec);
+    ::chmod(storage_dir.c_str(), 0700);
     if (ensureKey()) {
         loadFromDisk();
+    }
+}
+
+AesGcmPasswordVault::~AesGcmPasswordVault() {
+    if (!key_.empty()) {
+        OPENSSL_cleanse(key_.data(), key_.size());
+    }
+    for (auto& e : entries_) {
+        if (!e.password.empty()) {
+            OPENSSL_cleanse(e.password.data(), e.password.size());
+        }
     }
 }
 
@@ -117,6 +165,7 @@ bool AesGcmPasswordVault::ensureKey() {
         key_.resize(kKeyLen);
         if (in.read(reinterpret_cast<char*>(key_.data()), kKeyLen) &&
             static_cast<size_t>(in.gcount()) == kKeyLen) {
+            ::chmod(key_path_.c_str(), 0600);
             return true;
         }
     }
@@ -127,18 +176,7 @@ bool AesGcmPasswordVault::ensureKey() {
         return false;
     }
 
-    fs::path tmp = key_path_;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) return false;
-        out.write(reinterpret_cast<const char*>(key_.data()), kKeyLen);
-        out.flush();
-    }
-    ::chmod(tmp.c_str(), 0600);
-    fs::rename(tmp, key_path_, ec);
-    ::chmod(key_path_.c_str(), 0600);
-    return !ec;
+    return writeSecretFileAtomic0600(key_path_, key_.data(), kKeyLen);
 }
 
 bool AesGcmPasswordVault::loadFromDisk() {
@@ -177,11 +215,14 @@ bool AesGcmPasswordVault::loadFromDisk() {
     EVP_CIPHER_CTX_free(ctx);
 
     if (!ok) {
+        OPENSSL_cleanse(plain.data(), plain.size());
         entries_.clear();
         return false;
     }
     plain.resize(static_cast<size_t>(out_len1 + out_len2));
-    return deserializeEntries(plain, entries_);
+    bool parsed = deserializeEntries(plain, entries_);
+    OPENSSL_cleanse(plain.data(), plain.size());
+    return parsed;
 }
 
 bool AesGcmPasswordVault::persistToDisk() const {
@@ -189,10 +230,16 @@ bool AesGcmPasswordVault::persistToDisk() const {
 
     std::string plain = serializeEntries(entries_);
     unsigned char iv[kIvLen];
-    if (RAND_bytes(iv, static_cast<int>(kIvLen)) != 1) return false;
+    if (RAND_bytes(iv, static_cast<int>(kIvLen)) != 1) {
+        OPENSSL_cleanse(plain.data(), plain.size());
+        return false;
+    }
 
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
+    if (!ctx) {
+        OPENSSL_cleanse(plain.data(), plain.size());
+        return false;
+    }
 
     std::vector<unsigned char> ct(plain.size() + 16);
     unsigned char tag[kTagLen];
@@ -207,25 +254,18 @@ bool AesGcmPasswordVault::persistToDisk() const {
               EVP_EncryptFinal_ex(ctx, ct.data() + out_len1, &out_len2) == 1 &&
               EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kTagLen), tag) == 1;
     EVP_CIPHER_CTX_free(ctx);
+    OPENSSL_cleanse(plain.data(), plain.size());
     if (!ok) return false;
 
     size_t ct_len = static_cast<size_t>(out_len1 + out_len2);
-    fs::path tmp = enc_path_;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) return false;
-        out.write(kMagic, sizeof(kMagic));
-        out.write(reinterpret_cast<const char*>(iv), kIvLen);
-        out.write(reinterpret_cast<const char*>(tag), kTagLen);
-        out.write(reinterpret_cast<const char*>(ct.data()), static_cast<std::streamsize>(ct_len));
-        out.flush();
-    }
-    ::chmod(tmp.c_str(), 0600);
-    std::error_code ec;
-    fs::rename(tmp, enc_path_, ec);
-    ::chmod(enc_path_.c_str(), 0600);
-    return !ec;
+    std::vector<unsigned char> blob;
+    blob.reserve(sizeof(kMagic) + kIvLen + kTagLen + ct_len);
+    blob.insert(blob.end(), kMagic, kMagic + sizeof(kMagic));
+    blob.insert(blob.end(), iv, iv + kIvLen);
+    blob.insert(blob.end(), tag, tag + kTagLen);
+    blob.insert(blob.end(), ct.begin(), ct.begin() + static_cast<std::ptrdiff_t>(ct_len));
+    OPENSSL_cleanse(iv, sizeof(iv));
+    return writeSecretFileAtomic0600(enc_path_, blob.data(), blob.size());
 }
 
 bool AesGcmPasswordVault::saveOrUpdate(const std::string& origin,

@@ -45,6 +45,7 @@ inline std::string topChromeHtmlDataUrl() {
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: http: data:;">
 <title>Explorer Chrome</title>
 <style>
   :root {
@@ -176,9 +177,10 @@ inline std::string topChromeHtmlDataUrl() {
   .sep { width: 1px; height: 20px; background: rgba(148, 163, 184, 0.22); margin: 0 1px; flex-shrink: 0; }
 
   .progress-bar {
-    position: absolute; left: 0; bottom: 0; height: 2px; width: 0%;
+    position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
     background: linear-gradient(90deg, #38BDF8, #7DD3FC);
-    opacity: 0; transition: width 120ms ease, opacity 180ms ease; pointer-events: none;
+    transform-origin: left center; transform: scaleX(0); will-change: transform, opacity;
+    opacity: 0; transition: transform 110ms linear, opacity 160ms ease; pointer-events: none;
   }
   .progress-bar.active { opacity: 1; }
 
@@ -372,11 +374,11 @@ inline std::string topChromeHtmlDataUrl() {
 
   window.__updateProgress = (loading, progress) => {
     if (loading && progress > 0 && progress < 1.0) {
-      progressBar.style.width = Math.max(8, Math.round(progress * 100)) + '%';
+      progressBar.style.transform = 'scaleX(' + Math.max(0.08, Math.min(1, progress)) + ')';
       progressBar.classList.add('active');
     } else {
       progressBar.classList.remove('active');
-      progressBar.style.width = '0%';
+      progressBar.style.transform = 'scaleX(0)';
     }
   };
 
@@ -459,6 +461,7 @@ inline std::string powerHudHtmlDataUrl() {
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">
 <title>Explorer Control Panel</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }

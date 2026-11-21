@@ -1,18 +1,27 @@
 #include "explorer/shield/content_shield.hpp"
 
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 extern "C" {
 void* explorer_brave_shield_new(const char* rules_utf8);
 size_t explorer_brave_shield_reload(void* handle, const char* rules_utf8);
 size_t explorer_brave_shield_rule_count(const void* handle);
-int explorer_brave_shield_check(const void* handle,
-                                const char* url_utf8,
-                                const char* source_url_utf8,
-                                const char* request_type_utf8);
+int explorer_brave_shield_check_slices(const void* handle,
+                                       const char* url_ptr,
+                                       size_t url_len,
+                                       const char* source_ptr,
+                                       size_t source_len,
+                                       const char* rtype_ptr,
+                                       size_t rtype_len);
 void explorer_brave_shield_free(void* handle);
 }
 
@@ -84,7 +93,7 @@ constexpr const char* kBuiltinRules = R"RULES(
 @@||hotjar.com^$domain=jiohotstar.com|hotstar.com|zee5.com|sonyliv.com|netflix.com|primevideo.com|amazon.in|razorpay.com|paytm.com|stripe.com
 )RULES";
 
-const char* resourceKindToBraveType(ResourceKind kind) {
+std::string_view resourceKindToBraveType(ResourceKind kind) {
     switch (kind) {
         case ResourceKind::MainFrame: return "document";
         case ResourceKind::SubFrame: return "subdocument";
@@ -139,10 +148,12 @@ BlockDecision BraveAdblockShield::evaluate(std::string_view request_url,
         return {false, ""};
     }
 
-    std::string url(request_url);
-    std::string src(initiator_origin);
-    int matched = explorer_brave_shield_check(
-        handle_, url.c_str(), src.c_str(), resourceKindToBraveType(kind));
+    const std::string_view rtype = resourceKindToBraveType(kind);
+    int matched = explorer_brave_shield_check_slices(
+        handle_,
+        request_url.data(), request_url.size(),
+        initiator_origin.data(), initiator_origin.size(),
+        rtype.data(), rtype.size());
     if (matched == 1) {
         blocked_count_.fetch_add(1, std::memory_order_relaxed);
         return {true, "brave-adblock"};
@@ -177,9 +188,26 @@ void BraveAdblockShield::updateFilterListsAsync(std::function<void(bool, size_t)
             fs::path dest = filters_dir_ / s.name;
             fs::path tmp = dest;
             tmp += ".tmp";
-            std::string cmd = "curl -fsSL --max-time 20 '" + std::string(s.url) + "' -o '" +
-                              tmp.string() + "' >/dev/null 2>&1";
-            if (std::system(cmd.c_str()) == 0 && fs::exists(tmp, ec) && fs::file_size(tmp, ec) > 1024) {
+            // Fetch strictly over HTTPS via fork+execvp (ZERO shell, capped at 10 MiB).
+            pid_t pid = ::fork();
+            bool ok = false;
+            if (pid == 0) {
+                int devnull = ::open("/dev/null", O_RDWR);
+                if (devnull >= 0) {
+                    ::dup2(devnull, STDOUT_FILENO);
+                    ::dup2(devnull, STDERR_FILENO);
+                    ::close(devnull);
+                }
+                ::execlp("curl", "curl", "-fsSL", "--proto", "=https", "--tlsv1.2",
+                         "--max-time", "20", "--max-filesize", "10485760",
+                         s.url, "-o", tmp.c_str(), nullptr);
+                ::_exit(127);
+            } else if (pid > 0) {
+                int st = 0;
+                while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+                ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            }
+            if (ok && fs::exists(tmp, ec) && fs::file_size(tmp, ec) > 1024) {
                 fs::rename(tmp, dest, ec);
                 any_ok = true;
             } else {

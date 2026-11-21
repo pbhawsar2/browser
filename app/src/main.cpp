@@ -109,12 +109,19 @@ public:
             retval = CefV8Value::CreateBool(true);
             return true;
         }
-        if (name == "__expLoginCapture" && arguments.size() == 3 &&
-            arguments[0]->IsString() && arguments[1]->IsString() && arguments[2]->IsString()) {
+        if (name == "__expLoginCapture" && arguments.size() >= 2 &&
+            arguments[0]->IsString() && arguments[1]->IsString()) {
+            // Security: NEVER trust origin from untrusted page JS; read browser-verified frame URL!
+            std::string frame_url = browser_->GetMainFrame()->GetURL().ToString();
+            if (frame_url.rfind("https://", 0) != 0 &&
+                frame_url.rfind("http://localhost", 0) != 0 &&
+                frame_url.rfind("http://127.0.0.1", 0) != 0) {
+                return false;
+            }
             auto msg = CefProcessMessage::Create("explorer.login-capture");
-            msg->GetArgumentList()->SetString(0, arguments[0]->GetStringValue());
-            msg->GetArgumentList()->SetString(1, arguments[1]->GetStringValue());
-            msg->GetArgumentList()->SetString(2, arguments[2]->GetStringValue());
+            msg->GetArgumentList()->SetString(0, frame_url);
+            msg->GetArgumentList()->SetString(1, arguments[0]->GetStringValue());
+            msg->GetArgumentList()->SetString(2, arguments[1]->GetStringValue());
             browser_->GetMainFrame()->SendProcessMessage(PID_BROWSER, msg);
             retval = CefV8Value::CreateBool(true);
             return true;
@@ -213,12 +220,12 @@ public:
         if (frame->IsMain()) {
             CefRefPtr<CefV8Value> global = context->GetGlobal();
             CefRefPtr<CefV8Handler> cb = new ContentPageBridgeHandler(browser);
+            const auto attr = static_cast<CefV8Value::PropertyAttribute>(
+                V8_PROPERTY_ATTRIBUTE_DONTENUM | V8_PROPERTY_ATTRIBUTE_READONLY | V8_PROPERTY_ATTRIBUTE_DONTDELETE);
             global->SetValue("__expTopbarReveal",
-                             CefV8Value::CreateFunction("__expTopbarReveal", cb),
-                             V8_PROPERTY_ATTRIBUTE_DONTENUM);
+                             CefV8Value::CreateFunction("__expTopbarReveal", cb), attr);
             global->SetValue("__expLoginCapture",
-                             CefV8Value::CreateFunction("__expLoginCapture", cb),
-                             V8_PROPERTY_ATTRIBUTE_DONTENUM);
+                             CefV8Value::CreateFunction("__expLoginCapture", cb), attr);
 
             static const char* kPageUxHooksJs = R"JS((() => {
                 if (window.__explorerUxWired) return;
@@ -259,7 +266,7 @@ public:
                     if (!pw || !pw.value) return;
                     const usr = form.querySelector('input[type="email"], input[type="text"], input[autocomplete="username"]');
                     if (usr && usr.value && location.origin && location.origin.startsWith('http')) {
-                        try { __expLoginCapture(location.origin, usr.value.trim(), pw.value); } catch {}
+                        try { __expLoginCapture(usr.value.trim(), pw.value); } catch {}
                     }
                 }, true);
             })();)JS";
@@ -374,9 +381,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Installed WebApps get their own isolated cache/profile subdir under profile_dir/apps/<app_id>
-    // so they launch cleanly alongside the main browser without singleton lock collision!
+    // Sanitize --app-id strictly to prevent path traversal (e.g. --app-id=../../evil).
     if (!launch_cfg.app_mode_url.empty()) {
-        std::string sub = launch_cfg.app_id.empty() ? "default-app" : launch_cfg.app_id;
+        std::string sub;
+        for (unsigned char c : launch_cfg.app_id) {
+            if (std::isalnum(c) || c == '-' || c == '_') sub.push_back(static_cast<char>(c));
+            if (sub.size() >= 80) break;
+        }
+        if (sub.empty()) sub = "default-app";
+        launch_cfg.app_id = sub;
         launch_cfg.profile_dir = launch_cfg.profile_dir / "webapps" / sub;
     }
 
@@ -414,7 +427,8 @@ int main(int argc, char* argv[]) {
     std::filesystem::create_directories(launch_cfg.profile_dir, ec);
 
     CefSettings settings;
-    settings.no_sandbox = true;
+    // Enable Chromium's full multi-process user-namespace + seccomp-bpf sandbox by default!
+    settings.no_sandbox = (std::getenv("EXPLORER_NO_SANDBOX") != nullptr);
     settings.remote_debugging_port = remote_debug_port;
     settings.log_severity = LOGSEVERITY_WARNING;
     CefString(&settings.root_cache_path).FromString(launch_cfg.profile_dir.string());

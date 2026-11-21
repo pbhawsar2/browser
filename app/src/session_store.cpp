@@ -1,5 +1,7 @@
 #include "explorer/app/session_store.hpp"
 
+#include <sys/stat.h>
+
 #include <fstream>
 #include <sstream>
 
@@ -58,7 +60,7 @@ SessionData SessionStore::load() const {
                     u.push_back(line[i]);
                 }
             }
-            if (!u.empty() && u.rfind("data:", 0) != 0) {
+            if (u.rfind("https://", 0) == 0 || u.rfind("http://", 0) == 0) {
                 data.urls.push_back(std::move(u));
             }
         }
@@ -89,7 +91,9 @@ void SessionStore::saveAtomic(const SessionData& data) const {
         out << "  ]\n}\n";
         out.flush();
     }
+    ::chmod(tmp.c_str(), 0600);
     fs::rename(tmp, file_path_, ec);
+    ::chmod(file_path_.c_str(), 0600);
 }
 
 }  // namespace explorer::app

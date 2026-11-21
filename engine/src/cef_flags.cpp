@@ -42,9 +42,11 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
     std::vector<std::string> enable_features = {
         "AcceleratedVideoDecodeLinuxGL",
         "AcceleratedVideoDecodeLinuxZeroCopyGL",
+        "OverlayUnsupportedVideoSurfaces",
         "VaapiIgnoreDriverChecks",
         "CanvasOopRasterization",
         "BackForwardCache",
+        "ParallelDownloading",
         "WaylandPerSurfaceScale",
         "WaylandUiScale",
         "WebAssemblyTiering",
@@ -58,6 +60,9 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         cmd->AppendSwitchWithValue("ozone-platform-hint", "auto");
         cmd->AppendSwitchWithValue("use-gl", "angle");
         cmd->AppendSwitchWithValue("use-angle", "vulkan");
+        if (!hw.allow_dgpu && !hw.igpu_render_node.empty()) {
+            cmd->AppendSwitchWithValue("render-node-override", hw.igpu_render_node);
+        }
         cmd->AppendSwitch("enable-gpu-rasterization");
         cmd->AppendSwitch("enable-zero-copy");
         cmd->AppendSwitch("ignore-gpu-blocklist");
@@ -72,6 +77,9 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         cmd->AppendSwitchWithValue("ozone-platform-hint", "auto");
         cmd->AppendSwitchWithValue("use-gl", "angle");
         cmd->AppendSwitchWithValue("use-angle", "gl");
+        if (!hw.allow_dgpu && !hw.igpu_render_node.empty()) {
+            cmd->AppendSwitchWithValue("render-node-override", hw.igpu_render_node);
+        }
         cmd->AppendSwitch("disable-vulkan");  // Avoid Wayland Ozone Vulkan init warning/overhead
         cmd->AppendSwitch("enable-gpu-rasterization");
         cmd->AppendSwitch("enable-zero-copy");
@@ -79,13 +87,15 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         cmd->AppendSwitch("enable-smooth-scrolling");
     }
 
-    // 2. Strip Chrome background bloat / telemetry / sync / updater / optimization guide.
+    // 2. Strip Chrome background bloat / telemetry / sync / updater / ad-tracking APIs.
     cmd->AppendSwitch("disable-background-networking");
     cmd->AppendSwitch("disable-component-update");
     cmd->AppendSwitch("disable-sync");
     cmd->AppendSwitch("disable-domain-reliability");
     cmd->AppendSwitch("metrics-recording-only");
     cmd->AppendSwitch("no-pings");
+    // Prevent WebRTC from leaking local private LAN IPs while keeping video calls working.
+    cmd->AppendSwitchWithValue("webrtc-ip-handling-policy", "default_public_interface_only");
 
     // 3. Hardware VA-API VCN decode + Wayland fractional scaling + BFCache + HTTP/3 + V8/WASM tiering.
     cmd->AppendSwitch("enable-quic");
@@ -99,7 +109,7 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         enable_features.push_back("IntensiveWakeUpThrottling");
     }
 
-    // 4. Disable bloat + software AV1 when iGPU has no VCN AV1 decoder (Cezanne).
+    // 4. Disable bloat, Google ad-tracking Privacy Sandbox APIs, and software AV1 on Cezanne.
     std::vector<std::string> disable_features = {
         "OptimizationHints",
         "OptimizationTargetPrediction",
@@ -107,6 +117,10 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         "Translate",
         "AutofillServerCommunication",
         "InterestFeedContentSuggestions",
+        "PrivacySandboxAdsAPIsOverride",
+        "BrowsingTopics",
+        "Fledge",
+        "AttributionReportingCrossAppWeb",
     };
     if (media_policy.shouldDisableSoftwareAv1()) {
         disable_features.push_back("AV1Decoder");

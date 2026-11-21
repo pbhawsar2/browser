@@ -326,22 +326,11 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
 
     window_->AddChildView(root_panel_);
 
-    if (!is_app_mode) {
-        CefBrowserSettings hud_settings;
-        hud_settings.background_color = CefColorSetARGB(255, 14, 21, 36);
-        hud_client_ = new ChromeUiClient(this, true);
-        hud_view_ = CefBrowserView::CreateBrowserView(
-            hud_client_, powerHudHtmlDataUrl(), hud_settings,
-            makeTrustedChromeExtraInfo(), nullptr, new HudOverlayViewDelegate());
-        hud_overlay_ = window_->AddOverlayView(hud_view_, CEF_DOCKING_MODE_TOP_RIGHT, true);
-        if (hud_overlay_) {
-            hud_overlay_->SetInsets(CefInsets(48, 0, 0, 10));
-            hud_overlay_->SetVisible(false);
-        }
-    }
+    // Control Panel HUD (hud_view_ / hud_overlay_) is created LAZILY on first open:
+    // saves 1 Chromium renderer process + ~40-50 MiB RAM + ~40ms cold startup time!
 
     if (services_.telemetry) {
-        last_snap_ = services_.telemetry->sample();
+        last_snap_ = services_.telemetry->sampleLite();
     }
 
     if (is_app_mode) {
@@ -383,7 +372,10 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
         });
     }
 
-    CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::onTelemetryTick, base::Unretained(this)), 2000);
+    // Skip periodic telemetry polling in pure chromeless --app= mode (zero bezel/HUD).
+    if (!is_app_mode) {
+        CefPostDelayedTask(TID_UI, base::BindOnce(&BrowserWindow::onTelemetryTick, base::Unretained(this)), 2000);
+    }
 }
 
 void BrowserWindow::handleWindowDestroyed() {
@@ -603,21 +595,42 @@ void BrowserWindow::updateChromeLayout(bool force) {
     if (window_) window_->Layout();
 }
 
+void BrowserWindow::ensureHudCreated() {
+    CEF_REQUIRE_UI_THREAD();
+    if (hud_overlay_ || !window_ || !cfg_.app_mode_url.empty()) return;
+
+    CefBrowserSettings hud_settings;
+    hud_settings.background_color = CefColorSetARGB(255, 14, 21, 36);
+    hud_client_ = new ChromeUiClient(this, true);
+    hud_view_ = CefBrowserView::CreateBrowserView(
+        hud_client_, powerHudHtmlDataUrl(), hud_settings,
+        makeTrustedChromeExtraInfo(), nullptr, new HudOverlayViewDelegate());
+    hud_overlay_ = window_->AddOverlayView(hud_view_, CEF_DOCKING_MODE_TOP_RIGHT, true);
+    if (hud_overlay_) {
+        hud_overlay_->SetInsets(CefInsets(48, 0, 0, 10));
+        hud_overlay_->SetVisible(false);
+    }
+}
+
 void BrowserWindow::setHudVisible(bool visible, const std::string& tab) {
-    if (!hud_overlay_) return;
     if (visible) {
+        ensureHudCreated();
+        if (!hud_overlay_) return;
         scroll_hidden_ = false;
         updateChromeLayout();
     }
+    if (!hud_overlay_) return;
     bool changed = (hud_visible_ != visible);
     hud_visible_ = visible;
     hud_overlay_->SetVisible(visible);
     if (visible) {
+        if (!tab.empty()) pending_hud_tab_ = tab;
         if (services_.telemetry) last_snap_ = services_.telemetry->sample();
         pushHudState(last_snap_);
         if (!tab.empty() && hud_ready_ && hud_view_ && hud_view_->GetBrowser()) {
             hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
                 "window.__selectTab('" + jsonEscape(tab) + "');", "explorer://hud", 0);
+            pending_hud_tab_.clear();
         }
         if (hud_view_) hud_view_->RequestFocus();
     } else if (changed) {
@@ -712,10 +725,17 @@ void BrowserWindow::pushChromeTelemetry() {
     if (!chrome_ready_ || !chrome_view_ || !chrome_view_->GetBrowser()) return;
     bool adblock_on = services_.shield ? services_.shield->isEnabled() : false;
     uint64_t blocked = services_.shield ? services_.shield->blockedCount() : 0;
+    std::string pill = power_policy_.formatPillText(last_snap_);
+    bool batt = power_policy_.isBatteryMode();
+
+    std::string sig = (batt ? "1|" : "0|") + pill + (adblock_on ? "|1|" : "|0|") + std::to_string(blocked);
+    if (sig == last_telemetry_sig_) return;  // Zero idle JS IPC when nothing changed!
+    last_telemetry_sig_ = std::move(sig);
+
     std::ostringstream js;
     js << "window.__updateTelemetry("
-       << (power_policy_.isBatteryMode() ? "true" : "false") << ",\""
-       << jsonEscape(power_policy_.formatPillText(last_snap_)) << "\","
+       << (batt ? "true" : "false") << ",\""
+       << jsonEscape(pill) << "\","
        << (adblock_on ? "true" : "false") << ","
        << blocked << ");";
     chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js.str(), "explorer://chrome-telemetry", 0);
@@ -930,10 +950,22 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             pushChromeState();
             setStatusBanner("Deleted saved login for " + u);
         }
-    } else if (cmd == "vault_fill" && services_.vault && b) {
+    } else if (cmd == "vault_fill" && services_.vault && b && b->GetMainFrame()) {
         std::string o = extractJsonField(arg, "origin");
         std::string u = extractJsonField(arg, "username");
-        for (const auto& c : services_.vault->findForOrigin(o)) {
+        // Security: verify the live active frame's origin EXACTLY matches the credential's origin
+        // and is HTTPS (or localhost/127.0.0.1) to prevent cross-origin credential exfiltration!
+        std::string live_url = b->GetMainFrame()->GetURL().ToString();
+        std::string live_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(live_url);
+        std::string req_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(o);
+        bool secure_origin = (live_origin.rfind("https://", 0) == 0 ||
+                              live_origin.rfind("http://localhost", 0) == 0 ||
+                              live_origin.rfind("http://127.0.0.1", 0) == 0);
+        if (!secure_origin || live_origin.empty() || live_origin != req_origin) {
+            setStatusBanner("Blocked autofill: origin mismatch or insecure page");
+            return;
+        }
+        for (const auto& c : services_.vault->findForOrigin(live_origin)) {
             if (c.username == u) {
                 std::string fill_js =
                     "(() => {"
@@ -956,7 +988,13 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             }
         } catch (...) {}
     } else if (cmd == "dl_open") {
-        spawnDetachedXdgOpen(arg);
+        // Security: only open paths belonging to verified completed downloads from this session.
+        for (const auto& d : downloads_) {
+            if (d.is_complete && !d.full_path.empty() && d.full_path == arg) {
+                spawnDetachedXdgOpen(d.full_path);
+                break;
+            }
+        }
     } else if (cmd == "dl_open_dir") {
         const char* dl = std::getenv("XDG_DOWNLOAD_DIR");
         const char* home = std::getenv("HOME");
@@ -1054,7 +1092,13 @@ void BrowserWindow::onChromeReady(bool is_hud) {
     CEF_REQUIRE_UI_THREAD();
     if (is_hud) {
         hud_ready_ = true;
+        if (services_.telemetry) last_snap_ = services_.telemetry->sample();
         pushHudState(last_snap_);
+        if (!pending_hud_tab_.empty() && hud_view_ && hud_view_->GetBrowser()) {
+            hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
+                "window.__selectTab('" + jsonEscape(pending_hud_tab_) + "');", "explorer://hud", 0);
+            pending_hud_tab_.clear();
+        }
     } else {
         chrome_ready_ = true;
         pushChromeState();
@@ -1086,6 +1130,7 @@ void BrowserWindow::onTabCreated(uint64_t /*tab_id*/) {
 void BrowserWindow::onTabAddressChanged(uint64_t tab_id, const std::string& url) {
     CEF_REQUIRE_UI_THREAD();
     if (auto* t = findTab(tab_id)) {
+        if (t->url == url) return;
         t->url = url;
         if (tab_id == active_tab_id_) {
             scroll_hidden_ = false;
@@ -1099,7 +1144,9 @@ void BrowserWindow::onTabAddressChanged(uint64_t tab_id, const std::string& url)
 void BrowserWindow::onTabTitleChanged(uint64_t tab_id, const std::string& title) {
     CEF_REQUIRE_UI_THREAD();
     if (auto* t = findTab(tab_id)) {
-        t->title = title.empty() ? "New Tab" : title;
+        std::string clean = title.empty() ? "New Tab" : title;
+        if (t->title == clean) return;
+        t->title = std::move(clean);
         if (!cfg_.app_mode_url.empty() && window_) {
             window_->SetTitle(t->title);
         } else {
@@ -1111,6 +1158,7 @@ void BrowserWindow::onTabTitleChanged(uint64_t tab_id, const std::string& title)
 void BrowserWindow::onTabFaviconChanged(uint64_t tab_id, const std::string& favicon_url) {
     CEF_REQUIRE_UI_THREAD();
     if (auto* t = findTab(tab_id)) {
+        if (t->favicon == favicon_url) return;
         t->favicon = favicon_url;
         if (tabs_.size() > 1) pushChromeState();
     }
@@ -1148,8 +1196,11 @@ void BrowserWindow::onTabFullscreenChanged(uint64_t /*tab_id*/, bool fullscreen)
 
 void BrowserWindow::onTabPopupRequested(const std::string& url) {
     CEF_REQUIRE_UI_THREAD();
+    // Security: block web-initiated popups to privileged/dangerous schemes (file://, javascript:, chrome://, data:).
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) {
+        return;
+    }
     if (!cfg_.app_mode_url.empty()) {
-        // In standalone WebApp mode, navigate in-place or open inside Explorer browser cleanly.
         if (auto* t = activeTabEntry(); t && t->view && t->view->GetBrowser()) {
             t->view->GetBrowser()->GetMainFrame()->LoadURL(url);
         }
@@ -1412,7 +1463,9 @@ void BrowserWindow::onTelemetryTick() {
     if (!alive_.load()) return;
 
     if (services_.telemetry) {
-        last_snap_ = services_.telemetry->sample();
+        // Lightweight 2-file sysfs read when HUD is closed; full sensor sweep only when HUD is open!
+        last_snap_ = hud_visible_ ? services_.telemetry->sample()
+                                  : services_.telemetry->sampleLite();
         if (last_snap_.on_battery != power_policy_.isOnBatteryRaw()) {
             power_policy_.setPowerSource(last_snap_.on_battery);
             syncSystemPower();

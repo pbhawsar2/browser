@@ -128,6 +128,7 @@ private:
     void pushChromeProgress(bool loading, double progress);
     void pushHudState(const explorer::hal::TelemetrySnapshot& snap);
     void updateChromeLayout(bool force = false);
+    void ensureHudCreated();
     void setHudVisible(bool visible, const std::string& tab = "");
     void setFindBarVisible(bool visible);
     void setStatusBanner(const std::string& msg);
@@ -163,6 +164,8 @@ private:
     std::vector<explorer::engine::DownloadRecord> downloads_;
     std::optional<explorer::vault::Credential> pending_login_;
     std::string status_msg_;
+    std::string pending_hud_tab_;
+    std::string last_telemetry_sig_;
 
     uint64_t active_tab_id_ = 0;
     uint64_t next_tab_id_ = 1;

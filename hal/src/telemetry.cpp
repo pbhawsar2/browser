@@ -137,6 +137,31 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
     return out;
 }
 
+TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
+    TelemetrySnapshot out;
+    std::optional<bool> ac_on;
+    if (ac_online_) {
+        if (auto v = readU64(*ac_online_)) ac_on = (*v == 1);
+    }
+    bool discharging = false;
+    if (batt_status_) {
+        auto st = readTrimmed(*batt_status_).value_or("");
+        std::transform(st.begin(), st.end(), st.begin(), ::tolower);
+        discharging = (st == "discharging");
+    }
+    out.on_battery = discharging || (ac_on.has_value() && !*ac_on);
+    if (out.on_battery) {
+        out.batt_watts = sampleBattWatts();
+    }
+    for (const auto& f : fan_inputs_) {
+        if (auto rpm = readU64(f)) {
+            uint32_t r = static_cast<uint32_t>(*rpm);
+            out.fan_rpm = out.fan_rpm.has_value() ? std::max(*out.fan_rpm, r) : r;
+        }
+    }
+    return out;
+}
+
 std::optional<float> LinuxTelemetryMonitor::sampleRaplWatts() {
     if (!rapl_energy_uj_) return std::nullopt;
     auto energy = readU64(*rapl_energy_uj_);
