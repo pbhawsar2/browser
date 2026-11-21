@@ -19,6 +19,7 @@
 #include "include/cef_app.h"
 #include "include/cef_browser_process_handler.h"
 #include "include/cef_render_process_handler.h"
+#include "include/cef_request_context.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
 
@@ -161,6 +162,10 @@ public:
 
     void OnContextInitialized() override {
         CEF_REQUIRE_UI_THREAD();
+        // Keep web applications/pages independent of the Linux OS dark theme (default light prefers-color-scheme).
+        if (auto ctx = CefRequestContext::GetGlobalContext()) {
+            ctx->SetChromeColorScheme(CEF_COLOR_VARIANT_LIGHT, 0);
+        }
         window_ = std::make_unique<explorer::app::BrowserWindow>(launch_cfg_, services_);
         window_->show();
     }
@@ -189,17 +194,30 @@ public:
         if (extra_info && extra_info->HasKey("is_explorer_chrome") &&
             extra_info->GetBool("is_explorer_chrome")) {
             trusted_chrome_ids_.insert(browser->GetIdentifier());
-            return;
-        }
-        if (browser->GetMainFrame()) {
-            auto msg = CefProcessMessage::Create("explorer.renderer-pid");
-            msg->GetArgumentList()->SetInt(0, static_cast<int>(::getpid()));
-            browser->GetMainFrame()->SendProcessMessage(PID_BROWSER, msg);
         }
     }
 
     void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override {
         if (browser) trusted_chrome_ids_.erase(browser->GetIdentifier());
+    }
+
+    bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                  CefRefPtr<CefFrame> /*frame*/,
+                                  CefProcessId source_process,
+                                  CefRefPtr<CefProcessMessage> message) override {
+        if (source_process != PID_BROWSER || !message) return false;
+        if (message->GetName() == "explorer.autohide-config") {
+            auto args = message->GetArgumentList();
+            if (args && args->GetSize() >= 1 && browser && browser->GetMainFrame()) {
+                bool on = args->GetBool(0);
+                browser->GetMainFrame()->ExecuteJavaScript(
+                    on ? "if(typeof window.__setExplorerAutohide==='function')window.__setExplorerAutohide(true);"
+                       : "if(typeof window.__setExplorerAutohide==='function')window.__setExplorerAutohide(false);",
+                    "explorer://ux-config", 0);
+                return true;
+            }
+        }
+        return false;
     }
 
     void OnContextCreated(CefRefPtr<CefBrowser> browser,
@@ -222,12 +240,17 @@ public:
         }
 
         // 2. Untrusted Web Content: NEVER expose explorerHost!
-        //    Register write-only passive hooks for scroll auto-hide, media playback & login-form save prompt.
+        //    Register write-only passive hooks captured privately inside our IIFE closure and immediately
+        //    deleted from window so untrusted webpage scripts cannot invoke or spoof them.
         if (frame->IsMain()) {
+            if (frame->IsValid()) {
+                auto pid_msg = CefProcessMessage::Create("explorer.renderer-pid");
+                pid_msg->GetArgumentList()->SetInt(0, static_cast<int>(::getpid()));
+                frame->SendProcessMessage(PID_BROWSER, pid_msg);
+            }
             CefRefPtr<CefV8Value> global = context->GetGlobal();
             CefRefPtr<CefV8Handler> cb = new ContentPageBridgeHandler(browser);
-            const auto attr = static_cast<CefV8Value::PropertyAttribute>(
-                V8_PROPERTY_ATTRIBUTE_DONTENUM | V8_PROPERTY_ATTRIBUTE_READONLY | V8_PROPERTY_ATTRIBUTE_DONTDELETE);
+            const auto attr = static_cast<CefV8Value::PropertyAttribute>(V8_PROPERTY_ATTRIBUTE_DONTENUM);
             global->SetValue("__expTopbarReveal",
                              CefV8Value::CreateFunction("__expTopbarReveal", cb), attr);
             global->SetValue("__expMediaState",
@@ -236,48 +259,15 @@ public:
                              CefV8Value::CreateFunction("__expLoginCapture", cb), attr);
 
             static const char* kPageUxHooksJs = R"JS((() => {
+                const _topbarReveal = typeof window.__expTopbarReveal === 'function' ? window.__expTopbarReveal : null;
+                const _mediaState = typeof window.__expMediaState === 'function' ? window.__expMediaState : null;
+                const _loginCapture = typeof window.__expLoginCapture === 'function' ? window.__expLoginCapture : null;
+                try { delete window.__expTopbarReveal; } catch {}
+                try { delete window.__expMediaState; } catch {}
+                try { delete window.__expLoginCapture; } catch {}
                 if (window.__explorerUxWired) return;
                 window.__explorerUxWired = true;
-                const kCssText =
-                    '::-webkit-scrollbar{width:8px!important;height:8px!important;background:#080C14!important;}' +
-                    '::-webkit-scrollbar-track{background:#080C14!important;border-left:1px solid rgba(148,163,184,0.12)!important;}' +
-                    '::-webkit-scrollbar-thumb{background:rgba(56,189,248,0.40)!important;border-radius:999px!important;border:2px solid #080C14!important;}' +
-                    '::-webkit-scrollbar-thumb:hover{background:rgba(56,189,248,0.75)!important;}' +
-                    '::-webkit-scrollbar-thumb:active{background:#38BDF8!important;}' +
-                    '::-webkit-scrollbar-button,::-webkit-scrollbar-corner{display:none!important;width:0!important;height:0!important;}' +
-                    'html,body{-webkit-font-smoothing:antialiased!important;-moz-osx-font-smoothing:grayscale!important;text-rendering:optimizeLegibility!important;}';
-                let adoptedApplied = false;
-                const injectThemeCss = () => {
-                    try {
-                        if (document.documentElement) {
-                            document.documentElement.style.setProperty('-webkit-font-smoothing', 'antialiased');
-                            document.documentElement.style.setProperty('text-rendering', 'optimizeLegibility');
-                        }
-                        if (!adoptedApplied && document.adoptedStyleSheets && typeof CSSStyleSheet !== 'undefined') {
-                            const sheet = new CSSStyleSheet();
-                            sheet.replaceSync(kCssText);
-                            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
-                            adoptedApplied = true;
-                        }
-                        if (!document.getElementById('__explorer_theme_css')) {
-                            const root = document.head || document.documentElement;
-                            if (root) {
-                                const st = document.createElement('style');
-                                st.id = '__explorer_theme_css';
-                                const nEl = document.querySelector('style[nonce],script[nonce],link[nonce]');
-                                if (nEl && (nEl.nonce || nEl.getAttribute('nonce'))) {
-                                    st.setAttribute('nonce', nEl.nonce || nEl.getAttribute('nonce'));
-                                }
-                                st.textContent = kCssText;
-                                root.appendChild(st);
-                            }
-                        }
-                    } catch {}
-                };
-                injectThemeCss();
-                document.addEventListener('readystatechange', injectThemeCss);
-                document.addEventListener('DOMContentLoaded', injectThemeCss, { once: true });
-                window.addEventListener('load', injectThemeCss, { once: true });
+                let autohideActive = false;
                 let lastY = window.scrollY || 0;
                 let hidden = false;
                 let ticking = false;
@@ -292,10 +282,9 @@ public:
                     if (!reveal && (now - lastToggleTs) < 350) return;
                     lastToggleTs = now;
                     hidden = !reveal;
-                    try { if (typeof __expTopbarReveal === 'function') __expTopbarReveal(!!reveal); } catch {}
+                    try { if (_topbarReveal) _topbarReveal(!!reveal); } catch {}
                 };
-                window.addEventListener('scroll', () => {
-                    if (!document.getElementById('__explorer_theme_css')) injectThemeCss();
+                const onScroll = () => {
                     if (ticking) return;
                     ticking = true;
                     requestAnimationFrame(() => {
@@ -306,12 +295,32 @@ public:
                         else if (y > 110 && dy > 28) setBar(false);
                         lastY = y;
                     });
-                }, { passive: true });
-                window.addEventListener('mousemove', (e) => {
+                };
+                const onMouseMove = (e) => {
                     if (hidden && e.clientY <= 8) setBar(true);
-                }, { passive: true });
+                };
+                Object.defineProperty(window, '__setExplorerAutohide', {
+                    value: (enabled) => {
+                        const want = !!enabled;
+                        if (want === autohideActive) return;
+                        autohideActive = want;
+                        if (want) {
+                            lastY = window.scrollY || 0;
+                            window.addEventListener('scroll', onScroll, { passive: true });
+                            window.addEventListener('mousemove', onMouseMove, { passive: true });
+                        } else {
+                            window.removeEventListener('scroll', onScroll);
+                            window.removeEventListener('mousemove', onMouseMove);
+                            hidden = false;
+                        }
+                    },
+                    enumerable: false,
+                    configurable: false,
+                    writable: false
+                });
                 let lastMediaPlaying = false;
-                const syncMedia = () => {
+                const syncMedia = (ev) => {
+                    if (ev && ev.target && !(ev.target instanceof HTMLMediaElement)) return;
                     const els = document.querySelectorAll('video, audio');
                     let playing = false;
                     for (let i = 0; i < els.length; ++i) {
@@ -322,7 +331,7 @@ public:
                     }
                     if (playing !== lastMediaPlaying) {
                         lastMediaPlaying = playing;
-                        try { if (typeof __expMediaState === 'function') __expMediaState(playing); } catch {}
+                        try { if (_mediaState) _mediaState(playing); } catch {}
                     }
                 };
                 document.addEventListener('play', syncMedia, true);
@@ -337,7 +346,7 @@ public:
                     if (!pw || !pw.value) return;
                     const usr = form.querySelector('input[type="email"], input[type="text"], input[autocomplete="username"]');
                     if (usr && usr.value && location.origin && location.origin.startsWith('http')) {
-                        try { __expLoginCapture(usr.value.trim(), pw.value); } catch {}
+                        try { if (_loginCapture) _loginCapture(usr.value.trim(), pw.value); } catch {}
                     }
                 }, true);
             })();)JS";
@@ -410,7 +419,7 @@ int main(int argc, char* argv[]) {
         hw.on_battery = power_gov->isOnBatteryBoot();
         hw.va_caps = va_prober.probe(node);
         bool turbo = !hw.on_battery || (std::getenv("EXPLORER_TURBO") != nullptr);
-        power_gov->applyTimerSlackNs(turbo ? 1UL : 2'000'000UL);
+        power_gov->applyTimerSlackNs(turbo ? 50'000UL : 2'000'000UL);
         ::setenv("EXPLORER_ON_BATTERY", hw.on_battery ? "1" : "0", 1);
         ::setenv("EXPLORER_TURBO_SLACK", turbo ? "1" : "0", 1);
         ::setenv("EXPLORER_VA_AV1", hw.va_caps.av1 ? "1" : "0", 1);
@@ -421,7 +430,7 @@ int main(int argc, char* argv[]) {
         hw.va_caps.av1 = (va_av1 != nullptr && va_av1[0] == '1');
         const char* ts = std::getenv("EXPLORER_TURBO_SLACK");
         bool turbo = (ts != nullptr && ts[0] == '1');
-        power_gov->applyTimerSlackNs(turbo ? 1UL : 2'000'000UL);
+        power_gov->applyTimerSlackNs(turbo ? 50'000UL : 2'000'000UL);
     }
 
     explorer::policy::MediaCodecPolicy media_policy(hw.va_caps, hw.allow_dgpu);
@@ -518,6 +527,7 @@ int main(int argc, char* argv[]) {
     settings.remote_debugging_port = remote_debug_port;
     settings.log_severity = LOGSEVERITY_WARNING;
     CefString(&settings.root_cache_path).FromString(launch_cfg.profile_dir.string());
+    CefString(&settings.cache_path).FromString(launch_cfg.profile_dir.string());
 
     if (!CefInitialize(main_args, settings, app, nullptr)) {
         std::cerr << "Explorer: CefInitialize failed\n";

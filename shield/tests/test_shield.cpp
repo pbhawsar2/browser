@@ -1,6 +1,8 @@
 #include "explorer/shield/content_shield.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
 #define CHECK(cond)                                                                      \
@@ -56,6 +58,48 @@ int main() {
 
     shield.setEnabled(true);
     CHECK(shield.blockedCount() == 4);
+
+    // 6. Binary .dat engine cache roundtrip + fingerprint invalidation on .txt update.
+    {
+        namespace fs = std::filesystem;
+        fs::path tmp_dir = fs::temp_directory_path() / "explorer_test_shield_cache";
+        std::error_code ec;
+        fs::remove_all(tmp_dir, ec);
+        fs::create_directories(tmp_dir, ec);
+        {
+            std::ofstream f(tmp_dir / "custom.txt");
+            f << "||custom-tracker-xyz.example^\n";
+        }
+        {
+            BraveAdblockShield s1(tmp_dir, true);
+            CHECK(fs::exists(tmp_dir / "engine.dat"));
+            CHECK(fs::exists(tmp_dir / "engine.meta"));
+            CHECK(s1.evaluate("https://custom-tracker-xyz.example/p.js",
+                              "https://news.example/", ResourceKind::Script)
+                      .block);
+        }
+        // Reload directly from binary engine.dat cache
+        {
+            BraveAdblockShield s2(tmp_dir, true);
+            CHECK(s2.ruleCount() >= 46);
+            CHECK(s2.evaluate("https://custom-tracker-xyz.example/p.js",
+                              "https://news.example/", ResourceKind::Script)
+                      .block);
+        }
+        // Modify .txt -> fingerprint changes -> cache rebuilds with new rule
+        {
+            std::ofstream f(tmp_dir / "custom.txt", std::ios::app);
+            f << "||second-tracker-abc.example^\n";
+        }
+        {
+            BraveAdblockShield s3(tmp_dir, true);
+            CHECK(s3.evaluate("https://second-tracker-abc.example/a.js",
+                              "https://news.example/", ResourceKind::Script)
+                      .block);
+        }
+        fs::remove_all(tmp_dir, ec);
+    }
+
     std::cout << "[test_shield] ALL PASSED (Brave adblock-rust rules=" << shield.ruleCount()
               << " blocked=" << shield.blockedCount() << ")\n";
     return 0;

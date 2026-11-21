@@ -32,7 +32,10 @@ public:
     std::vector<PidTransition> releaseAll();
 
 private:
-    std::unordered_map<uint64_t, TabPidInfo> tabs_;
+    void pruneOrphanedPid(pid_t pid);
+
+    std::unordered_map<uint64_t, pid_t> tab_pids_;
+    std::unordered_set<pid_t> throttled_pids_;
 };
 
 }  // namespace explorer::policy

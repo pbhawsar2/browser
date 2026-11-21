@@ -15,6 +15,12 @@ struct Credential {
     std::string password;
 };
 
+/// Metadata-only credential projection (zero plaintext password copies in memory).
+struct CredentialMeta {
+    std::string origin;
+    std::string username;
+};
+
 class IPasswordVault {
 public:
     virtual ~IPasswordVault() = default;
@@ -23,6 +29,8 @@ public:
                               const std::string& password) = 0;
     virtual bool remove(const std::string& origin, const std::string& username) = 0;
     virtual std::vector<Credential> findForOrigin(const std::string& origin) const = 0;
+    virtual size_t countForOrigin(const std::string& origin) const = 0;
+    virtual std::vector<CredentialMeta> listMetadata() const = 0;
     virtual std::vector<Credential> listAll() const = 0;
 };
 
@@ -36,6 +44,8 @@ public:
                       const std::string& password) override;
     bool remove(const std::string& origin, const std::string& username) override;
     std::vector<Credential> findForOrigin(const std::string& origin) const override;
+    size_t countForOrigin(const std::string& origin) const override;
+    std::vector<CredentialMeta> listMetadata() const override;
     std::vector<Credential> listAll() const override;
 
     static std::string normalizeOrigin(const std::string& raw_url);

@@ -137,6 +137,9 @@ public:
             if (vk == 'I' && shift) return fire(explorer::engine::ShortcutAction::ToggleDevTools);
             if (vk == 0x09) return fire(shift ? explorer::engine::ShortcutAction::PrevTab
                                               : explorer::engine::ShortcutAction::NextTab);
+            if (vk == 0xBB || vk == 0x6B) return fire(explorer::engine::ShortcutAction::ZoomIn);
+            if (vk == 0xBD || vk == 0x6D) return fire(explorer::engine::ShortcutAction::ZoomOut);
+            if (vk == '0' || vk == 0x60) return fire(explorer::engine::ShortcutAction::ZoomReset);
         }
         if (alt && !ctrl) {
             if (vk == 'D') return fire(explorer::engine::ShortcutAction::FocusOmnibar);

@@ -42,9 +42,16 @@ struct LogicalMonitor {
     std::vector<std::string> connectors;
 };
 
-void applyEdpRefreshSync(double target_hz) {
+int64_t monotonicNowMs() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000LL + static_cast<int64_t>(ts.tv_nsec) / 1'000'000LL;
+}
+
+bool applyEdpRefreshSync(double target_hz, bool* did_apply_out) {
+    if (did_apply_out) *did_apply_out = false;
     sd_bus* bus = nullptr;
-    if (sd_bus_open_user(&bus) < 0 || !bus) return;
+    if (sd_bus_open_user(&bus) < 0 || !bus) return false;
 
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message* reply = nullptr;
@@ -62,7 +69,7 @@ void applyEdpRefreshSync(double target_hz) {
         sd_bus_error_free(&err);
         sd_bus_message_unref(reply);
         sd_bus_unref(bus);
-        return;
+        return false;
     }
 
     uint32_t serial = 0;
@@ -150,7 +157,7 @@ void applyEdpRefreshSync(double target_hz) {
 
     if (!parsed) {
         sd_bus_unref(bus);
-        return;
+        return false;
     }
 
     std::map<std::string, std::string> target_mode_by_conn;
@@ -165,7 +172,7 @@ void applyEdpRefreshSync(double target_hz) {
                 current_mode_by_conn[pm.connector] = m.id;
                 if (pm.connector.rfind("eDP", 0) == 0 && std::abs(m.hz - target_hz) < 2.0) {
                     sd_bus_unref(bus);
-                    return;  // Already at target Hz
+                    return true;  // Already at target Hz
                 }
             }
         }
@@ -203,7 +210,7 @@ void applyEdpRefreshSync(double target_hz) {
 
     if (target_mode_by_conn.empty()) {
         sd_bus_unref(bus);
-        return;
+        return true;  // No change needed or panel has no closer mode
     }
 
     sd_bus_message* req = nullptr;
@@ -214,7 +221,7 @@ void applyEdpRefreshSync(double target_hz) {
             "org.gnome.Mutter.DisplayConfig",
             "ApplyMonitorsConfig") < 0) {
         sd_bus_unref(bus);
-        return;
+        return false;
     }
 
     // Method 1 = temporary (non-persistent)
@@ -242,11 +249,14 @@ void applyEdpRefreshSync(double target_hz) {
     sd_bus_message_close_container(req);
 
     sd_bus_message* apply_reply = nullptr;
-    sd_bus_call(bus, req, 2'000'000, &err, &apply_reply);
+    int ar = sd_bus_call(bus, req, 2'000'000, &err, &apply_reply);
+    bool ok = (ar >= 0);
+    if (ok && did_apply_out) *did_apply_out = true;
     sd_bus_error_free(&err);
     sd_bus_message_unref(apply_reply);
     sd_bus_message_unref(req);
     sd_bus_unref(bus);
+    return ok;
 }
 
 struct MonitorsChangedCtx {
@@ -286,9 +296,17 @@ void MutterDisplayRefreshCtrl::setEdpRefreshRateAsync(double target_hz) {
             while (!stop_watcher_.load() && desired_hz_ > 0 && desired_hz_ != applied_hz_) {
                 int target = desired_hz_;
                 lock.unlock();
-                applyEdpRefreshSync(static_cast<double>(target));
+                bool did_apply = false;
+                bool ok = applyEdpRefreshSync(static_cast<double>(target), &did_apply);
+                if (did_apply) {
+                    last_self_apply_ms_.store(monotonicNowMs(), std::memory_order_relaxed);
+                }
                 lock.lock();
-                applied_hz_ = target;
+                if (ok) {
+                    applied_hz_ = target;
+                } else {
+                    break;  // Leave applied_hz_ unchanged so a subsequent trigger can retry
+                }
             }
             apply_in_flight_ = false;
         });
@@ -315,6 +333,10 @@ void MutterDisplayRefreshCtrl::startMonitorsChangedWatcher(std::function<void()>
         if (sd_bus_open_user(&bus) < 0 || !bus) return;
 
         MonitorsChangedCtx ctx{[this, cb = std::move(cb)]() {
+            int64_t last_ms = last_self_apply_ms_.load(std::memory_order_relaxed);
+            if (last_ms > 0 && (monotonicNowMs() - last_ms) < 600) {
+                return;  // Suppress echo from our own ApplyMonitorsConfig call
+            }
             invalidateCache();
             if (cb) cb();
         }};
@@ -359,6 +381,10 @@ void MutterDisplayRefreshCtrl::startMonitorsChangedWatcher(std::function<void()>
             fds[1].events = POLLIN;
             int pr = ::poll(fds, (wake_fd_ >= 0) ? 2 : 1, timeout_ms);
             if (pr < 0 && errno != EINTR) break;
+            if (wake_fd_ >= 0 && (fds[1].revents & POLLIN)) {
+                uint64_t drained = 0;
+                (void)::read(wake_fd_, &drained, sizeof(drained));
+            }
         }
 
         sd_bus_slot_unref(slot);

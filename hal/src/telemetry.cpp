@@ -1,9 +1,13 @@
 #include "explorer/hal/telemetry.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
-#include <fstream>
-#include <sstream>
+#include <cctype>
+#include <charconv>
 #include <string>
+#include <string_view>
 
 namespace explorer::hal {
 
@@ -11,33 +15,49 @@ namespace fs = std::filesystem;
 
 namespace {
 
+/// Zero-allocation POSIX read into a stack buffer (eliminates ifstream/string heap churn per tick).
+ssize_t readSmallFile(const fs::path& p, char* buf, size_t cap) {
+    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = ::read(fd, buf, cap);
+    ::close(fd);
+    return n;
+}
+
 std::optional<fs::path> readablePath(const fs::path& p) {
     // Verify actual open() readability (catches 0400 root-only files like intel-rapl energy_uj).
-    std::ifstream in(p);
-    if (in.is_open()) {
+    int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ::close(fd);
         return p;
     }
     return std::nullopt;
 }
 
 std::optional<std::string> readTrimmed(const fs::path& p) {
-    std::ifstream in(p);
-    std::string s;
-    if (!std::getline(in, s)) return std::nullopt;
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) {
-        s.pop_back();
+    char buf[256];
+    ssize_t n = readSmallFile(p, buf, sizeof(buf));
+    if (n <= 0) return std::nullopt;
+    std::string_view sv(buf, static_cast<size_t>(n));
+    auto nl = sv.find('\n');
+    if (nl != std::string_view::npos) sv = sv.substr(0, nl);
+    while (!sv.empty() && (sv.back() == '\r' || sv.back() == ' ')) {
+        sv.remove_suffix(1);
     }
-    return s;
+    return std::string(sv);
 }
 
 std::optional<uint64_t> readU64(const fs::path& p) {
-    auto s = readTrimmed(p);
-    if (!s.has_value() || s->empty()) return std::nullopt;
-    try {
-        return std::stoull(*s);
-    } catch (...) {
-        return std::nullopt;
-    }
+    char buf[64];
+    ssize_t n = readSmallFile(p, buf, sizeof(buf));
+    if (n <= 0) return std::nullopt;
+    const char* start = buf;
+    const char* end = buf + n;
+    while (start < end && (*start == ' ' || *start == '\t')) ++start;
+    uint64_t val = 0;
+    auto [ptr, ec] = std::from_chars(start, end, val);
+    if (ec != std::errc{} || ptr == start) return std::nullopt;
+    return val;
 }
 
 }  // namespace
@@ -80,7 +100,8 @@ LinuxTelemetryMonitor::LinuxTelemetryMonitor() {
         if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) continue;
         auto dev = e.path() / "device";
         auto vendor = readTrimmed(dev / "vendor").value_or("");
-        std::transform(vendor.begin(), vendor.end(), vendor.begin(), ::tolower);
+        std::transform(vendor.begin(), vendor.end(), vendor.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (vendor == "0x1002" && !igpu_busy_) {
             igpu_busy_ = readablePath(dev / "gpu_busy_percent");
         } else if (vendor == "0x8086") {
@@ -94,6 +115,7 @@ LinuxTelemetryMonitor::LinuxTelemetryMonitor() {
 }
 
 TelemetrySnapshot LinuxTelemetryMonitor::sample() {
+    std::lock_guard<std::mutex> lock(sample_mu_);
     TelemetrySnapshot out;
 
     std::optional<bool> ac_on;
@@ -105,7 +127,8 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
         auto st = readTrimmed(*batt_status_).value_or("");
         if (!st.empty()) out.batt_status_str = st;
         std::string st_low = st;
-        std::transform(st_low.begin(), st_low.end(), st_low.begin(), ::tolower);
+        std::transform(st_low.begin(), st_low.end(), st_low.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         discharging = (st_low == "discharging");
     }
     if (batt_capacity_) {
@@ -158,6 +181,7 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
 }
 
 TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
+    std::lock_guard<std::mutex> lock(sample_mu_);
     TelemetrySnapshot out;
     std::optional<bool> ac_on;
     if (ac_online_) {
@@ -166,11 +190,12 @@ TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
     bool discharging = false;
     if (batt_status_) {
         auto st = readTrimmed(*batt_status_).value_or("");
-        std::transform(st.begin(), st.end(), st.begin(), ::tolower);
+        std::transform(st.begin(), st.end(), st.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         discharging = (st == "discharging");
     }
     out.on_battery = discharging || (batt_status_.has_value() && ac_on.has_value() && !*ac_on);
-    // Keep /proc/stat delta warm every 2s/5s tick so opening the Power HUD shows immediate 2s CPU load!
+    // Keep /proc/stat delta warm on the background thread (<4us stack read) so opening HUD shows instant 2s CPU%!
     if (auto pct = sampleCpuPercent()) out.cpu_percent = *pct;
     if (out.on_battery) {
         out.batt_watts = sampleBattWatts();
@@ -222,18 +247,37 @@ std::optional<float> LinuxTelemetryMonitor::sampleBattWatts() const {
 }
 
 std::optional<float> LinuxTelemetryMonitor::sampleCpuPercent() {
-    std::ifstream in("/proc/stat");
-    std::string line;
-    if (!std::getline(in, line)) return std::nullopt;
+    char buf[256];
+    ssize_t n = readSmallFile("/proc/stat", buf, sizeof(buf));
+    if (n <= 4) return std::nullopt;
 
-    std::istringstream iss(line);
-    std::string tag;
-    uint64_t user = 0, nice = 0, sys = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
-    if (!(iss >> tag >> user >> nice >> sys >> idle)) return std::nullopt;
-    iss >> iowait >> irq >> softirq >> steal;
+    const char* p = buf;
+    const char* end = buf + n;
+    // Only parse the first line ("cpu  user nice sys idle iowait irq softirq steal ...")
+    for (const char* q = p; q < end; ++q) {
+        if (*q == '\n') {
+            end = q;
+            break;
+        }
+    }
+    // Skip leading "cpu" token
+    while (p < end && *p != ' ' && *p != '\t') ++p;
 
-    uint64_t total = user + nice + sys + idle + iowait + irq + softirq + steal;
-    uint64_t idle_all = idle + iowait;
+    uint64_t fields[8]{};
+    int parsed = 0;
+    for (int i = 0; i < 8; ++i) {
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        if (p >= end) break;
+        auto [next, ec] = std::from_chars(p, end, fields[i]);
+        if (ec != std::errc{} || next == p) break;
+        p = next;
+        ++parsed;
+    }
+    if (parsed < 4) return std::nullopt;
+
+    uint64_t total = fields[0] + fields[1] + fields[2] + fields[3] +
+                     fields[4] + fields[5] + fields[6] + fields[7];
+    uint64_t idle_all = fields[3] + fields[4];
 
     std::optional<float> pct;
     if (prev_stat_) {

@@ -55,10 +55,15 @@ int main() {
     CHECK(sd_loaded.urls[0] == "https://example.com");
     CHECK(sd_loaded.urls[1] == "https://github.com/trending");
     CHECK(sd_loaded.active_index == 1);
+    auto sess_perms = fs::status(tmp_dir / "session.json", ec).permissions();
+    CHECK((sess_perms & fs::perms::others_all) == fs::perms::none);
+    CHECK((sess_perms & fs::perms::group_all) == fs::perms::none);
 
     // 3. Base64 HTML data URL generation never contains unencoded '#' (which truncates data URLs)
     std::string chrome_url = topChromeHtmlDataUrl();
     std::string hud_url = powerHudHtmlDataUrl();
+    CHECK(chrome_url == topChromeHtmlDataUrl());  // Cached identity
+    CHECK(hud_url == powerHudHtmlDataUrl());
     CHECK(chrome_url.rfind("data:text/html;charset=utf-8;base64,", 0) == 0);
     CHECK(hud_url.rfind("data:text/html;charset=utf-8;base64,", 0) == 0);
     CHECK(chrome_url.find('#') == std::string::npos);

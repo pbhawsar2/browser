@@ -39,7 +39,7 @@ struct WindowLaunchConfig {
     std::string app_mode_url;
     std::string app_id;
     std::filesystem::path profile_dir;
-    double default_zoom = 1.05;
+    double default_zoom = 1.00;
     bool disable_session = false;
 };
 
@@ -105,6 +105,7 @@ public:
     void onWebAppInstallFinished(bool ok, std::string app_name);
     void onVaultRevealAuthFinished(bool ok, std::string origin, std::string username);
     void onTelemetryTick();
+    void onTelemetrySampleReady(explorer::hal::TelemetrySnapshot snap, bool from_tick);
     void onDebouncedSessionSave();
     void finishRetireTab(uint64_t tab_id);
 
@@ -115,7 +116,7 @@ private:
         std::string title = "New Tab";
         std::string favicon;
         double progress = 0.0;
-        double zoom_factor = 1.05;
+        double zoom_factor = 1.00;
         bool loading = false;
         bool can_back = false;
         bool can_fwd = false;
@@ -138,7 +139,10 @@ private:
     void setFindBarVisible(bool visible);
     void setStatusBanner(const std::string& msg);
     void syncSystemPower();
+    void broadcastAutohideConfig();
+    void requestTelemetrySampleAsync(bool full, bool from_tick);
     void reconcileRendererPriorities();
+    void drainPendingThrottleActions();
     void scheduleSessionSave();
     void flushSessionNow();
     void checkFinishShutdown();
@@ -166,6 +170,7 @@ private:
 
     std::vector<TabEntry> tabs_;
     std::unordered_map<uint64_t, TabEntry> retiring_tabs_;
+    std::unordered_map<pid_t, bool> pending_pid_throttles_;
     std::vector<explorer::engine::DownloadRecord> downloads_;
     std::vector<explorer::webapp::InstalledWebApp> cached_webapps_;
     bool webapps_cache_valid_ = false;
@@ -173,8 +178,10 @@ private:
     std::string status_msg_;
     std::string pending_hud_tab_;
     std::string active_hud_tab_ = "power";
+    std::string last_chrome_sig_;
     std::string last_telemetry_sig_;
     std::string last_hud_sig_;
+    std::string last_window_title_;
 
     uint64_t active_tab_id_ = 0;
     uint64_t next_tab_id_ = 1;
@@ -187,6 +194,9 @@ private:
     bool scroll_hidden_ = false;
     bool html_fullscreen_ = false;
     bool closing_ = false;
+    bool telemetry_in_flight_ = false;
+    bool telemetry_pending_full_ = false;
+    bool throttle_in_flight_ = false;
     bool session_dirty_ = false;
     bool session_flushed_on_close_ = false;
     std::shared_ptr<std::atomic<bool>> life_token_ = std::make_shared<std::atomic<bool>>(true);

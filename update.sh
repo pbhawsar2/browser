@@ -44,14 +44,14 @@ if [[ -n "$TARBALL" ]]; then
     NEW_VER="custom-$(basename "$TARBALL")"
 else
     echo "Checking latest stable Chromium/CEF Linux x64 release..."
-    read -r NEW_VER DL_NAME < <(python3 -c '
+    read -r NEW_VER DL_NAME DL_SHA1 < <(python3 -c '
 import json, urllib.request
 data = json.loads(urllib.request.urlopen("https://cef-builds.spotifycdn.com/index.json", timeout=15).read())
 for v in data["linux64"]["versions"]:
     if v.get("channel") == "stable":
         for f in v["files"]:
             if f.get("type") == "minimal":
-                print(v["cef_version"], f["name"])
+                print(v["cef_version"], f["name"], f.get("sha1", ""))
                 raise SystemExit(0)
 raise SystemExit(1)
 ')
@@ -65,6 +65,9 @@ raise SystemExit(1)
     ENC_NAME="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$DL_NAME")"
     echo "Downloading $DL_NAME..."
     curl -fL "https://cef-builds.spotifycdn.com/${ENC_NAME}" -o "$STAGE/cef.tar.bz2"
+    if [[ -n "${DL_SHA1:-}" ]]; then
+        echo "${DL_SHA1}  $STAGE/cef.tar.bz2" | sha1sum -c -
+    fi
     tar -xjf "$STAGE/cef.tar.bz2" -C "$STAGE"
 fi
 

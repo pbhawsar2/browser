@@ -176,13 +176,19 @@ InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
 
     // Best-effort favicon download & crisp multi-size PNG icon generation via posix_spawnp (ZERO shell!).
     std::vector<std::string> icon_candidates;
+    auto pushUniqueCandidate = [&](const std::string& u) {
+        if (u.empty()) return;
+        if (std::find(icon_candidates.begin(), icon_candidates.end(), u) == icon_candidates.end()) {
+            icon_candidates.push_back(u);
+        }
+    };
     if (isValidHttpUrl(favicon_url)) {
-        icon_candidates.push_back(favicon_url);
+        pushUniqueCandidate(favicon_url);
         std::string origin = extractOriginUrl(clean_url);
         if (!origin.empty()) {
-            icon_candidates.push_back(origin + "/apple-touch-icon.png");
-            icon_candidates.push_back(origin + "/favicon.ico");
-            icon_candidates.push_back("https://www.google.com/s2/favicons?sz=256&domain_url=" + origin);
+            pushUniqueCandidate(origin + "/apple-touch-icon.png");
+            pushUniqueCandidate(origin + "/favicon.ico");
+            pushUniqueCandidate("https://www.google.com/s2/favicons?sz=256&domain_url=" + origin);
         }
     }
 
@@ -193,34 +199,43 @@ InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
 
         for (const auto& cand_url : icon_candidates) {
             if (!isValidHttpUrl(cand_url)) continue;
-            fs::path tmp_dl = fs::temp_directory_path() / (app_id + "." + std::to_string(::getpid()) + ".dl");
+            // Create a private, unpredictable temp directory (0700) to avoid /tmp symlink races.
+            std::string dir_tmpl = (fs::temp_directory_path() / "explorer-icon-XXXXXX").string();
+            char* tmp_dir_c = ::mkdtemp(dir_tmpl.data());
+            if (!tmp_dir_c) continue;
+            fs::path tmp_dir(tmp_dir_c);
+            fs::path tmp_dl = tmp_dir / "icon.dl";
             bool fetched = runProcessNoShell(
                 {"curl", "-fsSL", "--proto", "=http,https", "--max-time", "5", "--max-filesize", "2097152",
                  "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
                  cand_url, "-o", tmp_dl.string()});
             std::string ext = fetched ? detectImageExtension(tmp_dl) : "";
             if (!ext.empty()) {
-                fs::path tmp_typed = tmp_dl;
-                tmp_typed.replace_extension(ext);
+                fs::path tmp_typed = tmp_dir / ("icon" + ext);
                 fs::rename(tmp_dl, tmp_typed, ec);
                 // For multi-layer .ico files, [-1] selects the highest-resolution frame (e.g. 48x48/64x64 instead of 16x16).
                 std::string frame_sel = (ext == ".ico") ? "[-1]" : "[0]";
-                if (runProcessNoShell({"magick", tmp_typed.string() + frame_sel, "-background", "none",
-                                       "-resize", "256x256", dest_png.string()}) &&
-                    fs::exists(dest_png, ec) && fs::file_size(dest_png, ec) > 100) {
+                fs::path p128 = icons_dir_ / "128x128" / "apps" / (app_id + ".png");
+                fs::path p64 = icons_dir_ / "64x64" / "apps" / (app_id + ".png");
+                fs::path p48 = icons_dir_ / "48x48" / "apps" / (app_id + ".png");
+                for (const char* sz : {"128x128", "64x64", "48x48"}) {
+                    fs::create_directories(icons_dir_ / sz / "apps", ec);
+                }
+                // Single ImageMagick invocation generates all 4 hicolor sizes (4x fewer process spawns).
+                bool converted = runProcessNoShell({
+                    "magick", tmp_typed.string() + frame_sel, "-background", "none",
+                    "(", "+clone", "-resize", "256x256", "-write", dest_png.string(), "+delete", ")",
+                    "(", "+clone", "-resize", "128x128", "-write", p128.string(), "+delete", ")",
+                    "(", "+clone", "-resize", "64x64", "-write", p64.string(), "+delete", ")",
+                    "-resize", "48x48", p48.string()
+                });
+                if (converted && fs::exists(dest_png, ec) && fs::file_size(dest_png, ec) > 100) {
                     icon_name = app_id;
-                    for (const char* sz : {"128x128", "64x64", "48x48"}) {
-                        fs::path sdir = icons_dir_ / sz / "apps";
-                        fs::create_directories(sdir, ec);
-                        runProcessNoShell({"magick", dest_png.string(), "-background", "none",
-                                           "-resize", sz, (sdir / (app_id + ".png")).string()});
-                    }
-                    fs::remove(tmp_typed, ec);
+                    fs::remove_all(tmp_dir, ec);
                     break;
                 }
-                fs::remove(tmp_typed, ec);
             }
-            fs::remove(tmp_dl, ec);
+            fs::remove_all(tmp_dir, ec);
         }
     }
 
@@ -290,6 +305,10 @@ bool LinuxWebAppInstaller::uninstall(const std::string& app_id) const {
     bool removed = fs::remove(apps_dir_ / (app_id + ".desktop"), ec);
     for (const char* sz : {"256x256", "128x128", "64x64", "48x48"}) {
         fs::remove(icons_dir_ / sz / "apps" / (app_id + ".png"), ec);
+    }
+    if (removed) {
+        runProcessNoShell({"gtk-update-icon-cache", "-f", "-t", icons_dir_.string()});
+        runProcessNoShell({"update-desktop-database", apps_dir_.string()});
     }
     return removed;
 }

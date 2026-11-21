@@ -6,7 +6,7 @@
 
 namespace explorer::policy {
 
-inline constexpr double kDefaultPageZoomFactor = 1.05;
+inline constexpr double kDefaultPageZoomFactor = 1.00;
 inline constexpr const char* kHomeUrl = "explorer://start";
 
 /// Normalizes raw omnibar input into a navigable URL or Google search query.
@@ -16,7 +16,7 @@ std::string normalizeOmnibarInput(std::string_view raw);
 /// (rejecting prefix spoofing such as http://localhost.evil.com or http://127.0.0.1.evil.com).
 bool isSecureWebOrigin(std::string_view url_or_origin);
 
-/// Converts a linear zoom factor (e.g. 1.05) to Chromium's logarithmic zoom level (`log(f)/log(1.2)`).
+/// Converts a linear zoom factor (e.g. 1.00, 1.10) to Chromium's logarithmic zoom level (`log(f)/log(1.2)`).
 double zoomFactorToCefLevel(double factor);
 
 /// Converts Chromium's logarithmic zoom level back to a linear zoom factor.

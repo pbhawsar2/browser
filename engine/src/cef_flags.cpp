@@ -106,14 +106,17 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
     cmd->AppendSwitch("enable-font-antialiasing");
     cmd->AppendSwitchWithValue("font-render-hinting", "medium");
     cmd->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
-    cmd->AppendSwitchWithValue("num-raster-threads", "4");
     cmd->AppendSwitchWithValue("renderer-process-limit", "8");
 
     bool turbo = !hw.on_battery || (std::getenv("EXPLORER_TURBO") != nullptr);
+    // Always throttle background-tab timers so foreground tabs get peak CPU/L3 headroom on AC AND battery.
+    enable_features.push_back("IntensiveWakeUpThrottling");
     if (!turbo) {
+        cmd->AppendSwitchWithValue("num-raster-threads", "2");
         enable_features.push_back("BatterySaverModeAlignWakeUps");
         enable_features.push_back("ToggleFreezingOnBatterySaverMode");
-        enable_features.push_back("IntensiveWakeUpThrottling");
+    } else {
+        cmd->AppendSwitchWithValue("num-raster-threads", "4");
     }
 
     // 4. Disable bloat, Google ad-tracking Privacy Sandbox APIs, and software AV1 on Cezanne.
@@ -133,7 +136,9 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
         disable_features.push_back("AV1Decoder");
     }
 
-    // 5. Ryzen 7 5800H (8C/16T, 16MB L3) V8 GC/JIT tuning.
+    // 5. Ryzen 7 5800H (8C/16T, 16MB L3) dual-profile V8 GC/JIT tuning:
+    //    - AC Turbo: 32MB semi-space for peak Speedometer throughput.
+    //    - Battery:  16MB semi-space (L3-resident, halves young-gen DRAM footprint & power).
     const char* v8_override = std::getenv("EXPLORER_V8_FLAGS");
     const char* v8_prof = std::getenv("EXPLORER_V8_PROFILE");
     if (v8_override && v8_override[0]) {
@@ -141,7 +146,8 @@ void applyHardwareEngineFlags(CefRefPtr<CefCommandLine> cmd,
     } else if (!v8_prof || std::string(v8_prof) != "stock") {
         cmd->AppendSwitchWithValue(
             "js-flags",
-            "--max-semi-space-size=32 --concurrent-recompilation --parallel-scavenge");
+            turbo ? "--max-semi-space-size=32 --concurrent-recompilation --parallel-scavenge"
+                  : "--max-semi-space-size=16 --concurrent-recompilation --parallel-scavenge");
     }
 
     // 6. Optional Widevine CDM auto-discovery for DRM streaming (Netflix/Prime/Hotstar).

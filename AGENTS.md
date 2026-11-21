@@ -41,7 +41,7 @@ This document defines mandatory operating rules for all AI agents (Antigravity, 
 - **UI & Theme Invariants:**
   - Top bezel stays compact (`44px`) with `36x34px` rounded card buttons and pixel-aligned SVG icons.
   - Multi-tab UI uses the auto-hiding top horizontal `.tab-bar` (`38px`, `visible` only when `tabs > 1`).
-  - Default page zoom is `1.05` (`kDefaultPageZoomFactor`), and **Google** is the default search engine.
+  - Default page zoom is `1.00` (`100%`, `kDefaultPageZoomFactor`) with `10%` increment/decrement steps, and **Google** is the default search engine.
   - Zero browsing history stored; persistent cookies & explicit clear-site-data controls.
 
 ---

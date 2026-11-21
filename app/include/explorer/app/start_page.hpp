@@ -163,7 +163,8 @@ inline std::string startPageDataUrl() {
   </div>
 </body>
 </html>)HTML";
-    return makeHtmlDataUrl(kHtml);
+    static const std::string kCachedUrl = makeHtmlDataUrl(kHtml);
+    return kCachedUrl;
 }
 
 }  // namespace explorer::app

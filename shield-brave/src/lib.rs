@@ -7,11 +7,12 @@ use adblock::request::Request;
 use adblock::Engine;
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 pub struct BraveShieldHandle {
     engine: RwLock<Engine>,
-    rule_count: RwLock<usize>,
+    rule_count: AtomicUsize,
 }
 
 fn build_engine_from_rules(rules_text: &str) -> (Engine, usize) {
@@ -35,8 +36,53 @@ pub extern "C" fn explorer_brave_shield_new(rules_utf8: *const c_char) -> *mut B
     let (engine, count) = build_engine_from_rules(rules);
     Box::into_raw(Box::new(BraveShieldHandle {
         engine: RwLock::new(engine),
-        rule_count: RwLock::new(count),
+        rule_count: AtomicUsize::new(count),
     }))
+}
+
+/// Fast-path cold startup: deserializes a precompiled binary `.dat` engine cache (~5-15ms vs ~250ms text parse).
+/// Returns null if the cache is missing, corrupt, or from an incompatible adblock-rust version.
+#[unsafe(no_mangle)]
+pub extern "C" fn explorer_brave_shield_new_from_dat(
+    dat_ptr: *const u8,
+    dat_len: usize,
+    rule_count: usize,
+) -> *mut BraveShieldHandle {
+    if dat_ptr.is_null() || dat_len == 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(dat_ptr, dat_len) };
+    let mut engine = Engine::default();
+    if engine.deserialize(bytes).is_err() {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(BraveShieldHandle {
+        engine: RwLock::new(engine),
+        rule_count: AtomicUsize::new(rule_count),
+    }))
+}
+
+/// Serializes the active compiled `Engine` to a file path for fast subsequent cold boots.
+/// Returns 1 on success, 0 on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn explorer_brave_shield_write_dat(
+    handle: *const BraveShieldHandle,
+    path_utf8: *const c_char,
+) -> i32 {
+    if handle.is_null() || path_utf8.is_null() {
+        return 0;
+    }
+    let Ok(path) = unsafe { CStr::from_ptr(path_utf8) }.to_str() else {
+        return 0;
+    };
+    let h = unsafe { &*handle };
+    let bytes = {
+        let Ok(guard) = h.engine.read() else {
+            return 0;
+        };
+        guard.serialize()
+    };
+    if std::fs::write(path, &bytes).is_ok() { 1 } else { 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -53,9 +99,7 @@ pub extern "C" fn explorer_brave_shield_reload(
     if let Ok(mut guard) = h.engine.write() {
         *guard = new_engine;
     }
-    if let Ok(mut cguard) = h.rule_count.write() {
-        *cguard = count;
-    }
+    h.rule_count.store(count, Ordering::Relaxed);
     count
 }
 
@@ -65,7 +109,7 @@ pub extern "C" fn explorer_brave_shield_rule_count(handle: *const BraveShieldHan
         return 0;
     }
     let h = unsafe { &*handle };
-    h.rule_count.read().map(|g| *g).unwrap_or(0)
+    h.rule_count.load(Ordering::Relaxed)
 }
 
 /// Evaluates a network request using Brave's `adblock::Engine::check_network_request`.

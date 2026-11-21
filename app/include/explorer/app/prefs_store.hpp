@@ -1,8 +1,11 @@
 #pragma once
 // Persistent user preferences (adblock toggle, auto-hide top bar on scroll, cookie persistence).
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -40,21 +43,38 @@ public:
     void save(const UserPrefs& p) const {
         std::error_code ec;
         std::filesystem::create_directories(file_path_.parent_path(), ec);
+        std::string payload =
+            std::string("{\n  \"adblock_enabled\": ") + (p.adblock_enabled ? "true" : "false") +
+            ",\n  \"autohide_topbar\": " + (p.autohide_topbar ? "true" : "false") +
+            ",\n  \"save_cookies\": " + (p.save_cookies ? "true" : "false") + "\n}\n";
+
         auto tmp = file_path_;
         tmp += ".tmp";
-        {
-            std::ofstream out(tmp, std::ios::trunc);
-            if (!out.is_open()) return;
-            out << "{\n"
-                << "  \"adblock_enabled\": " << (p.adblock_enabled ? "true" : "false") << ",\n"
-                << "  \"autohide_topbar\": " << (p.autohide_topbar ? "true" : "false") << ",\n"
-                << "  \"save_cookies\": " << (p.save_cookies ? "true" : "false") << "\n"
-                << "}\n";
-            out.flush();
+        ::unlink(tmp.c_str());
+        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0) return;
+        size_t off = 0;
+        while (off < payload.size()) {
+            ssize_t n = ::write(fd, payload.data() + off, payload.size() - off);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                ::unlink(tmp.c_str());
+                return;
+            }
+            if (n == 0) {
+                ::close(fd);
+                ::unlink(tmp.c_str());
+                return;
+            }
+            off += static_cast<size_t>(n);
         }
-        ::chmod(tmp.c_str(), 0600);
+        ::fchmod(fd, 0600);
+        ::close(fd);
         std::filesystem::rename(tmp, file_path_, ec);
-        ::chmod(file_path_.c_str(), 0600);
+        if (ec) {
+            ::unlink(tmp.c_str());
+        }
     }
 
 private:

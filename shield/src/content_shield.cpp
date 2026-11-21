@@ -1,13 +1,16 @@
 #include "explorer/shield/content_shield.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -16,6 +19,8 @@ extern char** environ;
 
 extern "C" {
 void* explorer_brave_shield_new(const char* rules_utf8);
+void* explorer_brave_shield_new_from_dat(const unsigned char* dat_ptr, size_t dat_len, size_t rule_count);
+int explorer_brave_shield_write_dat(const void* handle, const char* path_utf8);
 size_t explorer_brave_shield_reload(void* handle, const char* rules_utf8);
 size_t explorer_brave_shield_rule_count(const void* handle);
 int explorer_brave_shield_check_slices(const void* handle,
@@ -114,7 +119,11 @@ std::string_view resourceKindToBraveType(ResourceKind kind) {
     return "other";
 }
 
-bool spawnCurlHttps(const char* url, const std::string& out_path) {
+bool spawnCurlHttps(const char* url,
+                    const std::string& out_path,
+                    std::atomic<pid_t>& active_pid_slot,
+                    const std::atomic<bool>& shutting_down) {
+    if (shutting_down.load()) return false;
     posix_spawn_file_actions_t actions;
     if (::posix_spawn_file_actions_init(&actions) != 0) return false;
     ::posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
@@ -131,23 +140,109 @@ bool spawnCurlHttps(const char* url, const std::string& out_path) {
     ::posix_spawn_file_actions_destroy(&actions);
     if (rc != 0 || pid <= 0) return false;
 
+    active_pid_slot.store(pid, std::memory_order_release);
+    if (shutting_down.load()) {
+        ::kill(pid, SIGTERM);
+    }
+
     int st = 0;
     while (::waitpid(pid, &st, 0) < 0) {
-        if (errno != EINTR) return false;
+        if (errno != EINTR) {
+            active_pid_slot.store(-1, std::memory_order_release);
+            return false;
+        }
     }
+    active_pid_slot.store(-1, std::memory_order_release);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
 }  // namespace
 
+std::string BraveAdblockShield::computeFilterFingerprint() const {
+    std::ostringstream fp;
+    fp << "v1:" << std::hash<std::string_view>{}(kBuiltinRules);
+    if (!filters_dir_.empty()) {
+        std::vector<std::string> items;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(filters_dir_, ec)) {
+            if (!entry.is_regular_file(ec) || entry.path().extension() != ".txt") continue;
+            auto sz = entry.file_size(ec);
+            auto mt = entry.last_write_time(ec).time_since_epoch().count();
+            items.push_back(entry.path().filename().string() + ":" + std::to_string(sz) + ":" + std::to_string(mt));
+        }
+        std::sort(items.begin(), items.end());
+        for (const auto& it : items) fp << "|" << it;
+    }
+    return fp.str();
+}
+
+void BraveAdblockShield::saveBinaryCache(size_t rule_count, const std::string& fingerprint) const {
+    if (filters_dir_.empty() || !handle_) return;
+    std::error_code ec;
+    fs::create_directories(filters_dir_, ec);
+    fs::path dat_path = filters_dir_ / "engine.dat";
+    fs::path dat_tmp = filters_dir_ / "engine.dat.tmp";
+    fs::path meta_path = filters_dir_ / "engine.meta";
+    fs::path meta_tmp = filters_dir_ / "engine.meta.tmp";
+
+    if (explorer_brave_shield_write_dat(handle_, dat_tmp.c_str()) != 1) {
+        fs::remove(dat_tmp, ec);
+        return;
+    }
+    fs::rename(dat_tmp, dat_path, ec);
+    if (ec) {
+        fs::remove(dat_tmp, ec);
+        return;
+    }
+    {
+        std::ofstream out(meta_tmp, std::ios::trunc);
+        if (!out.is_open()) return;
+        out << rule_count << "\n" << fingerprint << "\n";
+        out.flush();
+    }
+    fs::rename(meta_tmp, meta_path, ec);
+}
+
 BraveAdblockShield::BraveAdblockShield(fs::path filters_dir, bool enabled)
     : filters_dir_(std::move(filters_dir)), enabled_(enabled) {
-    std::string combined = loadCombinedRules();
-    handle_ = explorer_brave_shield_new(combined.c_str());
+    const std::string fp = computeFilterFingerprint();
+    // Fast path: load precompiled binary `.dat` engine (~5-15ms) if fingerprint matches.
+    if (!filters_dir_.empty()) {
+        fs::path meta_path = filters_dir_ / "engine.meta";
+        fs::path dat_path = filters_dir_ / "engine.dat";
+        std::ifstream meta_in(meta_path);
+        std::string cnt_line, fp_line;
+        if (meta_in.is_open() && std::getline(meta_in, cnt_line) && std::getline(meta_in, fp_line) && fp_line == fp) {
+            size_t cached_count = 0;
+            try { cached_count = std::stoull(cnt_line); } catch (...) { cached_count = 0; }
+            std::ifstream dat_in(dat_path, std::ios::binary | std::ios::ate);
+            if (cached_count > 0 && dat_in.is_open()) {
+                auto sz = dat_in.tellg();
+                if (sz > 0 && sz < 64 * 1024 * 1024) {
+                    dat_in.seekg(0, std::ios::beg);
+                    std::vector<unsigned char> bytes(static_cast<size_t>(sz));
+                    if (dat_in.read(reinterpret_cast<char*>(bytes.data()), sz)) {
+                        handle_ = explorer_brave_shield_new_from_dat(bytes.data(), bytes.size(), cached_count);
+                    }
+                }
+            }
+        }
+    }
+    if (!handle_) {
+        std::string combined = loadCombinedRules();
+        handle_ = explorer_brave_shield_new(combined.c_str());
+        if (handle_ && !filters_dir_.empty()) {
+            saveBinaryCache(explorer_brave_shield_rule_count(handle_), fp);
+        }
+    }
 }
 
 BraveAdblockShield::~BraveAdblockShield() {
     shutting_down_.store(true);
+    pid_t curl_pid = active_curl_pid_.load(std::memory_order_acquire);
+    if (curl_pid > 1) {
+        ::kill(curl_pid, SIGTERM);
+    }
     std::thread worker;
     {
         std::lock_guard<std::mutex> lock(update_mu_);
@@ -246,7 +341,7 @@ void BraveAdblockShield::updateFilterListsAsync(std::function<void(bool, size_t)
                 fs::path dest = filters_dir_ / s.name;
                 fs::path tmp = dest;
                 tmp += ".tmp";
-                bool ok = spawnCurlHttps(s.url, tmp.string());
+                bool ok = spawnCurlHttps(s.url, tmp.string(), active_curl_pid_, shutting_down_);
                 if (ok && fs::exists(tmp, ec) && fs::file_size(tmp, ec) > 1024) {
                     fs::rename(tmp, dest, ec);
                     any_ok = true;
@@ -259,6 +354,7 @@ void BraveAdblockShield::updateFilterListsAsync(std::function<void(bool, size_t)
             if (any_ok && !shutting_down_.load() && handle_) {
                 std::string combined = loadCombinedRules();
                 total = explorer_brave_shield_reload(handle_, combined.c_str());
+                saveBinaryCache(total, computeFilterFingerprint());
             }
             updating_.store(false);
             if (cb && !shutting_down_.load()) cb(any_ok, total);

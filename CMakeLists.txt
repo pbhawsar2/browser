@@ -23,7 +23,11 @@ if(NOT DEFINED CEF_ROOT OR "${CEF_ROOT}" STREQUAL "")
     endif()
 endif()
 
-set(EXPLORER_OPT_FLAGS -O3 -march=native -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+option(EXPLORER_NATIVE_ARCH "Enable -march=native CPU-specific codegen" ON)
+set(EXPLORER_OPT_FLAGS -O3 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+if(EXPLORER_NATIVE_ARCH)
+    list(APPEND EXPLORER_OPT_FLAGS -march=native)
+endif()
 set(EXPLORER_LINK_FLAGS "")
 
 option(EXPLORER_PGO_GENERATE "Build with Clang PGO instrumentation (-fprofile-generate)" OFF)

@@ -73,7 +73,23 @@ int main() {
     auto t2 = planner.reconcile({1}, {4}, false);
     CHECK(t2.size() == 1 && t2[0].pid == 200 && t2[0].throttle == false);
 
-    // 4. Navigation policy: Google default search + URL normalization + strict secure-origin checks + 1.05x zoom math.
+    // 3b. Cross-site navigation onto an already-throttled PID stays consistent (single PID state).
+    auto t3 = planner.reconcile({1}, {4}, true);
+    CHECK(t3.size() == 1 && t3[0].pid == 200 && t3[0].throttle == true);
+    planner.registerTab(5, 200);  // New background tab shares already-throttled PID 200
+    auto t4 = planner.reconcile({1}, {4}, true);
+    CHECK(t4.empty());  // Must NOT redundantly re-throttle PID 200
+    auto t5 = planner.reconcile({5}, {4}, true);  // Activating tab 5 unthrottles PID 200
+    bool unthrottled_200 = false;
+    for (const auto& tr : t5) {
+        if (tr.pid == 200 && !tr.throttle) unthrottled_200 = true;
+    }
+    CHECK(unthrottled_200);
+    planner.unregisterTab(3);
+    planner.unregisterTab(5);  // Orphaned PID 200 cleanly pruned
+    CHECK(planner.releaseAll().size() <= 2);
+
+    // 4. Navigation policy: Google default search + URL normalization + strict secure-origin checks + 1.00x zoom math.
     CHECK(normalizeOmnibarInput("github.com") == "https://github.com");
     CHECK(normalizeOmnibarInput("localhost:3000") == "http://localhost:3000");
     CHECK(normalizeOmnibarInput("ryzen 5800h linux") == "https://www.google.com/search?q=ryzen+5800h+linux");
@@ -89,7 +105,9 @@ int main() {
     CHECK(!isSecureWebOrigin("https://"));
 
     double lvl = zoomFactorToCefLevel(kDefaultPageZoomFactor);
-    CHECK(std::abs(cefLevelToZoomFactor(lvl) - 1.05) < 1e-6);
+    CHECK(std::abs(cefLevelToZoomFactor(lvl) - 1.00) < 1e-6);
+    CHECK(std::abs(cefLevelToZoomFactor(zoomFactorToCefLevel(1.10)) - 1.10) < 1e-6);
+    CHECK(std::abs(cefLevelToZoomFactor(zoomFactorToCefLevel(0.90)) - 0.90) < 1e-6);
 
     std::cout << "[test_policy] ALL PASSED\n";
     return 0;

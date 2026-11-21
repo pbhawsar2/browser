@@ -53,6 +53,11 @@ int main() {
 
         auto gh = v.findForOrigin("https://github.com/repo");
         CHECK(gh.size() == 1 && gh[0].username == "piyush" && gh[0].password == "NewP@ss456");
+        CHECK(v.countForOrigin("https://github.com/repo") == 1);
+        CHECK(v.countForOrigin("https://nonexistent.example") == 0);
+        auto meta = v.listMetadata();
+        CHECK(meta.size() == 2);
+        CHECK(meta[0].origin == "https://github.com" && meta[0].username == "piyush");
     }
 
     // Verify encrypted file on disk contains ZERO plaintext password

@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <charconv>
 #include <filesystem>
 #include <string>
 
@@ -44,15 +45,14 @@ bool LinuxProcessThrottler::setProcessIdleClass(pid_t pid, bool idle_class) cons
     bool ok_all = true;
 
     for (const auto& entry : fs::directory_iterator(task_dir, ec)) {
-        try {
-            pid_t tid = std::stoi(entry.path().filename().string());
-            if (tid > 1) {
-                applied_any = true;
-                if (!applyTidThrottling(tid, idle_class)) {
-                    ok_all = false;
-                }
+        const auto name = entry.path().filename().string();
+        pid_t tid = 0;
+        auto [ptr, fc_ec] = std::from_chars(name.data(), name.data() + name.size(), tid);
+        if (fc_ec == std::errc{} && ptr == name.data() + name.size() && tid > 1) {
+            applied_any = true;
+            if (!applyTidThrottling(tid, idle_class)) {
+                ok_all = false;
             }
-        } catch (...) {
         }
     }
 

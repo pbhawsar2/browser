@@ -3,6 +3,7 @@
 // Supports instant lock-free On/Off toggle, EasyList/uBlock syntax, OTT auth exceptions,
 // and hot-reloading updated filter lists without restarting the browser.
 
+#include <sys/types.h>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -69,12 +70,15 @@ public:
 
 private:
     std::string loadCombinedRules() const;
+    std::string computeFilterFingerprint() const;
+    void saveBinaryCache(size_t rule_count, const std::string& fingerprint) const;
 
     void* handle_ = nullptr;
     std::filesystem::path filters_dir_;
     std::atomic<bool> enabled_{true};
     std::atomic<bool> updating_{false};
     std::atomic<bool> shutting_down_{false};
+    std::atomic<pid_t> active_curl_pid_{-1};
     std::mutex update_mu_;
     std::thread update_thread_;
     mutable std::atomic<uint64_t> blocked_count_{0};

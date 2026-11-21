@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -89,7 +90,13 @@ bool writeSecretFileAtomic0600(const fs::path& dest, const void* data, size_t le
     size_t written = 0;
     while (written < len) {
         ssize_t n = ::write(fd, ptr + written, len - written);
-        if (n <= 0) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        if (n == 0) {
             ::close(fd);
             ::unlink(tmp.c_str());
             return false;
@@ -104,6 +111,11 @@ bool writeSecretFileAtomic0600(const fs::path& dest, const void* data, size_t le
     if (ec) {
         ::unlink(tmp.c_str());
         return false;
+    }
+    int dir_fd = ::open(dest.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
     }
     return true;
 }
@@ -315,6 +327,9 @@ bool AesGcmPasswordVault::saveOrUpdate(const std::string& origin,
 
     for (auto& e : entries_) {
         if (e.origin == norm && e.username == username) {
+            if (!e.password.empty()) {
+                OPENSSL_cleanse(e.password.data(), e.password.size());
+            }
             e.password = password;
             return persistToDisk();
         }
@@ -326,6 +341,11 @@ bool AesGcmPasswordVault::saveOrUpdate(const std::string& origin,
 bool AesGcmPasswordVault::remove(const std::string& origin, const std::string& username) {
     std::string norm = normalizeOrigin(origin);
     auto before = entries_.size();
+    for (auto& c : entries_) {
+        if (c.origin == norm && c.username == username && !c.password.empty()) {
+            OPENSSL_cleanse(c.password.data(), c.password.size());
+        }
+    }
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                   [&](const Credential& c) {
                                       return c.origin == norm && c.username == username;
@@ -340,6 +360,25 @@ std::vector<Credential> AesGcmPasswordVault::findForOrigin(const std::string& or
     std::vector<Credential> res;
     for (const auto& e : entries_) {
         if (e.origin == norm) res.push_back(e);
+    }
+    return res;
+}
+
+size_t AesGcmPasswordVault::countForOrigin(const std::string& origin) const {
+    std::string norm = normalizeOrigin(origin);
+    if (norm.empty()) return 0;
+    size_t count = 0;
+    for (const auto& e : entries_) {
+        if (e.origin == norm) ++count;
+    }
+    return count;
+}
+
+std::vector<CredentialMeta> AesGcmPasswordVault::listMetadata() const {
+    std::vector<CredentialMeta> res;
+    res.reserve(entries_.size());
+    for (const auto& e : entries_) {
+        res.push_back(CredentialMeta{e.origin, e.username});
     }
     return res;
 }

@@ -175,6 +175,35 @@ def wait_page_ready(ws: MiniWs, domain_substr: str, timeout=22.0):
     return False
 
 
+def measure_network_timing(ws: MiniWs) -> dict:
+    try:
+        return ws.eval_js(
+            """
+            (() => {
+                const nav = performance.getEntriesByType('navigation')[0];
+                const res = performance.getEntriesByType('resource') || [];
+                let slowCount = 0;
+                let maxResMs = 0;
+                for (const r of res) {
+                    if (r.duration > maxResMs) maxResMs = r.duration;
+                    if (r.duration > 2500) slowCount++;
+                }
+                return {
+                    dnsMs: nav ? Math.round(nav.domainLookupEnd - nav.domainLookupStart) : 0,
+                    tlsMs: nav ? Math.round(nav.connectEnd - nav.connectStart) : 0,
+                    ttfbMs: nav ? Math.round(nav.responseStart - nav.requestStart) : 0,
+                    domInteractiveMs: nav ? Math.round(nav.domInteractive) : 0,
+                    resourceCount: res.length,
+                    slowResourcesOver2500ms: slowCount,
+                    maxResourceMs: Math.round(maxResMs)
+                };
+            })()
+            """
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def measure_scroll_and_theme(ws: MiniWs) -> dict:
     for attempt in range(3):
         try:
@@ -290,36 +319,51 @@ def main():
         robu_ws = MiniWs(robu_t["webSocketDebuggerUrl"])
         wait_page_ready(robu_ws, "robu.in", timeout=22.0)
         robu_scroll = measure_scroll_and_theme(robu_ws)
-        print(f"[{args.label}] 3. https://robu.in scroll & theme verification:", robu_scroll)
-        assert robu_scroll["themeCssInjected"] is True, "Obsidian scrollbar CSS must be injected on robu.in"
+        robu_net = measure_network_timing(robu_ws)
+        prefers_dark = robu_ws.eval_js("window.matchMedia('(prefers-color-scheme: dark)').matches")
+        base_dpr = robu_ws.eval_js("window.devicePixelRatio")
+        print(f"[{args.label}] 3. https://robu.in scroll, network & color-scheme verification:",
+              {**robu_scroll, "prefersDark": prefers_dark, "dpr": base_dpr, "net": robu_net})
+        assert prefers_dark is False, "Web apps must NOT inherit dark system theme"
 
         # ------------------------------------------------------------------
-        # Quick Zoom Controls (Top Bezel Zoom Pill + HUD Zoom Governor)
+        # Quick Zoom Controls (Top Bezel Zoom Pill + Live Page Render Zoom + HUD Zoom Governor)
         # ------------------------------------------------------------------
         initial_zoom = chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent")
-        assert initial_zoom == "105%", f"Expected default 105% zoom pill, got {initial_zoom}"
+        assert initial_zoom == "100%", f"Expected default 100% zoom pill, got {initial_zoom}"
 
-        # Click + twice (105% -> 115% -> 125%)
+        # Click + once (100% -> 110%) and verify both pill AND live page devicePixelRatio scale
         chrome_ws.eval_js("document.getElementById('btn-zoom-in').click()")
-        time.sleep(0.15)
+        time.sleep(0.18)
+        assert chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent") == "110%"
+        dpr_110 = robu_ws.eval_js("window.devicePixelRatio")
+        assert abs((dpr_110 / base_dpr) - 1.10) < 0.03, f"Expected live page zoom 1.10x, got {dpr_110 / base_dpr:.3f}"
+
+        # Click + again (110% -> 120%)
         chrome_ws.eval_js("document.getElementById('btn-zoom-in').click()")
-        time.sleep(0.2)
+        time.sleep(0.18)
         zoom_in_pct = chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent")
-        assert zoom_in_pct == "125%", f"Expected 125% after 2x zoom in, got {zoom_in_pct}"
+        assert zoom_in_pct == "120%", f"Expected 120% after 2x zoom in, got {zoom_in_pct}"
+        dpr_120 = robu_ws.eval_js("window.devicePixelRatio")
+        assert abs((dpr_120 / base_dpr) - 1.20) < 0.03, f"Expected live page zoom 1.20x, got {dpr_120 / base_dpr:.3f}"
 
-        # Click - three times (125% -> 115% -> 105% -> 95%)
-        for _ in range(3):
+        # Click - three times (120% -> 110% -> 100% -> 90%)
+        for expected_step in ("110%", "100%", "90%"):
             chrome_ws.eval_js("document.getElementById('btn-zoom-out').click()")
-            time.sleep(0.12)
-        zoom_out_pct = chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent")
-        assert zoom_out_pct == "95%", f"Expected 95% after 3x zoom out, got {zoom_out_pct}"
+            time.sleep(0.15)
+            got_step = chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent")
+            assert got_step == expected_step, f"Expected {expected_step}, got {got_step}"
+        dpr_90 = robu_ws.eval_js("window.devicePixelRatio")
+        assert abs((dpr_90 / base_dpr) - 0.90) < 0.03, f"Expected live page zoom 0.90x, got {dpr_90 / base_dpr:.3f}"
 
-        # Click zoom percentage pill to reset back to 105%
+        # Click zoom percentage pill to reset back to 100%
         chrome_ws.eval_js("document.getElementById('btn-zoom-reset').click()")
-        time.sleep(0.15)
+        time.sleep(0.18)
         zoom_reset_pct = chrome_ws.eval_js("document.getElementById('btn-zoom-reset').textContent")
-        assert zoom_reset_pct == "105%", f"Expected 105% after reset, got {zoom_reset_pct}"
-        print(f"[{args.label}] 4. Top-bar Quick Zoom Pill verified: 105% -> 125% -> 95% -> 105%")
+        assert zoom_reset_pct == "100%", f"Expected 100% after reset, got {zoom_reset_pct}"
+        dpr_100 = robu_ws.eval_js("window.devicePixelRatio")
+        assert abs((dpr_100 / base_dpr) - 1.00) < 0.02, f"Expected live page zoom 1.00x after reset, got {dpr_100 / base_dpr:.3f}"
+        print(f"[{args.label}] 4. Top-bar Quick Zoom Pill & Live Page Render Zoom verified: 100% -> 110% -> 120% -> 90% -> 100% (DPR ratios: {dpr_110/base_dpr:.2f}x, {dpr_120/base_dpr:.2f}x, {dpr_90/base_dpr:.2f}x, {dpr_100/base_dpr:.2f}x)")
 
         # ------------------------------------------------------------------
         # 5-Tab Control Overlay HUD Layout, Zero-Overlap & Vault Font Size Check
@@ -356,7 +400,26 @@ def main():
         print(f"[{args.label}] 5. HUD Layout, Zero-Truncation & Vault Font Audit:", hud_ui_audit)
         assert hud_ui_audit["anyTabTruncated"] is False, f"HUD tab truncated: {hud_ui_audit['tabs']}"
         assert hud_ui_audit["vOriginFont"] == "14px", f"Expected 14px Vault input font, got {hud_ui_audit['vOriginFont']}"
-        assert hud_ui_audit["hudZoomText"] == "105%"
+        assert hud_ui_audit["hudZoomText"] == "100%"
+        # Verify HUD zoom buttons (+10%, -10%, Reset) also step cleanly by 10%
+        hud_ws.eval_js("send('zoom_in')")
+        for _ in range(25):
+            if hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "110%":
+                break
+            time.sleep(0.05)
+        assert hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "110%"
+        hud_ws.eval_js("send('zoom_out'); send('zoom_out');")
+        for _ in range(25):
+            if hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "90%":
+                break
+            time.sleep(0.05)
+        assert hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "90%"
+        hud_ws.eval_js("send('zoom_reset')")
+        for _ in range(25):
+            if hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "100%":
+                break
+            time.sleep(0.05)
+        assert hud_ws.eval_js("document.getElementById('v-zoom').textContent") == "100%"
 
         # Exercise all 5 HUD tabs + Vault save/edit/delete
         for tab_name in ("shield", "vault", "downloads", "apps", "power"):
@@ -393,7 +456,10 @@ def main():
         amz_ws = MiniWs(amz_t["webSocketDebuggerUrl"])
         wait_page_ready(amz_ws, "amazon.in", timeout=20.0)
         amz_scroll = measure_scroll_and_theme(amz_ws)
-        print(f"[{args.label}] 6. https://www.amazon.in scroll & theme verification:", amz_scroll)
+        amz_net = measure_network_timing(amz_ws)
+        amz_dpr = amz_ws.eval_js("window.devicePixelRatio")
+        assert abs(amz_dpr - base_dpr) < 0.02, f"New tab must start at 100% zoom ({base_dpr}), got {amz_dpr}"
+        print(f"[{args.label}] 6. https://www.amazon.in scroll, 100% zoom & network verification:", {**amz_scroll, "net": amz_net})
 
         # ------------------------------------------------------------------
         # Site 3 & OTT Streaming Platforms + Hardware Video & WebAudio Playback
@@ -532,7 +598,11 @@ def main():
         chrome_ws.close()
 
         exit_code = proc.wait(timeout=15)
+        stderr_out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
         assert exit_code == 0, f"Browser exited with code {exit_code}"
+        assert "**CRASHING**" not in stderr_out, f"Sandbox/process crash detected in stderr:\n{stderr_out}"
+        assert "SendProcessMessage sent to detached frame" not in stderr_out, f"Detached frame IPC warning in stderr:\n{stderr_out}"
+        print(f"[{args.label}] 10. Process stderr & sandbox stability audit: CLEAN (0 crashes, 0 detached-frame drops)")
         print(f"[{args.label}] SUMMARY: startup={startup_ms:.1f}ms | unit_25x={unit_ms:.1f}ms | "
               f"robu_scroll_avg={robu_scroll['avgMs']}ms | amazon_scroll_avg={amz_scroll['avgMs']}ms")
 

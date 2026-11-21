@@ -85,6 +85,9 @@ public:
     void OnLoadStart(CefRefPtr<CefBrowser> browser,
                      CefRefPtr<CefFrame> frame,
                      TransitionType transition_type) override;
+    void OnLoadEnd(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   int httpStatusCode) override;
 
     // CefRequestHandler / CefResourceRequestHandler (IO thread)
     bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,

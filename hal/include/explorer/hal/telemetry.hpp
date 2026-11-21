@@ -4,6 +4,7 @@
 #include "explorer/hal/types.hpp"
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -39,6 +40,7 @@ private:
     std::vector<std::filesystem::path> fan_inputs_;
     std::optional<std::filesystem::path> dgpu_runtime_status_;
 
+    std::mutex sample_mu_;
     std::optional<std::pair<uint64_t, std::chrono::steady_clock::time_point>> prev_rapl_;
     std::optional<std::pair<uint64_t, uint64_t>> prev_stat_;
 

@@ -46,7 +46,8 @@ std::pair<std::string, std::string> AmdCezanneGpuIsolator::discoverIgpuRenderNod
     std::pair<std::string, std::string> fallback{"/dev/dri/renderD128", ""};
     for (const auto& node : nodes) {
         std::string vendor = readTrimmed(node / "device" / "vendor");
-        std::transform(vendor.begin(), vendor.end(), vendor.begin(), ::tolower);
+        std::transform(vendor.begin(), vendor.end(), vendor.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         std::string dev = "/dev/dri/" + node.filename().string();
         if (vendor == "0x1002" || vendor == "0x8086") {
             return {dev, vendor};

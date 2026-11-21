@@ -48,7 +48,8 @@ CEF_DIR="${EXPLORER_CEF_DIR:-$HOME/.local/share/explorer-cef}"
 BUILD_DIR="${SCRIPT_DIR}/build"
 PGO_DIR="${SCRIPT_DIR}/pgo"
 PGO_PROFDATA="${PGO_DIR}/explorer.profdata"
-PGO_RAW_DIR="/tmp/explorer_pgo_raw_$$"
+PGO_RAW_DIR="$(mktemp -d /tmp/explorer_pgo_raw.XXXXXX)"
+trap 'rm -rf "$PGO_RAW_DIR"' EXIT
 
 TRAIN_PGO=0
 USE_PGO=1

@@ -228,11 +228,16 @@ void ExplorerCefClient::OnFullscreenModeChange(CefRefPtr<CefBrowser> /*browser*/
     }
 }
 
-void ExplorerCefClient::OnLoadingStateChange(CefRefPtr<CefBrowser> /*browser*/,
+void ExplorerCefClient::OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
                                              bool isLoading,
                                              bool canGoBack,
                                              bool canGoForward) {
     CEF_REQUIRE_UI_THREAD();
+    if (browser && browser->GetHost()) {
+        if (std::abs(browser->GetHost()->GetZoomLevel() - current_zoom_level_) > 1e-4) {
+            browser->GetHost()->SetZoomLevel(current_zoom_level_);
+        }
+    }
     if (observer_) {
         observer_->onTabLoadingChanged(tab_id_, isLoading, canGoBack, canGoForward);
     }
@@ -244,6 +249,18 @@ void ExplorerCefClient::OnLoadStart(CefRefPtr<CefBrowser> browser,
     CEF_REQUIRE_UI_THREAD();
     if (browser && frame && frame->IsMain() && browser->GetHost()) {
         // Maintain the tab's active zoom level consistently across navigations
+        if (std::abs(browser->GetHost()->GetZoomLevel() - current_zoom_level_) > 1e-4) {
+            browser->GetHost()->SetZoomLevel(current_zoom_level_);
+        }
+    }
+}
+
+void ExplorerCefClient::OnLoadEnd(CefRefPtr<CefBrowser> browser,
+                                  CefRefPtr<CefFrame> frame,
+                                  int /*httpStatusCode*/) {
+    CEF_REQUIRE_UI_THREAD();
+    if (browser && frame && frame->IsMain() && browser->GetHost()) {
+        // Override any stale per_host_zoom_levels restored by Chromium's HostZoomMap at commit time.
         if (std::abs(browser->GetHost()->GetZoomLevel() - current_zoom_level_) > 1e-4) {
             browser->GetHost()->SetZoomLevel(current_zoom_level_);
         }
@@ -289,31 +306,32 @@ CefResourceRequestHandler::ReturnValue ExplorerCefClient::OnBeforeResourceLoad(
         return RV_CONTINUE;
     }
     std::string url = request->GetURL().ToString();
-
-    // Send Global Privacy Control (Sec-GPC: 1) & Do-Not-Track (DNT: 1) on outgoing web requests.
-    if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
-        CefRequest::HeaderMap headers;
-        request->GetHeaderMap(headers);
-        headers.erase("Sec-GPC");
-        headers.erase("DNT");
-        headers.emplace("Sec-GPC", "1");
-        headers.emplace("DNT", "1");
-        request->SetHeaderMap(headers);
-    }
-
-    if (!shield_) {
+    // Fast-path non-network schemes (data:, blob:, about:, chrome:) — skip shield FFI & header work.
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) {
         return RV_CONTINUE;
     }
-    std::string initiator;
-    if (frame) {
-        initiator = frame->GetURL().ToString();
-    }
-    if (initiator.empty()) {
-        initiator = request->GetReferrerURL().ToString();
+
+    // 1. Evaluate Brave Shield FIRST so blocked ads/trackers skip header mutation completely.
+    const auto kind = mapCefResourceType(request->GetResourceType());
+    if (shield_ && kind != explorer::shield::ResourceKind::MainFrame) {
+        std::string initiator;
+        if (frame) {
+            initiator = frame->GetURL().ToString();
+        }
+        if (initiator.empty()) {
+            initiator = request->GetReferrerURL().ToString();
+        }
+        auto decision = shield_->evaluate(url, initiator, kind);
+        if (decision.block) {
+            return RV_CANCEL;
+        }
     }
 
-    auto decision = shield_->evaluate(url, initiator, mapCefResourceType(request->GetResourceType()));
-    return decision.block ? RV_CANCEL : RV_CONTINUE;
+    // 2. Send Global Privacy Control (Sec-GPC: 1) & Do-Not-Track (DNT: 1) in-place (zero HeaderMap copy).
+    request->SetHeaderByName("Sec-GPC", "1", true);
+    request->SetHeaderByName("DNT", "1", true);
+
+    return RV_CONTINUE;
 }
 
 bool ExplorerCefClient::OnBeforeDownload(CefRefPtr<CefBrowser> /*browser*/,

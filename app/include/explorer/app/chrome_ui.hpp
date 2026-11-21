@@ -146,13 +146,13 @@ inline std::string topChromeHtmlDataUrl() {
   }
   #url-input {
     flex: 1; min-width: 60px; height: 100%; background: transparent; border: none; outline: none;
-    color: #FFFFFF; font-size: 13.5px; font-weight: 500; line-height: 1; caret-color: var(--cyan); user-select: text;
+    color: #FFFFFF; font-size: 14.5px; font-weight: 600; letter-spacing: 0.01em; line-height: 1; caret-color: var(--cyan); user-select: text;
   }
-  #url-input::placeholder { color: #94A3B8; font-weight: 400; }
+  #url-input::placeholder { color: #94A3B8; font-weight: 500; }
 
   .mini-pill {
-    height: 22px; padding: 0 8px; border-radius: 999px; flex-shrink: 0; cursor: pointer;
-    font-size: 11px; font-weight: 600; line-height: 1; white-space: nowrap;
+    height: 24px; padding: 0 9px; border-radius: 999px; flex-shrink: 0; cursor: pointer;
+    font-size: 11.5px; font-weight: 600; line-height: 1; white-space: nowrap;
     font-variant-numeric: tabular-nums;
     border: 1px solid rgba(56, 189, 248, 0.34); background: rgba(56, 189, 248, 0.14); color: #7DD3FC;
     display: inline-flex; align-items: center; justify-content: center; gap: 4px;
@@ -162,23 +162,23 @@ inline std::string topChromeHtmlDataUrl() {
   .mini-pill.key.show { display: inline-flex; }
 
   .zoom-pill {
-    height: 22px; border-radius: 999px; flex-shrink: 0;
-    border: 1px solid rgba(148, 163, 184, 0.28); background: rgba(19, 28, 44, 0.92);
+    height: 26px; border-radius: 999px; flex-shrink: 0;
+    border: 1px solid rgba(148, 163, 184, 0.36); background: rgba(19, 28, 44, 0.96);
     display: inline-flex; align-items: center; overflow: hidden;
     font-variant-numeric: tabular-nums;
   }
   .zoom-pill button {
-    height: 100%; border: none; background: transparent; color: #CBD5E1;
-    font-size: 11px; font-weight: 600; line-height: 1; cursor: pointer;
-    padding: 0 6px; display: inline-flex; align-items: center; justify-content: center;
+    height: 100%; border: none; background: transparent; color: #E2E8F0;
+    font-size: 12.5px; font-weight: 700; line-height: 1; cursor: pointer;
+    padding: 0 7px; display: inline-flex; align-items: center; justify-content: center;
     transition: background-color 100ms ease, color 100ms ease;
   }
-  .zoom-pill button:hover { background: rgba(56, 189, 248, 0.22); color: #FFFFFF; }
-  .zoom-pill button:active { background: rgba(56, 189, 248, 0.36); color: #7DD3FC; }
+  .zoom-pill button:hover { background: rgba(56, 189, 248, 0.24); color: #FFFFFF; }
+  .zoom-pill button:active { background: rgba(56, 189, 248, 0.38); color: #7DD3FC; }
   .zoom-pill #btn-zoom-reset {
-    padding: 0 5px; color: #7DD3FC;
-    border-left: 1px solid rgba(148, 163, 184, 0.18);
-    border-right: 1px solid rgba(148, 163, 184, 0.18);
+    padding: 0 7px; color: #7DD3FC; font-size: 12px; font-weight: 700;
+    border-left: 1px solid rgba(148, 163, 184, 0.22);
+    border-right: 1px solid rgba(148, 163, 184, 0.22);
   }
 
   button.power-pill {
@@ -281,9 +281,9 @@ inline std::string topChromeHtmlDataUrl() {
         <input id="url-input" type="text" spellcheck="false" autocomplete="off" placeholder="Search Google or enter URL...">
         <button class="mini-pill key" id="btn-key" title="Saved Encrypted Passwords">Key</button>
         <div class="zoom-pill" title="Page Zoom (Ctrl - / Ctrl 0 / Ctrl +)">
-          <button type="button" id="btn-zoom-out" title="Zoom Out (Ctrl -)">−</button>
-          <button type="button" id="btn-zoom-reset" title="Reset Zoom (Ctrl 0)">105%</button>
-          <button type="button" id="btn-zoom-in" title="Zoom In (Ctrl +)">+</button>
+          <button type="button" id="btn-zoom-out" title="Zoom Out -10% (Ctrl -)">−</button>
+          <button type="button" id="btn-zoom-reset" title="Reset Zoom to 100% (Ctrl 0)">100%</button>
+          <button type="button" id="btn-zoom-in" title="Zoom In +10% (Ctrl +)">+</button>
         </div>
         <button class="mini-pill" id="btn-shield" title="Brave Adblock Shield (click to manage)">Shield</button>
       </div>
@@ -451,32 +451,64 @@ inline std::string topChromeHtmlDataUrl() {
     const tabsSig = showTabs ? JSON.stringify(s.tabs) : '';
     if (tabsSig !== lastTabsSig) {
       lastTabsSig = tabsSig;
-      tabBar.innerHTML = '';
-      if (showTabs) {
-        for (const t of s.tabs) {
-          const pill = document.createElement('div');
-          pill.className = 'tab-pill' + (t.active ? ' active' : '');
-          pill.dataset.tabId = String(t.id);
-          pill.onmousedown = (ev) => { if (ev.button === 1) { ev.preventDefault(); send('close_tab', t.id); } };
-          pill.onclick = (ev) => { if (!ev.target.closest('.tab-close')) send('activate_tab', t.id); };
-          if (t.favicon && (t.favicon.startsWith('https://') || t.favicon.startsWith('data:image/'))) {
-            const img = document.createElement('img');
-            img.className = 'tab-fav'; img.src = t.favicon; img.onerror = () => { img.style.display = 'none'; };
-            pill.appendChild(img);
-          } else {
-            const dot = document.createElement('span');
-            dot.className = 'tab-dot'; dot.style.opacity = t.active ? '1' : '0.4';
-            pill.appendChild(dot);
+      if (!showTabs) {
+        tabBar.innerHTML = '';
+      } else {
+        const existing = new Map();
+        for (const el of tabBar.children) {
+          if (el.dataset && el.dataset.tabId) existing.set(el.dataset.tabId, el);
+        }
+        const activeIds = new Set(s.tabs.map(t => String(t.id)));
+        for (const [id, el] of existing) {
+          if (!activeIds.has(id)) el.remove();
+        }
+        for (let i = 0; i < s.tabs.length; ++i) {
+          const t = s.tabs[i];
+          const idStr = String(t.id);
+          let pill = existing.get(idStr);
+          const wantFav = (t.favicon && (t.favicon.startsWith('https://') || t.favicon.startsWith('data:image/'))) ? t.favicon : '';
+          if (!pill) {
+            pill = document.createElement('div');
+            pill.dataset.tabId = idStr;
+            pill.dataset.fav = '';
+            pill.onmousedown = (ev) => { if (ev.button === 1) { ev.preventDefault(); send('close_tab', t.id); } };
+            pill.onclick = (ev) => { if (!ev.target.closest('.tab-close')) send('activate_tab', t.id); };
+            const iconSlot = document.createElement('span');
+            iconSlot.className = 'tab-dot';
+            pill.appendChild(iconSlot);
+            const title = document.createElement('span');
+            title.className = 'tab-title';
+            pill.appendChild(title);
+            const close = document.createElement('button');
+            close.className = 'tab-close'; close.type = 'button'; close.title = 'Close Tab';
+            close.innerHTML = '<svg viewBox="0 0 24 24"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
+            close.onclick = (ev) => { ev.stopPropagation(); send('close_tab', t.id); };
+            pill.appendChild(close);
           }
-          const title = document.createElement('span');
-          title.className = 'tab-title'; title.textContent = t.title || 'New Tab';
-          pill.appendChild(title);
-          const close = document.createElement('button');
-          close.className = 'tab-close'; close.type = 'button'; close.title = 'Close Tab';
-          close.innerHTML = '<svg viewBox="0 0 24 24"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
-          close.onclick = (ev) => { ev.stopPropagation(); send('close_tab', t.id); };
-          pill.appendChild(close);
-          tabBar.appendChild(pill);
+          pill.className = 'tab-pill' + (t.active ? ' active' : '');
+          if (pill.dataset.fav !== wantFav) {
+            pill.dataset.fav = wantFav;
+            const first = pill.firstElementChild;
+            if (wantFav) {
+              const img = document.createElement('img');
+              img.className = 'tab-fav'; img.src = wantFav; img.onerror = () => { img.style.display = 'none'; };
+              if (first) pill.replaceChild(img, first);
+            } else {
+              const dot = document.createElement('span');
+              dot.className = 'tab-dot';
+              if (first) pill.replaceChild(dot, first);
+            }
+          }
+          if (pill.firstElementChild && pill.firstElementChild.classList.contains('tab-dot')) {
+            pill.firstElementChild.style.opacity = t.active ? '1' : '0.4';
+          }
+          const titleEl = pill.querySelector('.tab-title');
+          if (titleEl && titleEl.textContent !== (t.title || 'New Tab')) {
+            titleEl.textContent = t.title || 'New Tab';
+          }
+          if (tabBar.children[i] !== pill) {
+            tabBar.insertBefore(pill, tabBar.children[i] || null);
+          }
         }
       }
     }
@@ -485,7 +517,8 @@ inline std::string topChromeHtmlDataUrl() {
 </script>
 </body>
 </html>)HTML";
-    return makeHtmlDataUrl(kHtml);
+    static const std::string kCachedUrl = makeHtmlDataUrl(kHtml);
+    return kCachedUrl;
 }
 
 inline std::string powerHudHtmlDataUrl() {
@@ -648,7 +681,7 @@ inline std::string powerHudHtmlDataUrl() {
           <span class="lbl">Page Zoom</span>
           <div style="display:flex; align-items:center; gap:6px;">
             <button class="btn sm" type="button" style="flex:0 0 30px; padding:0;" onclick="send('zoom_out')" title="Zoom Out (Ctrl -)">−</button>
-            <span class="val cyan" id="v-zoom" style="min-width:46px; text-align:center;">105%</span>
+            <span class="val cyan" id="v-zoom" style="min-width:46px; text-align:center;">100%</span>
             <button class="btn sm" type="button" style="flex:0 0 30px; padding:0;" onclick="send('zoom_in')" title="Zoom In (Ctrl +)">+</button>
             <button class="btn sm" type="button" style="flex:0 0 auto;" onclick="send('zoom_reset')" title="Reset Zoom (Ctrl 0)">Reset</button>
           </div>
@@ -1035,7 +1068,8 @@ inline std::string powerHudHtmlDataUrl() {
 </script>
 </body>
 </html>)HTML";
-    return makeHtmlDataUrl(kHtml);
+    static const std::string kCachedUrl = makeHtmlDataUrl(kHtml);
+    return kCachedUrl;
 }
 
 }  // namespace explorer::app

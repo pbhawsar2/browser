@@ -140,7 +140,8 @@ bool LinuxPowerGovernor::isOnBatteryBoot() const {
         } else if (kind == "Battery") {
             has_battery = true;
             std::string status = readTrimmed(entry.path() / "status");
-            std::transform(status.begin(), status.end(), status.begin(), ::tolower);
+            std::transform(status.begin(), status.end(), status.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (status == "discharging") {
                 discharging = true;
             }
@@ -258,6 +259,10 @@ void LinuxPowerGovernor::startBatteryWatcher(std::function<void(bool)> on_change
             fds[1].events = POLLIN;
             int pr = ::poll(fds, (wake_fd_ >= 0) ? 2 : 1, timeout_ms);
             if (pr < 0 && errno != EINTR) break;
+            if (wake_fd_ >= 0 && (fds[1].revents & POLLIN)) {
+                uint64_t drained = 0;
+                (void)::read(wake_fd_, &drained, sizeof(drained));
+            }
         }
 
         sd_bus_slot_unref(slot);
