@@ -267,6 +267,53 @@ void ExplorerCefClient::OnLoadEnd(CefRefPtr<CefBrowser> browser,
     }
 }
 
+bool ExplorerCefClient::OnRequestMediaAccessPermission(
+    CefRefPtr<CefBrowser> /*browser*/,
+    CefRefPtr<CefFrame> /*frame*/,
+    const CefString& requesting_origin,
+    uint32_t requested_permissions,
+    CefRefPtr<CefMediaAccessCallback> callback) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!callback) return false;
+    std::string origin = requesting_origin.ToString();
+    if (!explorer::policy::isSecureWebOrigin(origin)) {
+        callback->Cancel();
+        return true;
+    }
+    uint32_t allowed = requested_permissions;
+    if (observer_) {
+        allowed = observer_->onTabMediaPermissionRequested(tab_id_, origin, requested_permissions);
+    }
+    // CEF contract: for getUserMedia, allowed_permissions must match requested_permissions or be canceled.
+    if (allowed == requested_permissions && allowed != 0) {
+        callback->Continue(allowed);
+    } else {
+        callback->Cancel();
+    }
+    return true;
+}
+
+bool ExplorerCefClient::OnShowPermissionPrompt(
+    CefRefPtr<CefBrowser> /*browser*/,
+    uint64_t /*prompt_id*/,
+    const CefString& requesting_origin,
+    uint32_t requested_permissions,
+    CefRefPtr<CefPermissionPromptCallback> callback) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!callback) return false;
+    std::string origin = requesting_origin.ToString();
+    if (!explorer::policy::isSecureWebOrigin(origin)) {
+        callback->Continue(CEF_PERMISSION_RESULT_DENY);
+        return true;
+    }
+    bool accept = true;
+    if (observer_) {
+        accept = observer_->onTabPermissionPromptRequested(tab_id_, origin, requested_permissions);
+    }
+    callback->Continue(accept ? CEF_PERMISSION_RESULT_ACCEPT : CEF_PERMISSION_RESULT_DENY);
+    return true;
+}
+
 bool ExplorerCefClient::OnOpenURLFromTab(CefRefPtr<CefBrowser> /*browser*/,
                                          CefRefPtr<CefFrame> /*frame*/,
                                          const CefString& target_url,
@@ -312,18 +359,20 @@ CefResourceRequestHandler::ReturnValue ExplorerCefClient::OnBeforeResourceLoad(
     }
 
     // 1. Evaluate Brave Shield FIRST so blocked ads/trackers skip header mutation completely.
-    const auto kind = mapCefResourceType(request->GetResourceType());
-    if (shield_ && kind != explorer::shield::ResourceKind::MainFrame) {
-        std::string initiator;
-        if (frame) {
-            initiator = frame->GetURL().ToString();
-        }
-        if (initiator.empty()) {
-            initiator = request->GetReferrerURL().ToString();
-        }
-        auto decision = shield_->evaluate(url, initiator, kind);
-        if (decision.block) {
-            return RV_CANCEL;
+    if (shield_ && shield_->isEnabled()) {
+        const auto kind = mapCefResourceType(request->GetResourceType());
+        if (kind != explorer::shield::ResourceKind::MainFrame) {
+            std::string initiator;
+            if (frame) {
+                initiator = frame->GetURL().ToString();
+            }
+            if (initiator.empty()) {
+                initiator = request->GetReferrerURL().ToString();
+            }
+            auto decision = shield_->evaluate(url, initiator, kind);
+            if (decision.block) {
+                return RV_CANCEL;
+            }
         }
     }
 
@@ -405,25 +454,46 @@ bool ExplorerCefClient::OnPreKeyEvent(CefRefPtr<CefBrowser> /*browser*/,
     };
 
     if (ctrl && !alt) {
-        if (vk == 'T') return dispatch(ShortcutAction::NewTab);
-        if (vk == 'W') return dispatch(ShortcutAction::CloseTab);
+        if (vk == 'T') return dispatch(shift ? ShortcutAction::ReopenClosedTab : ShortcutAction::NewTab);
+        if (vk == 'N' && !shift) return dispatch(ShortcutAction::NewTab);
+        if (vk == 'W' || vk == 0x73) return dispatch(ShortcutAction::CloseTab);                      // Ctrl+W / Ctrl+F4
         if (vk == 'L') return dispatch(ShortcutAction::FocusOmnibar);
-        if (vk == 'F') return dispatch(ShortcutAction::FindInPage);
+        if (vk == 'F' && !shift) return dispatch(ShortcutAction::FindInPage);
+        if (vk == 'G') return dispatch(shift ? ShortcutAction::FindPrev : ShortcutAction::FindNext);
+        if (vk == 'J' && !shift) return dispatch(ShortcutAction::OpenDownloads);
+        if (vk == 'M' && !shift) return dispatch(ShortcutAction::ToggleMute);
+        if ((vk == 0x2E || vk == 0x08) && shift) return dispatch(ShortcutAction::OpenSiteSettings);  // Ctrl+Shift+Del
         if (vk == 'Q') return dispatch(ShortcutAction::QuitApp);
-        if (vk == 'R') return dispatch(shift ? ShortcutAction::HardReload : ShortcutAction::Reload);
+        if (vk == 'R' || vk == 0x74) return dispatch(shift ? ShortcutAction::HardReload : ShortcutAction::Reload);
         if (vk == 'I' && shift) return dispatch(ShortcutAction::ToggleDevTools);
-        if (vk == 0x09) return dispatch(shift ? ShortcutAction::PrevTab : ShortcutAction::NextTab);  // Tab
+        if (vk == 0x09) return dispatch(shift ? ShortcutAction::PrevTab : ShortcutAction::NextTab);  // Ctrl+Tab
+        if (vk == 0x21) return dispatch(ShortcutAction::PrevTab);                                    // Ctrl+PageUp
+        if (vk == 0x22) return dispatch(ShortcutAction::NextTab);                                    // Ctrl+PageDown
         if (vk == 0xBB || vk == 0x6B) return dispatch(ShortcutAction::ZoomIn);                       // + / =
         if (vk == 0xBD || vk == 0x6D) return dispatch(ShortcutAction::ZoomOut);                      // -
         if (vk == '0' || vk == 0x60) return dispatch(ShortcutAction::ZoomReset);
+        if (!shift) {
+            if (vk == '1' || vk == 0x61) return dispatch(ShortcutAction::SelectTab1);
+            if (vk == '2' || vk == 0x62) return dispatch(ShortcutAction::SelectTab2);
+            if (vk == '3' || vk == 0x63) return dispatch(ShortcutAction::SelectTab3);
+            if (vk == '4' || vk == 0x64) return dispatch(ShortcutAction::SelectTab4);
+            if (vk == '5' || vk == 0x65) return dispatch(ShortcutAction::SelectTab5);
+            if (vk == '6' || vk == 0x66) return dispatch(ShortcutAction::SelectTab6);
+            if (vk == '7' || vk == 0x67) return dispatch(ShortcutAction::SelectTab7);
+            if (vk == '8' || vk == 0x68) return dispatch(ShortcutAction::SelectTab8);
+            if (vk == '9' || vk == 0x69) return dispatch(ShortcutAction::SelectLastTab);
+        }
     }
     if (alt && !ctrl) {
         if (vk == 'D') return dispatch(ShortcutAction::FocusOmnibar);
-        if (vk == 0x25) return dispatch(ShortcutAction::GoBack);     // Left
-        if (vk == 0x27) return dispatch(ShortcutAction::GoForward);  // Right
+        if (vk == 0x25) return dispatch(ShortcutAction::GoBack);     // Alt+Left
+        if (vk == 0x27) return dispatch(ShortcutAction::GoForward);  // Alt+Right
+        if (vk == 0x24) return dispatch(ShortcutAction::GoHome);     // Alt+Home
     }
     if (!ctrl && !alt) {
-        if (vk == 0x74) return dispatch(shift ? ShortcutAction::HardReload : ShortcutAction::Reload);  // F5
+        if (vk == 0x72) return dispatch(shift ? ShortcutAction::FindPrev : ShortcutAction::FindNext);  // F3 / Shift+F3
+        if (vk == 0x74) return dispatch(shift ? ShortcutAction::HardReload : ShortcutAction::Reload);  // F5 / Shift+F5
+        if (vk == 0x75) return dispatch(ShortcutAction::FocusOmnibar);                                 // F6
         if (vk == 0x7A) return dispatch(ShortcutAction::ToggleFullscreen);                             // F11
         if (vk == 0x7B) return dispatch(ShortcutAction::ToggleDevTools);                               // F12
         if (vk == 0x1B) {

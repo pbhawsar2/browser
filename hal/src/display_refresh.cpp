@@ -259,20 +259,126 @@ bool applyEdpRefreshSync(double target_hz, bool* did_apply_out) {
     return ok;
 }
 
-struct MonitorsChangedCtx {
-    std::function<void()> cb;
+struct WatcherCallbacksCtx {
+    std::function<void()> on_monitors;
+    std::function<void(bool)> on_theme;
 };
 
 int onMonitorsChanged(sd_bus_message* /*m*/, void* userdata, sd_bus_error* /*err*/) {
-    auto* ctx = static_cast<MonitorsChangedCtx*>(userdata);
-    if (ctx && ctx->cb) ctx->cb();
+    auto* ctx = static_cast<WatcherCallbacksCtx*>(userdata);
+    if (ctx && ctx->on_monitors) ctx->on_monitors();
     return 0;
+}
+
+bool readColorSchemeVariant(sd_bus_message* m, uint32_t* out_scheme) {
+    if (!m || !out_scheme) return false;
+    if (sd_bus_message_read(m, "v", "u", out_scheme) >= 0) {
+        return true;
+    }
+    sd_bus_message_rewind(m, false);
+    if (sd_bus_message_enter_container(m, 'v', "v") >= 0) {
+        bool ok = (sd_bus_message_read(m, "v", "u", out_scheme) >= 0);
+        sd_bus_message_exit_container(m);
+        if (ok) return true;
+    }
+    return false;
+}
+
+int onPortalSettingChanged(sd_bus_message* m, void* userdata, sd_bus_error* /*err*/) {
+    auto* ctx = static_cast<WatcherCallbacksCtx*>(userdata);
+    if (!ctx || !ctx->on_theme || !m) return 0;
+
+    const char* ns = nullptr;
+    const char* key = nullptr;
+    if (sd_bus_message_read(m, "ss", &ns, &key) < 0 || !ns || !key) return 0;
+    if (std::string(ns) != "org.freedesktop.appearance" || std::string(key) != "color-scheme") {
+        return 0;
+    }
+    uint32_t scheme = 0;
+    if (sd_bus_message_read(m, "v", "u", &scheme) >= 0) {
+        // XDG Desktop Portal color-scheme: 1 = prefer dark, 2 = prefer light, 0 = default (light)
+        ctx->on_theme(scheme == 1U);
+    }
+    return 0;
+}
+
+bool fallbackEnvPrefersDark() {
+    if (const char* gtk = std::getenv("GTK_THEME"); gtk && gtk[0]) {
+        std::string s(gtk);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s.find("dark") != std::string::npos;
+    }
+    return true;
 }
 
 }  // namespace
 
 MutterDisplayRefreshCtrl::~MutterDisplayRefreshCtrl() {
     shutdown();
+}
+
+bool MutterDisplayRefreshCtrl::prefersDarkTheme() const {
+    if (const char* env = std::getenv("EXPLORER_SYSTEM_THEME"); env && env[0]) {
+        std::string s(env);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (s == "dark" || s == "1" || s == "true" || s == "prefer-dark") return true;
+        if (s == "light" || s == "0" || s == "false" || s == "prefer-light" || s == "default") return false;
+    }
+
+    int cached = cached_prefers_dark_.load(std::memory_order_relaxed);
+    if (cached != -1) {
+        return cached == 1;
+    }
+
+    sd_bus* bus = nullptr;
+    if (sd_bus_open_user(&bus) < 0 || !bus) {
+        bool dark = fallbackEnvPrefersDark();
+        cached_prefers_dark_.store(dark ? 1 : 0, std::memory_order_relaxed);
+        return dark;
+    }
+
+    uint32_t scheme = 0;
+    bool got_scheme = false;
+
+    for (const char* method : {"ReadOne", "Read"}) {
+        sd_bus_message* req = nullptr;
+        if (sd_bus_message_new_method_call(
+                bus, &req,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+                method) >= 0 && req) {
+            sd_bus_message_append(req, "ss", "org.freedesktop.appearance", "color-scheme");
+            sd_bus_error err = SD_BUS_ERROR_NULL;
+            sd_bus_message* reply = nullptr;
+            int r = sd_bus_call(bus, req, 500'000, &err, &reply);
+            if (r >= 0 && reply && readColorSchemeVariant(reply, &scheme)) {
+                got_scheme = true;
+            }
+            sd_bus_error_free(&err);
+            sd_bus_message_unref(reply);
+            sd_bus_message_unref(req);
+            if (got_scheme) break;
+        }
+    }
+
+    sd_bus_unref(bus);
+    bool result = true;
+    if (got_scheme) {
+        if (scheme == 1U) result = true;
+        else if (scheme == 2U) result = false;
+        else if (const char* gtk = std::getenv("GTK_THEME"); gtk && gtk[0]) {
+            result = fallbackEnvPrefersDark();
+        } else {
+            result = false;
+        }
+    } else {
+        result = fallbackEnvPrefersDark();
+    }
+    cached_prefers_dark_.store(result ? 1 : 0, std::memory_order_relaxed);
+    return result;
 }
 
 void MutterDisplayRefreshCtrl::setEdpRefreshRateAsync(double target_hz) {
@@ -322,33 +428,73 @@ void MutterDisplayRefreshCtrl::invalidateCache() {
 }
 
 void MutterDisplayRefreshCtrl::startMonitorsChangedWatcher(std::function<void()> on_changed) {
-    if (isTuningDisabled() || watcher_thread_.joinable()) return;
+    if (isTuningDisabled()) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    monitors_cb_ = std::move(on_changed);
+    ensureWatcherThreadLocked();
+}
+
+void MutterDisplayRefreshCtrl::startThemeChangedWatcher(std::function<void(bool)> on_theme_changed) {
+    std::lock_guard<std::mutex> lock(mu_);
+    theme_cb_ = std::move(on_theme_changed);
+    ensureWatcherThreadLocked();
+}
+
+void MutterDisplayRefreshCtrl::ensureWatcherThreadLocked() {
+    if (watcher_thread_.joinable()) return;
 
     stop_watcher_.store(false);
     if (wake_fd_ < 0) {
         wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     }
-    watcher_thread_ = std::thread([this, cb = std::move(on_changed)]() mutable {
+    watcher_thread_ = std::thread([this]() {
         sd_bus* bus = nullptr;
         if (sd_bus_open_user(&bus) < 0 || !bus) return;
 
-        MonitorsChangedCtx ctx{[this, cb = std::move(cb)]() {
-            int64_t last_ms = last_self_apply_ms_.load(std::memory_order_relaxed);
-            if (last_ms > 0 && (monotonicNowMs() - last_ms) < 600) {
-                return;  // Suppress echo from our own ApplyMonitorsConfig call
+        WatcherCallbacksCtx ctx{
+            [this]() {
+                int64_t last_ms = last_self_apply_ms_.load(std::memory_order_relaxed);
+                if (last_ms > 0 && (monotonicNowMs() - last_ms) < 600) {
+                    return;  // Suppress echo from our own ApplyMonitorsConfig call
+                }
+                invalidateCache();
+                std::function<void()> cb;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    cb = monitors_cb_;
+                }
+                if (cb) cb();
+            },
+            [this](bool is_dark) {
+                cached_prefers_dark_.store(is_dark ? 1 : 0, std::memory_order_relaxed);
+                std::function<void(bool)> cb;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    cb = theme_cb_;
+                }
+                if (cb) cb(is_dark);
             }
-            invalidateCache();
-            if (cb) cb();
-        }};
-        sd_bus_slot* slot = nullptr;
+        };
+        sd_bus_slot* monitors_slot = nullptr;
         sd_bus_match_signal(
             bus,
-            &slot,
+            &monitors_slot,
             "org.gnome.Mutter.DisplayConfig",
             "/org/gnome/Mutter/DisplayConfig",
             "org.gnome.Mutter.DisplayConfig",
             "MonitorsChanged",
             onMonitorsChanged,
+            &ctx);
+
+        sd_bus_slot* theme_slot = nullptr;
+        sd_bus_match_signal(
+            bus,
+            &theme_slot,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "SettingChanged",
+            onPortalSettingChanged,
             &ctx);
 
         const int bus_fd = sd_bus_get_fd(bus);
@@ -387,7 +533,8 @@ void MutterDisplayRefreshCtrl::startMonitorsChangedWatcher(std::function<void()>
             }
         }
 
-        sd_bus_slot_unref(slot);
+        if (theme_slot) sd_bus_slot_unref(theme_slot);
+        if (monitors_slot) sd_bus_slot_unref(monitors_slot);
         sd_bus_unref(bus);
     });
 }

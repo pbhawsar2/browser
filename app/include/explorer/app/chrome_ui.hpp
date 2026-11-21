@@ -65,6 +65,23 @@ inline std::string topChromeHtmlDataUrl() {
     --text-dim: #E2E8F0;
     --muted: #94A3B8;
   }
+  html[data-theme="light"] {
+    --bg-canvas: #F1F5F9;
+    --bg-bezel: #F8FAFC;
+    --bg-card: #FFFFFF;
+    --bg-card-hover: #E0F2FE;
+    --bg-card-active: #BAE6FD;
+    --bg-url: #FFFFFF;
+    --bg-url-focus: #FFFFFF;
+    --border: #CBD5E1;
+    --border-subtle: rgba(15, 23, 42, 0.12);
+    --cyan: #0284C7;
+    --emerald: #059669;
+    --coral: #DC2626;
+    --text: #0F172A;
+    --text-dim: #1E293B;
+    --muted: #64748B;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
   html, body {
     width: 100%; height: 100%; overflow: hidden;
@@ -138,6 +155,7 @@ inline std::string topChromeHtmlDataUrl() {
   .url-icon {
     width: 15px; height: 15px; color: var(--muted); flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
   }
   .url-icon.secure { color: var(--emerald); }
   .url-icon svg {
@@ -146,9 +164,9 @@ inline std::string topChromeHtmlDataUrl() {
   }
   #url-input {
     flex: 1; min-width: 60px; height: 100%; background: transparent; border: none; outline: none;
-    color: #FFFFFF; font-size: 14.5px; font-weight: 600; letter-spacing: 0.01em; line-height: 1; caret-color: var(--cyan); user-select: text;
+    color: var(--text); font-size: 14.5px; font-weight: 600; letter-spacing: 0.01em; line-height: 1; caret-color: var(--cyan); user-select: text;
   }
-  #url-input::placeholder { color: #94A3B8; font-weight: 500; }
+  #url-input::placeholder { color: var(--muted); font-weight: 500; }
 
   .mini-pill {
     height: 24px; padding: 0 9px; border-radius: 999px; flex-shrink: 0; cursor: pointer;
@@ -157,9 +175,14 @@ inline std::string topChromeHtmlDataUrl() {
     border: 1px solid rgba(56, 189, 248, 0.34); background: rgba(56, 189, 248, 0.14); color: #7DD3FC;
     display: inline-flex; align-items: center; justify-content: center; gap: 4px;
   }
-  .mini-pill.off { border-color: rgba(148,163,184,0.28); background: rgba(148,163,184,0.10); color: #94A3B8; }
+  html[data-theme="light"] .mini-pill { color: #0369A1; border-color: rgba(2,132,199,0.4); background: rgba(2,132,199,0.12); }
+  .mini-pill.off { border-color: rgba(148,163,184,0.28); background: rgba(148,163,184,0.10); color: var(--muted); }
   .mini-pill.key { border-color: rgba(52,211,153,0.42); background: rgba(52,211,153,0.14); color: #6EE7B7; display: none; }
+  html[data-theme="light"] .mini-pill.key { color: #047857; }
   .mini-pill.key.show { display: inline-flex; }
+  .mini-pill.media { border-color: rgba(248,113,113,0.52); background: rgba(248,113,113,0.16); color: #FCA5A5; display: none; }
+  html[data-theme="light"] .mini-pill.media { color: #B91C1C; }
+  .mini-pill.media.show { display: inline-flex; }
 
   .zoom-pill {
     height: 26px; border-radius: 999px; flex-shrink: 0;
@@ -254,6 +277,23 @@ inline std::string topChromeHtmlDataUrl() {
   button.find-btn svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; fill: none; display: block; }
   button.find-btn:hover { background: var(--bg-card-hover); border-color: var(--cyan); color: #FFF; }
   button.find-btn.close:hover { background: #36151E; border-color: var(--coral); color: #FECACA; }
+  html[data-theme="light"], html[data-theme="light"] body {
+    background: #F8FAFC; color: #0F172A; border-color: rgba(15, 23, 42, 0.22);
+  }
+  html[data-theme="light"] .card, html[data-theme="light"] .list-item {
+    background: #FFFFFF; border-color: #CBD5E1; color: #0F172A;
+  }
+  html[data-theme="light"] .lbl, html[data-theme="light"] .toggle-row, html[data-theme="light"] .item-name, html[data-theme="light"] .val {
+    color: #0F172A;
+  }
+  html[data-theme="light"] .item-sub, html[data-theme="light"] .card-title { color: #475569; }
+  html[data-theme="light"] .val.cyan, html[data-theme="light"] .item-stat { color: #0284C7; }
+  html[data-theme="light"] .val.ok { color: #059669; }
+  html[data-theme="light"] .tab { color: #475569; }
+  html[data-theme="light"] .tab.active { background: #E0F2FE; border-color: #0284C7; color: #0F172A; }
+  html[data-theme="light"] input.field { background: #F1F5F9; border-color: #CBD5E1; color: #0F172A; }
+  html[data-theme="light"] .btn { background: rgba(2,132,199,0.12); border-color: rgba(2,132,199,0.45); color: #0369A1; }
+  html[data-theme="light"] .btn.danger { background: rgba(220,38,38,0.12); border-color: rgba(220,38,38,0.45); color: #B91C1C; }
 </style>
 </head>
 <body>
@@ -275,10 +315,11 @@ inline std::string topChromeHtmlDataUrl() {
 
     <div class="url-wrap">
       <div class="url-box">
-        <span class="url-icon" id="url-icon">
+        <span class="url-icon" id="url-icon" title="Site Permissions, Cookies &amp; App Settings">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         </span>
         <input id="url-input" type="text" spellcheck="false" autocomplete="off" placeholder="Search Google or enter URL...">
+        <button class="mini-pill media" id="btn-media-active" title="Active Microphone/Camera Access (click to manage permissions)">Mic</button>
         <button class="mini-pill key" id="btn-key" title="Saved Encrypted Passwords">Key</button>
         <div class="zoom-pill" title="Page Zoom (Ctrl - / Ctrl 0 / Ctrl +)">
           <button type="button" id="btn-zoom-out" title="Zoom Out -10% (Ctrl -)">−</button>
@@ -358,6 +399,8 @@ inline std::string topChromeHtmlDataUrl() {
   document.getElementById('btn-hud').onclick = () => send('open_panel', 'power');
   document.getElementById('btn-shield').onclick = () => send('open_panel', 'shield');
   document.getElementById('btn-key').onclick = () => send('open_panel', 'vault');
+  document.getElementById('url-icon').onclick = () => send('open_panel', 'apps');
+  document.getElementById('btn-media-active').onclick = () => send('open_panel', 'apps');
   document.getElementById('btn-zoom-out').onclick = () => send('zoom_out');
   document.getElementById('btn-zoom-reset').onclick = () => send('zoom_reset');
   document.getElementById('btn-zoom-in').onclick = () => send('zoom_in');
@@ -411,6 +454,7 @@ inline std::string topChromeHtmlDataUrl() {
   };
 
   window.__updateChrome = (s) => {
+    document.documentElement.setAttribute('data-theme', s.darkTheme === false ? 'light' : 'dark');
     document.getElementById('btn-back').disabled = !s.canBack;
     document.getElementById('btn-fwd').disabled = !s.canFwd;
 
@@ -434,6 +478,12 @@ inline std::string topChromeHtmlDataUrl() {
     }
 
     window.__updateTelemetry(s.batteryMode, s.pillText, s.adblockOn, s.blocked);
+
+    const mediaBtn = document.getElementById('btn-media-active');
+    if (mediaBtn) {
+      mediaBtn.className = 'mini-pill media' + (s.mediaAccess ? ' show' : '');
+      mediaBtn.textContent = s.mediaAccess || 'Mic';
+    }
 
     const keyBtn = document.getElementById('btn-key');
     keyBtn.className = 'mini-pill key' + ((s.siteCreds > 0 || s.hasPendingLogin) ? ' show' : '');
@@ -646,6 +696,23 @@ inline std::string powerHudHtmlDataUrl() {
   }
   .empty { font-size: 13px; color: #94A3B8; text-align: center; padding: 12px 0; }
   .status-msg { font-size: 12.5px; line-height: 1.35; color: #6EE7B7; min-height: 16px; word-break: break-word; }
+  html[data-theme="light"], html[data-theme="light"] body {
+    background: #F8FAFC; color: #0F172A; border-color: rgba(15, 23, 42, 0.22);
+  }
+  html[data-theme="light"] .card, html[data-theme="light"] .list-item {
+    background: #FFFFFF; border-color: #CBD5E1; color: #0F172A;
+  }
+  html[data-theme="light"] .lbl, html[data-theme="light"] .toggle-row, html[data-theme="light"] .item-name, html[data-theme="light"] .val {
+    color: #0F172A;
+  }
+  html[data-theme="light"] .item-sub, html[data-theme="light"] .card-title { color: #475569; }
+  html[data-theme="light"] .val.cyan, html[data-theme="light"] .item-stat { color: #0284C7; }
+  html[data-theme="light"] .val.ok { color: #059669; }
+  html[data-theme="light"] .tab { color: #475569; }
+  html[data-theme="light"] .tab.active { background: #E0F2FE; border-color: #0284C7; color: #0F172A; }
+  html[data-theme="light"] input.field { background: #F1F5F9; border-color: #CBD5E1; color: #0F172A; }
+  html[data-theme="light"] .btn { background: rgba(2,132,199,0.12); border-color: rgba(2,132,199,0.45); color: #0369A1; }
+  html[data-theme="light"] .btn.danger { background: rgba(220,38,38,0.12); border-color: rgba(220,38,38,0.45); color: #B91C1C; }
 </style>
 </head>
 <body>
@@ -685,6 +752,10 @@ inline std::string powerHudHtmlDataUrl() {
             <button class="btn sm" type="button" style="flex:0 0 30px; padding:0;" onclick="send('zoom_in')" title="Zoom In (Ctrl +)">+</button>
             <button class="btn sm" type="button" style="flex:0 0 auto;" onclick="send('zoom_reset')" title="Reset Zoom (Ctrl 0)">Reset</button>
           </div>
+        </div>
+        <div class="row">
+          <span class="lbl">Theme Appearance</span>
+          <button class="btn sm" id="btn-theme-mode" type="button" onclick="send('cycle_theme')" title="Cycle System Auto / Dark / Light Theme">System (Dark)</button>
         </div>
         <div class="toggle-row" onclick="send('toggle_turbo')">
           <span>AC Turbo Performance Hold (PPD)</span>
@@ -762,24 +833,69 @@ inline std::string powerHudHtmlDataUrl() {
       <div id="dl-list" style="display:flex; flex-direction:column; gap:6px;"></div>
     </div>
 
-    <!-- TAB 4: APPS (PWA) & PRIVACY / COOKIES -->
+    <!-- TAB 5: SITE PERMISSIONS, COOKIES/CACHE & WEB APPS (PWA) -->
     <div class="pane" id="pane-apps">
       <div class="card">
+        <div class="card-title" id="perm-origin-title">Site Permissions &amp; Access</div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'microphone')">
+          <span>Microphone Access</span>
+          <button class="sw green" id="sw-perm-mic" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'camera')">
+          <span>Camera Access</span>
+          <button class="sw green" id="sw-perm-camera" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'location')">
+          <span>Location (Geolocation)</span>
+          <button class="sw green" id="sw-perm-location" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'notifications')">
+          <span>Notifications</span>
+          <button class="sw green" id="sw-perm-notifications" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'clipboard')">
+          <span>Clipboard Read &amp; Write</span>
+          <button class="sw green" id="sw-perm-clipboard" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'screen_capture')">
+          <span>Screen &amp; Window Share</span>
+          <button class="sw green" id="sw-perm-screen" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'storage')">
+          <span>Persistent Storage &amp; Files</span>
+          <button class="sw green" id="sw-perm-storage" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'sound')">
+          <span>Site Audio / Sound</span>
+          <button class="sw green" id="sw-perm-sound" type="button"></button>
+        </div>
+        <div class="toggle-row" onclick="send('toggle_perm', 'popups')">
+          <span>Popups &amp; New Tabs</span>
+          <button class="sw green" id="sw-perm-popups" type="button"></button>
+        </div>
+        <button class="btn sm" id="btn-perm-reset" type="button" onclick="send('reset_site_perms')">Reset Current Site Permissions</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Privacy, Cookies &amp; Cache (No History Stored)</div>
+        <div class="toggle-row" onclick="send('toggle_cookies')">
+          <span>Persistent Cookies &amp; Sign-Ins</span>
+          <button class="sw green" id="sw-cookies" type="button"></button>
+        </div>
+        <button class="btn sm" type="button" onclick="send('clear_site_data')">Clear Current Site Cookies &amp; Storage</button>
+        <button class="btn sm" type="button" onclick="send('clear_http_cache')">Clear HTTP Disk &amp; Memory Cache</button>
+        <button class="btn sm danger" type="button" onclick="send('clear_all_data')">Clear All Cookies, Cache &amp; Site Data</button>
+      </div>
+
+      <div class="card">
         <div class="card-title">Install Current Site as Standalone App</div>
-        <input class="field" id="app-name" placeholder="App Name (e.g. YouTube)">
-        <button class="btn" type="button" onclick="installApp()">Install as Chromeless Desktop App</button>
+        <input class="field" id="app-name" placeholder="App Name (e.g. Gemini Work)">
+        <button class="btn" type="button" onclick="installApp()">Install as Standalone Desktop App</button>
       </div>
 
       <div class="card">
-        <div class="card-title">Installed Web Apps</div>
+        <div class="card-title">Installed Web Apps (Isolated Data)</div>
         <div id="apps-list" style="display:flex; flex-direction:column; gap:6px;"></div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">Privacy &amp; Site Data (No History Stored)</div>
-        <div class="row"><span class="lbl">Persistent Cookies</span><span class="val ok">Enabled</span></div>
-        <button class="btn" type="button" onclick="send('clear_site_data')">Clear Current Site Cookies &amp; Storage</button>
-        <button class="btn danger" type="button" onclick="send('clear_all_data')">Clear All Cookies &amp; Site Data</button>
       </div>
     </div>
 
@@ -895,10 +1011,35 @@ inline std::string powerHudHtmlDataUrl() {
 
   window.__updateHud = (h) => {
     window.__lastHudData = h;
+    document.documentElement.setAttribute('data-theme', h.darkTheme === false ? 'light' : 'dark');
     document.getElementById('sw-adblock').className = 'sw green' + (h.adblockOn ? ' on' : '');
     document.getElementById('sw-autohide').className = 'sw' + (h.autohide ? ' on' : '');
     document.getElementById('sw-turbo').className = 'sw' + (!h.batteryMode ? ' on' : '');
     document.getElementById('sw-cinema').className = 'sw' + (h.cinema60 ? ' on' : '');
+    const themeBtn = document.getElementById('btn-theme-mode');
+    if (themeBtn && h.themeLabel) themeBtn.textContent = h.themeLabel;
+
+    const pTitle = document.getElementById('perm-origin-title');
+    if (pTitle) {
+      pTitle.textContent = h.currentOrigin
+        ? ('Site Permissions · ' + h.currentOrigin)
+        : 'Site Permissions (Default)';
+    }
+    const sp = h.sitePerms || {};
+    const setPermSw = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.className = 'sw green' + (val !== false ? ' on' : '');
+    };
+    setPermSw('sw-perm-mic', sp.mic);
+    setPermSw('sw-perm-camera', sp.camera);
+    setPermSw('sw-perm-location', sp.location);
+    setPermSw('sw-perm-notifications', sp.notifications);
+    setPermSw('sw-perm-clipboard', sp.clipboard);
+    setPermSw('sw-perm-screen', sp.screen);
+    setPermSw('sw-perm-storage', sp.storage);
+    setPermSw('sw-perm-sound', sp.sound);
+    setPermSw('sw-perm-popups', sp.popups);
+    setPermSw('sw-cookies', h.saveCookies !== false);
 
     document.getElementById('v-shield-rules').textContent = (h.rules || 0) + ' rules';
     document.getElementById('v-shield-blocked').textContent = (h.blocked || 0) + ' blocked';

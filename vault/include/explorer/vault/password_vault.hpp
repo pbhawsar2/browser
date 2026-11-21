@@ -52,13 +52,16 @@ public:
 
 private:
     bool ensureKey();
-    bool loadFromDisk();
-    bool persistToDisk() const;
+    bool decryptEntriesFromDisk(std::vector<Credential>& out) const;
+    bool persistEntriesToDisk(const std::vector<Credential>& entries);
+    static void cleanseEntries(std::vector<Credential>& entries);
 
     std::filesystem::path key_path_;
     std::filesystem::path enc_path_;
     std::vector<unsigned char> key_;  // 32 bytes (AES-256)
-    std::vector<Credential> entries_;
+    // Deep-sleep memory footprint: only lightweight (origin, username) metadata is kept resident;
+    // plaintext passwords are decrypted on-demand and immediately scrubbed with OPENSSL_cleanse!
+    std::vector<CredentialMeta> meta_;
 };
 
 }  // namespace explorer::vault

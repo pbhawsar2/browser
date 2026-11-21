@@ -127,24 +127,51 @@ public:
         };
 
         if (ctrl && !alt) {
-            if (vk == 'T') return fire(explorer::engine::ShortcutAction::NewTab);
-            if (vk == 'W') return fire(explorer::engine::ShortcutAction::CloseTab);
+            if (vk == 'T') return fire(shift ? explorer::engine::ShortcutAction::ReopenClosedTab
+                                             : explorer::engine::ShortcutAction::NewTab);
+            if (vk == 'N' && !shift) return fire(explorer::engine::ShortcutAction::NewTab);
+            if (vk == 'W' || vk == 0x73) return fire(explorer::engine::ShortcutAction::CloseTab);
             if (vk == 'L') return fire(explorer::engine::ShortcutAction::FocusOmnibar);
-            if (vk == 'F') return fire(explorer::engine::ShortcutAction::FindInPage);
+            if (vk == 'F' && !shift) return fire(explorer::engine::ShortcutAction::FindInPage);
+            if (vk == 'G') return fire(shift ? explorer::engine::ShortcutAction::FindPrev
+                                             : explorer::engine::ShortcutAction::FindNext);
+            if (vk == 'J' && !shift) return fire(explorer::engine::ShortcutAction::OpenDownloads);
+            if (vk == 'M' && !shift) return fire(explorer::engine::ShortcutAction::ToggleMute);
+            if ((vk == 0x2E || vk == 0x08) && shift) return fire(explorer::engine::ShortcutAction::OpenSiteSettings);
             if (vk == 'Q') return fire(explorer::engine::ShortcutAction::QuitApp);
-            if (vk == 'R') return fire(shift ? explorer::engine::ShortcutAction::HardReload
-                                             : explorer::engine::ShortcutAction::Reload);
+            if (vk == 'R' || vk == 0x74) return fire(shift ? explorer::engine::ShortcutAction::HardReload
+                                                           : explorer::engine::ShortcutAction::Reload);
             if (vk == 'I' && shift) return fire(explorer::engine::ShortcutAction::ToggleDevTools);
             if (vk == 0x09) return fire(shift ? explorer::engine::ShortcutAction::PrevTab
                                               : explorer::engine::ShortcutAction::NextTab);
+            if (vk == 0x21) return fire(explorer::engine::ShortcutAction::PrevTab);
+            if (vk == 0x22) return fire(explorer::engine::ShortcutAction::NextTab);
             if (vk == 0xBB || vk == 0x6B) return fire(explorer::engine::ShortcutAction::ZoomIn);
             if (vk == 0xBD || vk == 0x6D) return fire(explorer::engine::ShortcutAction::ZoomOut);
             if (vk == '0' || vk == 0x60) return fire(explorer::engine::ShortcutAction::ZoomReset);
+            if (!shift) {
+                if (vk == '1' || vk == 0x61) return fire(explorer::engine::ShortcutAction::SelectTab1);
+                if (vk == '2' || vk == 0x62) return fire(explorer::engine::ShortcutAction::SelectTab2);
+                if (vk == '3' || vk == 0x63) return fire(explorer::engine::ShortcutAction::SelectTab3);
+                if (vk == '4' || vk == 0x64) return fire(explorer::engine::ShortcutAction::SelectTab4);
+                if (vk == '5' || vk == 0x65) return fire(explorer::engine::ShortcutAction::SelectTab5);
+                if (vk == '6' || vk == 0x66) return fire(explorer::engine::ShortcutAction::SelectTab6);
+                if (vk == '7' || vk == 0x67) return fire(explorer::engine::ShortcutAction::SelectTab7);
+                if (vk == '8' || vk == 0x68) return fire(explorer::engine::ShortcutAction::SelectTab8);
+                if (vk == '9' || vk == 0x69) return fire(explorer::engine::ShortcutAction::SelectLastTab);
+            }
         }
         if (alt && !ctrl) {
             if (vk == 'D') return fire(explorer::engine::ShortcutAction::FocusOmnibar);
+            if (vk == 0x25) return fire(explorer::engine::ShortcutAction::GoBack);
+            if (vk == 0x27) return fire(explorer::engine::ShortcutAction::GoForward);
+            if (vk == 0x24) return fire(explorer::engine::ShortcutAction::GoHome);
         }
         if (!ctrl && !alt) {
+            if (vk == 0x72) return fire(shift ? explorer::engine::ShortcutAction::FindPrev
+                                              : explorer::engine::ShortcutAction::FindNext);
+            if (vk == 0x74) return fire(shift ? explorer::engine::ShortcutAction::HardReload
+                                              : explorer::engine::ShortcutAction::Reload);
             if (vk == 0x7A) return fire(explorer::engine::ShortcutAction::ToggleFullscreen);
             if (vk == 0x7B) return fire(explorer::engine::ShortcutAction::ToggleDevTools);
             if (vk == 0x1B && is_hud_) return fire(explorer::engine::ShortcutAction::Escape);

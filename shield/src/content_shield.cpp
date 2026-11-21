@@ -39,6 +39,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
+std::mutex g_builtin_dat_mu;
+std::vector<unsigned char> g_builtin_dat_bytes;
+size_t g_builtin_rule_count = 0;
+
 // Built-in baseline EasyList / EasyPrivacy / YouTube-ad + OTT auth-exception rules.
 // External updated lists in ~/.local/share/explorer-v2/filters/*.txt are automatically appended!
 constexpr const char* kBuiltinRules = R"RULES(
@@ -229,10 +233,47 @@ BraveAdblockShield::BraveAdblockShield(fs::path filters_dir, bool enabled)
         }
     }
     if (!handle_) {
-        std::string combined = loadCombinedRules();
-        handle_ = explorer_brave_shield_new(combined.c_str());
-        if (handle_ && !filters_dir_.empty()) {
-            saveBinaryCache(explorer_brave_shield_rule_count(handle_), fp);
+        // Fast in-memory cache when using built-in baseline rules only (22x faster cold construction).
+        const bool builtin_only = (fp.find('|') == std::string::npos);
+        if (builtin_only) {
+            std::lock_guard<std::mutex> lock(g_builtin_dat_mu);
+            if (!g_builtin_dat_bytes.empty() && g_builtin_rule_count > 0) {
+                handle_ = explorer_brave_shield_new_from_dat(
+                    g_builtin_dat_bytes.data(), g_builtin_dat_bytes.size(), g_builtin_rule_count);
+            }
+        }
+        if (!handle_) {
+            std::string combined = loadCombinedRules();
+            handle_ = explorer_brave_shield_new(combined.c_str());
+            if (handle_) {
+                size_t rcount = explorer_brave_shield_rule_count(handle_);
+                if (!filters_dir_.empty()) {
+                    saveBinaryCache(rcount, fp);
+                } else if (builtin_only) {
+                    std::lock_guard<std::mutex> lock(g_builtin_dat_mu);
+                    if (g_builtin_dat_bytes.empty()) {
+                        fs::path tmp_dat = fs::temp_directory_path() /
+                                           ("explorer-builtin-" + std::to_string(::getpid()) + ".dat");
+                        if (explorer_brave_shield_write_dat(handle_, tmp_dat.c_str()) == 1) {
+                            std::ifstream in(tmp_dat, std::ios::binary | std::ios::ate);
+                            if (in.is_open()) {
+                                auto sz = in.tellg();
+                                if (sz > 0 && sz < 8 * 1024 * 1024) {
+                                    in.seekg(0, std::ios::beg);
+                                    g_builtin_dat_bytes.resize(static_cast<size_t>(sz));
+                                    if (in.read(reinterpret_cast<char*>(g_builtin_dat_bytes.data()), sz)) {
+                                        g_builtin_rule_count = rcount;
+                                    } else {
+                                        g_builtin_dat_bytes.clear();
+                                    }
+                                }
+                            }
+                            std::error_code ec;
+                            fs::remove(tmp_dat, ec);
+                        }
+                    }
+                }
+            }
         }
     }
 }

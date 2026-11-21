@@ -191,7 +191,14 @@ AesGcmPasswordVault::AesGcmPasswordVault(fs::path storage_dir)
     fs::create_directories(storage_dir, ec);
     ::chmod(storage_dir.c_str(), 0700);
     if (ensureKey()) {
-        loadFromDisk();
+        std::vector<Credential> tmp;
+        if (decryptEntriesFromDisk(tmp)) {
+            meta_.reserve(tmp.size());
+            for (const auto& c : tmp) {
+                meta_.push_back(CredentialMeta{c.origin, c.username});
+            }
+        }
+        cleanseEntries(tmp);
     }
 }
 
@@ -199,11 +206,16 @@ AesGcmPasswordVault::~AesGcmPasswordVault() {
     if (!key_.empty()) {
         OPENSSL_cleanse(key_.data(), key_.size());
     }
-    for (auto& e : entries_) {
+}
+
+void AesGcmPasswordVault::cleanseEntries(std::vector<Credential>& entries) {
+    for (auto& e : entries) {
         if (!e.password.empty()) {
             OPENSSL_cleanse(e.password.data(), e.password.size());
+            e.password.clear();
         }
     }
+    entries.clear();
 }
 
 bool AesGcmPasswordVault::ensureKey() {
@@ -230,7 +242,8 @@ bool AesGcmPasswordVault::ensureKey() {
     return writeSecretFileAtomic0600(key_path_, key_.data(), kKeyLen);
 }
 
-bool AesGcmPasswordVault::loadFromDisk() {
+bool AesGcmPasswordVault::decryptEntriesFromDisk(std::vector<Credential>& out) const {
+    out.clear();
     std::error_code ec;
     if (!fs::exists(enc_path_, ec) || key_.size() != kKeyLen) return false;
 
@@ -267,19 +280,21 @@ bool AesGcmPasswordVault::loadFromDisk() {
 
     if (!ok) {
         OPENSSL_cleanse(plain.data(), plain.size());
-        entries_.clear();
         return false;
     }
     plain.resize(static_cast<size_t>(out_len1 + out_len2));
-    bool parsed = deserializeEntries(plain, entries_);
+    bool parsed = deserializeEntries(plain, out);
     OPENSSL_cleanse(plain.data(), plain.size());
+    if (!parsed) {
+        cleanseEntries(out);
+    }
     return parsed;
 }
 
-bool AesGcmPasswordVault::persistToDisk() const {
+bool AesGcmPasswordVault::persistEntriesToDisk(const std::vector<Credential>& entries) {
     if (key_.size() != kKeyLen) return false;
 
-    std::string plain = serializeEntries(entries_);
+    std::string plain = serializeEntries(entries);
     unsigned char iv[kIvLen];
     if (RAND_bytes(iv, static_cast<int>(kIvLen)) != 1) {
         OPENSSL_cleanse(plain.data(), plain.size());
@@ -316,50 +331,84 @@ bool AesGcmPasswordVault::persistToDisk() const {
     blob.insert(blob.end(), tag, tag + kTagLen);
     blob.insert(blob.end(), ct.begin(), ct.begin() + static_cast<std::ptrdiff_t>(ct_len));
     OPENSSL_cleanse(iv, sizeof(iv));
-    return writeSecretFileAtomic0600(enc_path_, blob.data(), blob.size());
+    if (!writeSecretFileAtomic0600(enc_path_, blob.data(), blob.size())) {
+        return false;
+    }
+
+    meta_.clear();
+    meta_.reserve(entries.size());
+    for (const auto& c : entries) {
+        meta_.push_back(CredentialMeta{c.origin, c.username});
+    }
+    meta_.shrink_to_fit();
+    return true;
 }
 
 bool AesGcmPasswordVault::saveOrUpdate(const std::string& origin,
                                        const std::string& username,
                                        const std::string& password) {
+    if (key_.size() != kKeyLen) return false;
     std::string norm = normalizeOrigin(origin);
     if (norm.empty() || username.empty() || password.empty()) return false;
 
-    for (auto& e : entries_) {
+    std::vector<Credential> entries;
+    decryptEntriesFromDisk(entries);
+    bool updated = false;
+    for (auto& e : entries) {
         if (e.origin == norm && e.username == username) {
             if (!e.password.empty()) {
                 OPENSSL_cleanse(e.password.data(), e.password.size());
             }
             e.password = password;
-            return persistToDisk();
+            updated = true;
+            break;
         }
     }
-    entries_.push_back(Credential{norm, username, password});
-    return persistToDisk();
+    if (!updated) {
+        entries.push_back(Credential{norm, username, password});
+    }
+    bool ok = persistEntriesToDisk(entries);
+    cleanseEntries(entries);
+    return ok;
 }
 
 bool AesGcmPasswordVault::remove(const std::string& origin, const std::string& username) {
+    if (key_.size() != kKeyLen) return false;
     std::string norm = normalizeOrigin(origin);
-    auto before = entries_.size();
-    for (auto& c : entries_) {
+    std::vector<Credential> entries;
+    decryptEntriesFromDisk(entries);
+    auto before = entries.size();
+    for (auto& c : entries) {
         if (c.origin == norm && c.username == username && !c.password.empty()) {
             OPENSSL_cleanse(c.password.data(), c.password.size());
         }
     }
-    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                  [&](const Credential& c) {
-                                      return c.origin == norm && c.username == username;
-                                  }),
-                   entries_.end());
-    if (entries_.size() == before) return false;
-    return persistToDisk();
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&](const Credential& c) {
+                                     return c.origin == norm && c.username == username;
+                                 }),
+                  entries.end());
+    if (entries.size() == before) {
+        cleanseEntries(entries);
+        return false;
+    }
+    bool ok = persistEntriesToDisk(entries);
+    cleanseEntries(entries);
+    return ok;
 }
 
 std::vector<Credential> AesGcmPasswordVault::findForOrigin(const std::string& origin) const {
     std::string norm = normalizeOrigin(origin);
     std::vector<Credential> res;
-    for (const auto& e : entries_) {
-        if (e.origin == norm) res.push_back(e);
+    if (norm.empty() || countForOrigin(norm) == 0) return res;
+    std::vector<Credential> all;
+    if (!decryptEntriesFromDisk(all)) return res;
+    for (auto& e : all) {
+        if (e.origin == norm) {
+            res.push_back(std::move(e));
+        } else if (!e.password.empty()) {
+            OPENSSL_cleanse(e.password.data(), e.password.size());
+        }
     }
     return res;
 }
@@ -368,23 +417,20 @@ size_t AesGcmPasswordVault::countForOrigin(const std::string& origin) const {
     std::string norm = normalizeOrigin(origin);
     if (norm.empty()) return 0;
     size_t count = 0;
-    for (const auto& e : entries_) {
-        if (e.origin == norm) ++count;
+    for (const auto& m : meta_) {
+        if (m.origin == norm) ++count;
     }
     return count;
 }
 
 std::vector<CredentialMeta> AesGcmPasswordVault::listMetadata() const {
-    std::vector<CredentialMeta> res;
-    res.reserve(entries_.size());
-    for (const auto& e : entries_) {
-        res.push_back(CredentialMeta{e.origin, e.username});
-    }
-    return res;
+    return meta_;
 }
 
 std::vector<Credential> AesGcmPasswordVault::listAll() const {
-    return entries_;
+    std::vector<Credential> all;
+    decryptEntriesFromDisk(all);
+    return all;
 }
 
 }  // namespace explorer::vault

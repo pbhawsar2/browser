@@ -23,6 +23,7 @@
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
 
+#include <malloc.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -162,9 +163,16 @@ public:
 
     void OnContextInitialized() override {
         CEF_REQUIRE_UI_THREAD();
-        // Keep web applications/pages independent of the Linux OS dark theme (default light prefers-color-scheme).
+        // Automatically detect Linux system-level dark/light theme (or apply saved user theme preference)
+        // so websites (`prefers-color-scheme`) and Explorer UI match the system appearance automatically.
+        explorer::app::PrefsStore pstore(launch_cfg_.profile_dir / "prefs.json");
+        auto prefs = pstore.load();
+        bool sys_dark = services_.display_ctrl ? services_.display_ctrl->prefersDarkTheme() : true;
+        bool want_dark = (prefs.theme_mode == "dark")    ? true
+                         : (prefs.theme_mode == "light") ? false
+                                                         : sys_dark;
         if (auto ctx = CefRequestContext::GetGlobalContext()) {
-            ctx->SetChromeColorScheme(CEF_COLOR_VARIANT_LIGHT, 0);
+            ctx->SetChromeColorScheme(want_dark ? CEF_COLOR_VARIANT_DARK : CEF_COLOR_VARIANT_LIGHT, 0);
         }
         window_ = std::make_unique<explorer::app::BrowserWindow>(launch_cfg_, services_);
         window_->show();
@@ -216,6 +224,10 @@ public:
                     "explorer://ux-config", 0);
                 return true;
             }
+        } else if (message->GetName() == "explorer.deep-sleep") {
+            // Release unused renderer heap arenas back to the Linux kernel when module/tab enters deep sleep.
+            ::malloc_trim(0);
+            return true;
         }
         return false;
     }
@@ -410,12 +422,14 @@ int main(int argc, char* argv[]) {
     explorer::hal::HardwareProfile hw;
     hw.tuning_disabled = explorer::hal::isTuningDisabled();
     hw.allow_dgpu = (std::getenv("EXPLORER_ALLOW_DGPU") != nullptr);
-    auto [node, vendor] = gpu_iso.discoverIgpuRenderNode();
-    hw.igpu_render_node = node;
-    hw.igpu_vendor = vendor;
-    gpu_iso.applyIsolationEnv(vendor, hw.allow_dgpu);
 
     if (!is_subprocess) {
+        auto [node, vendor] = gpu_iso.discoverIgpuRenderNode();
+        hw.igpu_render_node = node;
+        hw.igpu_vendor = vendor;
+        gpu_iso.applyIsolationEnv(vendor, hw.allow_dgpu);
+        ::setenv("EXPLORER_IGPU_NODE", node.c_str(), 1);
+        ::setenv("EXPLORER_IGPU_VENDOR", vendor.c_str(), 1);
         hw.on_battery = power_gov->isOnBatteryBoot();
         hw.va_caps = va_prober.probe(node);
         bool turbo = !hw.on_battery || (std::getenv("EXPLORER_TURBO") != nullptr);
@@ -424,6 +438,18 @@ int main(int argc, char* argv[]) {
         ::setenv("EXPLORER_TURBO_SLACK", turbo ? "1" : "0", 1);
         ::setenv("EXPLORER_VA_AV1", hw.va_caps.av1 ? "1" : "0", 1);
     } else {
+        // Zero-syscall subprocess fast-path: inherit pre-discovered iGPU node/vendor & isolation env from parent!
+        const char* env_node = std::getenv("EXPLORER_IGPU_NODE");
+        const char* env_vendor = std::getenv("EXPLORER_IGPU_VENDOR");
+        if (env_node && env_node[0]) {
+            hw.igpu_render_node = env_node;
+            hw.igpu_vendor = env_vendor ? env_vendor : "";
+        } else {
+            auto [node, vendor] = gpu_iso.discoverIgpuRenderNode();
+            hw.igpu_render_node = node;
+            hw.igpu_vendor = vendor;
+            gpu_iso.applyIsolationEnv(vendor, hw.allow_dgpu);
+        }
         const char* on_batt = std::getenv("EXPLORER_ON_BATTERY");
         hw.on_battery = (on_batt != nullptr && on_batt[0] == '1');
         const char* va_av1 = std::getenv("EXPLORER_VA_AV1");
@@ -464,6 +490,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::filesystem::path base_profile_dir = launch_cfg.profile_dir;
+    ::setenv("EXPLORER_PROFILE_DIR", base_profile_dir.c_str(), 1);
     // Installed WebApps get their own isolated cache/profile subdir under profile_dir/webapps/<app_id>
     // Sanitize --app-id strictly to prevent path traversal (e.g. --app-id=../../evil).
     if (!launch_cfg.app_mode_url.empty()) {
@@ -495,7 +522,9 @@ int main(int argc, char* argv[]) {
         services.telemetry = std::make_shared<explorer::hal::LinuxTelemetryMonitor>();
         services.shield = std::make_shared<explorer::shield::BraveAdblockShield>(
             base_profile_dir / "filters", true);
-        services.vault = std::make_shared<explorer::vault::AesGcmPasswordVault>(base_profile_dir);
+        // Each installed WebApp gets its own isolated encrypted password vault in launch_cfg.profile_dir
+        // so uninstalling the WebApp purges 100% of its sign-ins, cookies, and caches!
+        services.vault = std::make_shared<explorer::vault::AesGcmPasswordVault>(launch_cfg.profile_dir);
         const char* home = std::getenv("HOME");
         if (home && home[0]) {
             std::filesystem::path h(home);
@@ -503,10 +532,30 @@ int main(int argc, char* argv[]) {
             if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0]) {
                 data_home = xdg;
             }
+            std::filesystem::path apps_dir = data_home / "applications";
+            if (const char* env_apps = std::getenv("EXPLORER_APPS_DIR"); env_apps && env_apps[0]) {
+                apps_dir = env_apps;
+            }
+            std::filesystem::path icons_dir = data_home / "icons/hicolor";
+            if (const char* env_icons = std::getenv("EXPLORER_ICONS_DIR"); env_icons && env_icons[0]) {
+                icons_dir = env_icons;
+            }
+            std::filesystem::path browser_bin = h / ".local/bin/explorer";
+            char exe_buf[4096];
+            ssize_t exe_n = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+            if (exe_n > 0) {
+                exe_buf[exe_n] = '\0';
+                std::error_code ec;
+                if (!std::filesystem::exists(browser_bin, ec) ||
+                    std::getenv("EXPLORER_USE_SELF_BIN") != nullptr) {
+                    browser_bin = exe_buf;
+                }
+            }
             services.webapp_installer = std::make_shared<explorer::webapp::LinuxWebAppInstaller>(
-                data_home / "applications",
-                data_home / "icons/hicolor",
-                h / ".local/bin/explorer");
+                apps_dir,
+                icons_dir,
+                browser_bin,
+                base_profile_dir / "webapps");
         }
     }
 
@@ -515,7 +564,9 @@ int main(int argc, char* argv[]) {
 
     int exit_code = CefExecuteProcess(main_args, app, nullptr);
     if (exit_code >= 0) {
-        return exit_code;
+        // Sandboxed CEF subprocesses (renderer/utility/zygote) run under strict seccomp-bpf where
+        // Clang's atexit lprofSuspendSigKill -> prctl(PR_GET_PDEATHSIG) is blocked; exit directly.
+        ::_exit(exit_code);
     }
 
     std::error_code ec;

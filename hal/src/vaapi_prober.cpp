@@ -3,18 +3,85 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace explorer::hal {
+
+namespace {
+
+std::mutex g_va_cache_mu;
+std::string g_cached_node;
+VaCapabilities g_cached_caps;
+bool g_has_cached_caps = false;
+
+std::string vaCacheFilePath() {
+    if (const char* xdg = std::getenv("XDG_RUNTIME_DIR"); xdg && xdg[0]) {
+        return std::string(xdg) + "/explorer-vaapi.cache";
+    }
+    return "/tmp/explorer-vaapi-" + std::to_string(::getuid()) + ".cache";
+}
+
+long long driverMtimeKey() {
+    struct stat st{};
+    for (const char* drv : {"/usr/lib64/dri-freeworld/radeonsi_drv_video.so",
+                            "/usr/lib64/dri/radeonsi_drv_video.so",
+                            "/usr/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so",
+                            "/usr/lib64/dri/iHD_drv_video.so"}) {
+        if (::stat(drv, &st) == 0) {
+            return static_cast<long long>(st.st_mtim.tv_sec) ^
+                   (static_cast<long long>(st.st_size) << 16);
+        }
+    }
+    return 0;
+}
+
+}  // namespace
 
 VaCapabilities LibvaDrmProber::probe(const std::string& render_node) const {
     VaCapabilities caps;
     caps.render_node = render_node;
     if (isTuningDisabled() || render_node.empty()) {
         return caps;
+    }
+
+    // 1. In-process memoization (~20ns)
+    {
+        std::lock_guard<std::mutex> lock(g_va_cache_mu);
+        if (g_has_cached_caps && g_cached_node == render_node) {
+            return g_cached_caps;
+        }
+    }
+
+    // 2. Persistent tmpfs cache in XDG_RUNTIME_DIR (~15us vs ~120ms dlopen(radeonsi_drv_video.so + libLLVM.so))
+    const long long drv_key = driverMtimeKey();
+    const std::string cache_path = vaCacheFilePath();
+    if (drv_key != 0) {
+        std::ifstream in(cache_path);
+        std::string c_node;
+        long long c_key = 0;
+        int h264 = 0, hevc = 0, vp9 = 0, av1 = 0;
+        if (in >> c_node >> c_key >> h264 >> hevc >> vp9 >> av1) {
+            if (c_node == render_node && c_key == drv_key) {
+                caps.h264 = (h264 != 0);
+                caps.hevc = (hevc != 0);
+                caps.vp9 = (vp9 != 0);
+                caps.av1 = (av1 != 0);
+                std::lock_guard<std::mutex> lock(g_va_cache_mu);
+                g_cached_node = render_node;
+                g_cached_caps = caps;
+                g_has_cached_caps = true;
+                return caps;
+            }
+        }
     }
 
     // AMD Mesa requires O_RDWR on /dev/dri/renderD* so amdgpu_bo_cpu_map succeeds.
@@ -106,6 +173,29 @@ VaCapabilities LibvaDrmProber::probe(const std::string& render_node) const {
     ::dlclose(h_drm);
     ::dlclose(h_va);
     ::close(fd);
+
+    if (caps.h264 || caps.hevc || caps.vp9 || caps.av1) {
+        {
+            std::lock_guard<std::mutex> lock(g_va_cache_mu);
+            g_cached_node = render_node;
+            g_cached_caps = caps;
+            g_has_cached_caps = true;
+        }
+        if (drv_key != 0) {
+            std::string tmp_path = cache_path + ".tmp";
+            int cfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (cfd >= 0) {
+                char line[256];
+                int len = std::snprintf(line, sizeof(line), "%s %lld %d %d %d %d\n",
+                                        render_node.c_str(), drv_key,
+                                        caps.h264 ? 1 : 0, caps.hevc ? 1 : 0,
+                                        caps.vp9 ? 1 : 0, caps.av1 ? 1 : 0);
+                if (len > 0) (void)::write(cfd, line, static_cast<size_t>(len));
+                ::close(cfd);
+                (void)::rename(tmp_path.c_str(), cache_path.c_str());
+            }
+        }
+    }
     return caps;
 }
 

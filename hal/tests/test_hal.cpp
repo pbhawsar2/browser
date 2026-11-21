@@ -1,3 +1,4 @@
+#include "explorer/hal/display_refresh.hpp"
 #include "explorer/hal/gpu_isolator.hpp"
 #include "explorer/hal/power_governor.hpp"
 #include "explorer/hal/process_throttler.hpp"
@@ -64,6 +65,18 @@ int main() {
     LinuxPowerGovernor gov;
     CHECK(gov.applyTimerSlackNs(50'000UL));
     gov.shutdown();
+
+    // 6. System dark/light theme detector (XDG Desktop Portal + env override + watcher lifecycle).
+    MutterDisplayRefreshCtrl disp;
+    bool native_dark = disp.prefersDarkTheme();
+    std::cout << "[test_hal] native XDG portal prefersDarkTheme=" << native_dark << "\n";
+    ::setenv("EXPLORER_SYSTEM_THEME", "dark", 1);
+    CHECK(disp.prefersDarkTheme() == true);
+    ::setenv("EXPLORER_SYSTEM_THEME", "light", 1);
+    CHECK(disp.prefersDarkTheme() == false);
+    ::unsetenv("EXPLORER_SYSTEM_THEME");
+    disp.startThemeChangedWatcher([](bool) {});
+    disp.shutdown();
 
     std::cout << "[test_hal] ALL PASSED\n";
     return 0;

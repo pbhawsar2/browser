@@ -15,10 +15,12 @@ public:
     virtual void setEdpRefreshRateAsync(double target_hz) = 0;
     virtual void invalidateCache() = 0;
     virtual void startMonitorsChangedWatcher(std::function<void()> on_changed) = 0;
+    virtual bool prefersDarkTheme() const { return true; }
+    virtual void startThemeChangedWatcher(std::function<void(bool)> /*on_theme_changed*/) {}
     virtual void shutdown() = 0;
 };
 
-/// Async GNOME Mutter DisplayConfig controller via sd-bus (zero main-thread stalls).
+/// Async GNOME Mutter DisplayConfig + XDG Desktop Portal system theme controller via sd-bus (zero main-thread stalls).
 class MutterDisplayRefreshCtrl final : public IDisplayRefreshCtrl {
 public:
     MutterDisplayRefreshCtrl() = default;
@@ -27,15 +29,22 @@ public:
     void setEdpRefreshRateAsync(double target_hz) override;
     void invalidateCache() override;
     void startMonitorsChangedWatcher(std::function<void()> on_changed) override;
+    bool prefersDarkTheme() const override;
+    void startThemeChangedWatcher(std::function<void(bool)> on_theme_changed) override;
     void shutdown() override;
 
 private:
+    void ensureWatcherThreadLocked();
+
     std::mutex mu_;
     int desired_hz_ = -1;
     int applied_hz_ = -1;
     bool apply_in_flight_ = false;
     std::atomic<int64_t> last_self_apply_ms_{0};
     std::thread apply_thread_;
+    std::function<void()> monitors_cb_;
+    std::function<void(bool)> theme_cb_;
+    mutable std::atomic<int> cached_prefers_dark_{-1};
     std::atomic<bool> stop_watcher_{false};
     int wake_fd_ = -1;
     std::thread watcher_thread_;

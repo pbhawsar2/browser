@@ -81,6 +81,12 @@ public:
                              const std::string& username,
                              const std::string& password) override;
     void onTabCreated(uint64_t tab_id) override;
+    uint32_t onTabMediaPermissionRequested(uint64_t tab_id,
+                                           const std::string& requesting_origin,
+                                           uint32_t requested_permissions) override;
+    bool onTabPermissionPromptRequested(uint64_t tab_id,
+                                        const std::string& requesting_origin,
+                                        uint32_t requested_permissions) override;
     bool onTabDoClose(uint64_t tab_id) override;
     void onTabClosed(uint64_t tab_id) override;
 
@@ -101,6 +107,7 @@ public:
     std::string linuxAppId() const { return cfg_.app_id.empty() ? "explorer" : cfg_.app_id; }
 
     void onPowerSourceChangedFromThread(bool on_battery);
+    void onSystemThemeChanged(bool is_dark);
     void onFilterUpdateFinished(bool ok, size_t total_rules);
     void onWebAppInstallFinished(bool ok, std::string app_name);
     void onVaultRevealAuthFinished(bool ok, std::string origin, std::string username);
@@ -121,13 +128,17 @@ private:
         bool can_back = false;
         bool can_fwd = false;
         bool playing_media = false;
+        bool mic_active = false;
+        bool cam_active = false;
         CefRefPtr<explorer::engine::ExplorerCefClient> client;
         CefRefPtr<CefBrowserView> view;
     };
 
     void openNewTab(const std::string& url, bool activate);
     void activateTab(uint64_t tab_id);
+    void activateTabByIndex(size_t index);
     void closeTab(uint64_t tab_id);
+    void reopenClosedTab();
     void cycleTab(int delta);
     void pushChromeState();
     void pushChromeTelemetry();
@@ -139,6 +150,14 @@ private:
     void setFindBarVisible(bool visible);
     void setStatusBanner(const std::string& msg);
     void syncSystemPower();
+    bool isEffectiveDarkTheme() const;
+    std::string formatThemeModeLabel() const;
+    void syncColorScheme();
+    void syncCefContentSettingsForOrigin(const std::string& origin);
+    bool shouldSleepBackgroundModules() const;
+    void updateModuleSleepState();
+    void wakeSleepingModules(bool reveal_topbar = false);
+    void trimProcessMemoryAsync();
     void broadcastAutohideConfig();
     void requestTelemetrySampleAsync(bool full, bool from_tick);
     void reconcileRendererPriorities();
@@ -156,6 +175,9 @@ private:
     SessionStore session_store_;
     PrefsStore prefs_store_;
     UserPrefs prefs_;
+    SitePermissionsStore perms_store_;
+    std::unordered_map<std::string, SitePermissions> synced_cef_perms_;
+    bool system_prefers_dark_ = true;
     explorer::hal::TelemetrySnapshot last_snap_;
 
     CefRefPtr<CefWindow> window_;
@@ -169,6 +191,7 @@ private:
     CefRefPtr<CefOverlayController> hud_overlay_;
 
     std::vector<TabEntry> tabs_;
+    std::vector<std::string> closed_tab_urls_;
     std::unordered_map<uint64_t, TabEntry> retiring_tabs_;
     std::unordered_map<pid_t, bool> pending_pid_throttles_;
     std::vector<explorer::engine::DownloadRecord> downloads_;
@@ -176,6 +199,7 @@ private:
     bool webapps_cache_valid_ = false;
     std::optional<explorer::vault::Credential> pending_login_;
     std::string status_msg_;
+    std::string last_find_query_;
     std::string pending_hud_tab_;
     std::string active_hud_tab_ = "power";
     std::string last_chrome_sig_;
@@ -196,6 +220,8 @@ private:
     bool closing_ = false;
     bool telemetry_in_flight_ = false;
     bool telemetry_pending_full_ = false;
+    bool telemetry_sleeping_ = false;
+    bool mem_trim_in_flight_ = false;
     bool throttle_in_flight_ = false;
     bool session_dirty_ = false;
     bool session_flushed_on_close_ = false;

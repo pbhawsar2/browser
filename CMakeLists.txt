@@ -44,6 +44,7 @@ elseif(NOT "${EXPLORER_PGO_USE}" STREQUAL "" AND EXISTS "${EXPLORER_PGO_USE}")
         "-fprofile-use=${EXPLORER_PGO_USE}"
         "-Wno-profile-instr-out-of-date"
         "-Wno-profile-instr-unprofiled"
+        "-Wno-backend-plugin"
         "-flto=thin"
     )
     list(APPEND EXPLORER_LINK_FLAGS "-fprofile-use=${EXPLORER_PGO_USE}" "-flto=thin")

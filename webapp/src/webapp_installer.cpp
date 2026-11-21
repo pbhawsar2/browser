@@ -1,6 +1,7 @@
 #include "explorer/webapp/webapp_installer.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -52,9 +53,9 @@ bool isValidAppId(const std::string& app_id) {
     return true;
 }
 
-/// Escapes `%` as `%%` and quotes arguments containing spaces per FreeDesktop Exec= specification.
+/// Escapes `%` as `%%` and quotes arguments containing FreeDesktop Exec= reserved characters.
 std::string escapeDesktopExecArg(const std::string& s) {
-    bool needs_quote = (s.find_first_of(" \t\"\\") != std::string::npos);
+    bool needs_quote = (s.find_first_of(" \t\n\"'\\><~|&;$*?#()=`") != std::string::npos);
     std::string out;
     out.reserve(s.size() + 12);
     if (needs_quote) out.push_back('"');
@@ -143,21 +144,73 @@ std::string detectImageExtension(const fs::path& file_path) {
     return "";
 }
 
+/// Terminates any running WebApp processes matching `--app-id=<app_id>` owned by current user
+/// so open LevelDB/SQLite/Cache handles do not re-create files during data purge.
+void terminateRunningWebAppProcesses(const std::string& app_id) {
+    if (!isValidAppId(app_id)) return;
+    const std::string needle = "--app-id=" + app_id;
+    const uid_t my_uid = ::getuid();
+    const pid_t self_pid = ::getpid();
+    std::error_code ec;
+    std::vector<pid_t> matched_pids;
+
+    for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+        std::string dname = entry.path().filename().string();
+        if (dname.empty() || !std::all_of(dname.begin(), dname.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            continue;
+        }
+        pid_t pid = static_cast<pid_t>(std::atol(dname.c_str()));
+        if (pid <= 1 || pid == self_pid) continue;
+
+        struct stat st{};
+        if (::stat(entry.path().c_str(), &st) != 0 || st.st_uid != my_uid) continue;
+
+        std::ifstream cmd_in(entry.path() / "cmdline", std::ios::binary);
+        if (!cmd_in.is_open()) continue;
+        std::string raw((std::istreambuf_iterator<char>(cmd_in)), {});
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            size_t end = raw.find('\0', pos);
+            if (end == std::string::npos) end = raw.size();
+            if (raw.compare(pos, end - pos, needle) == 0) {
+                matched_pids.push_back(pid);
+                break;
+            }
+            pos = end + 1;
+        }
+    }
+
+    for (pid_t pid : matched_pids) {
+        ::kill(pid, SIGTERM);
+    }
+    if (!matched_pids.empty()) {
+        ::usleep(120'000);
+        for (pid_t pid : matched_pids) {
+            if (::kill(pid, 0) == 0) {
+                ::kill(pid, SIGKILL);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 std::string LinuxWebAppInstaller::makeAppId(const std::string& name, const std::string& url) {
-    std::size_t h = std::hash<std::string>{}(url);
+    std::string clean_name = sanitizeDesktopValue(name.empty() ? "Web App" : name);
+    std::size_t h = std::hash<std::string>{}(clean_name + "\n" + url);
     char hex[16];
     std::snprintf(hex, sizeof(hex), "%08x", static_cast<unsigned int>(h & 0xFFFFFFFFU));
-    return std::string(kPrefix) + slugify(name) + "-" + hex;
+    return std::string(kPrefix) + slugify(clean_name) + "-" + hex;
 }
 
 LinuxWebAppInstaller::LinuxWebAppInstaller(fs::path apps_dir,
                                            fs::path icons_dir,
-                                           fs::path browser_bin)
+                                           fs::path browser_bin,
+                                           fs::path webapps_data_dir)
     : apps_dir_(std::move(apps_dir)),
       icons_dir_(std::move(icons_dir)),
-      browser_bin_(std::move(browser_bin)) {}
+      browser_bin_(std::move(browser_bin)),
+      webapps_data_dir_(std::move(webapps_data_dir)) {}
 
 InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
                                               const std::string& url,
@@ -251,8 +304,8 @@ InstalledWebApp LinuxWebAppInstaller::install(const std::string& name,
             << "Name=" << clean_name << "\n"
             << "Comment=" << clean_name << " (Explorer Web App)\n"
             << "Exec=" << escapeDesktopExecArg(browser_bin_.string())
-            << " --app=" << escapeDesktopExecArg(clean_url)
-            << " --app-id=" << app_id << "\n"
+            << " " << escapeDesktopExecArg("--app=" + clean_url)
+            << " " << escapeDesktopExecArg("--app-id=" + app_id) << "\n"
             << "Icon=" << icon_name << "\n"
             << "Terminal=false\n"
             << "Categories=Network;WebBrowser;\n"
@@ -301,11 +354,37 @@ std::vector<InstalledWebApp> LinuxWebAppInstaller::listInstalled() const {
 bool LinuxWebAppInstaller::uninstall(const std::string& app_id) const {
     // Strictly reject any path traversal (e.g., explorer-app-../../foo).
     if (!isValidAppId(app_id)) return false;
+
+    // 1. Terminate any running instance of this WebApp so open DB/cache files close cleanly.
+    terminateRunningWebAppProcesses(app_id);
+
     std::error_code ec;
     bool removed = fs::remove(apps_dir_ / (app_id + ".desktop"), ec);
     for (const char* sz : {"256x256", "128x128", "64x64", "48x48"}) {
         fs::remove(icons_dir_ / sz / "apps" / (app_id + ".png"), ec);
     }
+
+    // 2. Purge 100% of isolated WebApp data (caches, cookies, IndexedDB, localStorage, sign-ins, vault, prefs).
+    std::vector<fs::path> data_dirs;
+    if (!webapps_data_dir_.empty()) {
+        data_dirs.push_back(webapps_data_dir_ / app_id);
+    }
+    if (const char* env_prof = std::getenv("EXPLORER_PROFILE_DIR"); env_prof && env_prof[0]) {
+        data_dirs.push_back(fs::path(env_prof) / "webapps" / app_id);
+    }
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0]) {
+        data_dirs.push_back(fs::path(xdg) / "explorer" / "webapps" / app_id);
+    } else if (const char* home = std::getenv("HOME"); home && home[0]) {
+        data_dirs.push_back(fs::path(home) / ".local" / "share" / "explorer" / "webapps" / app_id);
+    }
+
+    for (const auto& d : data_dirs) {
+        if (fs::exists(d, ec)) {
+            auto count = fs::remove_all(d, ec);
+            if (count > 0) removed = true;
+        }
+    }
+
     if (removed) {
         runProcessNoShell({"gtk-update-icon-cache", "-f", "-t", icons_dir_.string()});
         runProcessNoShell({"update-desktop-database", apps_dir_.string()});

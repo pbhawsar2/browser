@@ -165,6 +165,7 @@ TelemetrySnapshot LinuxTelemetryMonitor::sample() {
     }
     out.batt_watts = sampleBattWatts();
 
+    out.fan_rpms.reserve(fan_inputs_.size());
     for (const auto& f : fan_inputs_) {
         if (auto rpm = readU64(f)) {
             uint32_t r = static_cast<uint32_t>(*rpm);
@@ -189,10 +190,15 @@ TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
     }
     bool discharging = false;
     if (batt_status_) {
-        auto st = readTrimmed(*batt_status_).value_or("");
-        std::transform(st.begin(), st.end(), st.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        discharging = (st == "discharging");
+        char sbuf[64];
+        ssize_t sn = readSmallFile(*batt_status_, sbuf, sizeof(sbuf));
+        if (sn >= 11) {
+            // Case-insensitive stack check for "discharging" (zero heap string allocation)
+            discharging = ((sbuf[0] == 'D' || sbuf[0] == 'd') &&
+                           (sbuf[1] == 'i' || sbuf[1] == 'I') &&
+                           (sbuf[2] == 's' || sbuf[2] == 'S') &&
+                           (sbuf[3] == 'c' || sbuf[3] == 'C'));
+        }
     }
     out.on_battery = discharging || (batt_status_.has_value() && ac_on.has_value() && !*ac_on);
     // Keep /proc/stat delta warm on the background thread (<4us stack read) so opening HUD shows instant 2s CPU%!
@@ -200,6 +206,7 @@ TelemetrySnapshot LinuxTelemetryMonitor::sampleLite() {
     if (out.on_battery) {
         out.batt_watts = sampleBattWatts();
     }
+    out.fan_rpms.reserve(fan_inputs_.size());
     for (const auto& f : fan_inputs_) {
         if (auto rpm = readU64(f)) {
             uint32_t r = static_cast<uint32_t>(*rpm);

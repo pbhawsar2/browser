@@ -10,8 +10,10 @@
 #     3. 2-Stage Clang Profile-Guided Optimization (PGO) + ThinLTO C++20 build:
 #          - Stage 1 (when training or if pgo/explorer.profdata is missing):
 #            Compiles with `-fprofile-generate`, runs `pgo/train_pgo.py` across
-#            all 6 unit test suites + live heavy websites (robu.in, amazon.in,
-#            youtube.com) with scrolling, zooming, HUD, Vault, and video decode,
+#            all 6 unit test suites + 50 well-known large global websites
+#            (wikipedia.org, github.com, amazon.in, gemini.google.com, youtube.com,
+#            netflix.com, primevideo.com, bbc.com, stackoverflow.com, etc.) with
+#            scrolling, zooming, HUD, Vault, permissions, WebApps, and video decode,
 #            and merges `.profraw` counters into `pgo/explorer.profdata` via
 #            `llvm-profdata`.
 #          - Stage 2 (Production Binary):
@@ -97,7 +99,7 @@ if [[ "$USE_PGO" -eq 1 ]] && command -v llvm-profdata >/dev/null 2>&1; then
         # Stage instrumented binary next to libcef.so so CEF resources resolve during live training
         install -p -m 755 "$BUILD_DIR/explorer" "$CEF_DIR/Release/explorer"
 
-        echo "=== Explorer PGO Stage 1b: Running Heavy Workload Trainer (robu.in / amazon.in / youtube.com / HUD / Zoom / Video) ==="
+        echo "=== Explorer PGO Stage 1b: Running 50-Site Heavy Workload & Stress Trainer (Wikipedia / GitHub / Gemini / Amazon / YouTube / OTT / HUD / WebApps) ==="
         LLVM_PROFILE_FILE="${PGO_RAW_DIR}/explorer-%p-%m.profraw" \
             python3 "$SCRIPT_DIR/pgo/train_pgo.py" \
                 --binary "$CEF_DIR/Release/explorer" \

@@ -30,7 +30,8 @@ class LinuxWebAppInstaller final : public IWebAppInstaller {
 public:
     LinuxWebAppInstaller(std::filesystem::path apps_dir,
                          std::filesystem::path icons_dir,
-                         std::filesystem::path browser_bin);
+                         std::filesystem::path browser_bin,
+                         std::filesystem::path webapps_data_dir = {});
 
     InstalledWebApp install(const std::string& name,
                             const std::string& url,
@@ -45,6 +46,7 @@ private:
     std::filesystem::path apps_dir_;
     std::filesystem::path icons_dir_;
     std::filesystem::path browser_bin_;
+    std::filesystem::path webapps_data_dir_;
 };
 
 }  // namespace explorer::webapp

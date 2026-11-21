@@ -10,6 +10,7 @@
 #include "include/cef_cookie.h"
 #include "include/cef_image.h"
 #include "include/cef_parser.h"
+#include "include/cef_request_context.h"
 #include "include/views/cef_box_layout.h"
 #include "include/views/cef_fill_layout.h"
 #include "include/views/cef_window_delegate.h"
@@ -17,6 +18,7 @@
 #include "include/wrapper/cef_helpers.h"
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <pwd.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -33,6 +35,7 @@ extern char** environ;
 #include <fstream>
 #include <functional>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 
@@ -56,10 +59,25 @@ constexpr int kAccelZoomReset = 113;
 constexpr int kAccelFullscreen = 114;
 constexpr int kAccelDevTools = 115;
 constexpr int kAccelQuit = 116;
+constexpr int kAccelReopenTab = 117;
+constexpr int kAccelFindNext = 118;
+constexpr int kAccelFindPrev = 119;
+constexpr int kAccelHome = 120;
+constexpr int kAccelMute = 121;
+constexpr int kAccelDownloads = 122;
+constexpr int kAccelSiteSettings = 123;
+constexpr int kAccelTab1 = 131;
+constexpr int kAccelTab2 = 132;
+constexpr int kAccelTab3 = 133;
+constexpr int kAccelTab4 = 134;
+constexpr int kAccelTab5 = 135;
+constexpr int kAccelTab6 = 136;
+constexpr int kAccelTab7 = 137;
+constexpr int kAccelTab8 = 138;
+constexpr int kAccelTabLast = 139;
 
-std::string jsonEscape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
+/// Appends JSON-escaped string directly into a pre-reserved buffer (zero temporary std::string allocations).
+void appendJsonEscaped(std::string& out, std::string_view s) {
     for (size_t i = 0; i < s.size(); ++i) {
         unsigned char c = static_cast<unsigned char>(s[i]);
         switch (c) {
@@ -84,6 +102,12 @@ std::string jsonEscape(const std::string& s) {
                 }
         }
     }
+}
+
+std::string jsonEscape(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    appendJsonEscaped(out, s);
     return out;
 }
 
@@ -119,6 +143,16 @@ private:
     std::shared_ptr<std::atomic<bool>> token_;
     std::function<void()> fn_;
     IMPLEMENT_REFCOUNTING(GuardedUiTask);
+};
+
+/// Non-null CefCompletionCallback for CEF 158 ClearHttpCache / ClearHttpAuthCredentials
+/// (CEF 158 binds &CefCompletionCallback::OnComplete unconditionally inside its Mojo reply callback).
+class NoopCompletionCallback : public CefCompletionCallback {
+public:
+    void OnComplete() override {}
+
+private:
+    IMPLEMENT_REFCOUNTING(NoopCompletionCallback);
 };
 
 void spawnDetachedXdgOpen(const std::string& target) {
@@ -336,9 +370,13 @@ BrowserWindow::BrowserWindow(WindowLaunchConfig cfg, RuntimeServices services)
       power_policy_(services_.hw.on_battery),
       session_store_(cfg_.profile_dir / "session.json"),
       prefs_store_(cfg_.profile_dir / "prefs.json"),
-      prefs_(prefs_store_.load()) {
+      prefs_(prefs_store_.load()),
+      perms_store_(cfg_.profile_dir / "permissions.json") {
     if (services_.shield) {
         services_.shield->setEnabled(prefs_.adblock_enabled);
+    }
+    if (services_.display_ctrl) {
+        system_prefers_dark_ = services_.display_ctrl->prefersDarkTheme();
     }
 }
 
@@ -362,10 +400,8 @@ BrowserWindow::~BrowserWindow() {
 
 void BrowserWindow::show() {
     CEF_REQUIRE_UI_THREAD();
-    // Normal browser: frameless obsidian CSD.
-    // Standalone --app= mode: native minimal desktop window with ZERO browser chrome (100% pure app look & feel!).
-    const bool frameless = cfg_.app_mode_url.empty();
-    CefWindow::CreateTopLevelWindow(new FramelessWindowDelegate(this, frameless));
+    // Both normal browser and installed WebApps use the unified Frameless Obsidian CSD UI.
+    CefWindow::CreateTopLevelWindow(new FramelessWindowDelegate(this, true));
 }
 
 void BrowserWindow::openExternalUrls(const std::vector<std::string>& urls) {
@@ -386,7 +422,7 @@ void BrowserWindow::activateWindow() {
 }
 
 int BrowserWindow::desiredChromeHeight() const {
-    if (!cfg_.app_mode_url.empty() || html_fullscreen_) return 0;
+    if (html_fullscreen_) return 0;
     if (scroll_hidden_ && !hud_visible_ && !find_visible_) return 0;
     int h = theme::kTopBezelHeight;
     if (tabs_.size() > 1) h += theme::kTabBarHeight;
@@ -407,17 +443,41 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
 
     // Global native window accelerators (work regardless of focus & in --app= mode too).
     window_->SetAccelerator(kAccelNewTab, 'T', false, true, false, false);
+    window_->SetAccelerator(kAccelNewTab, 'N', false, true, false, false);
+    window_->SetAccelerator(kAccelReopenTab, 'T', true, true, false, false);
     window_->SetAccelerator(kAccelCloseTab, 'W', false, true, false, false);
+    window_->SetAccelerator(kAccelCloseTab, 0x73, false, true, false, false);
     window_->SetAccelerator(kAccelNextTab, 0x09, false, true, false, false);
     window_->SetAccelerator(kAccelPrevTab, 0x09, true, true, false, false);
+    window_->SetAccelerator(kAccelPrevTab, 0x21, false, true, false, false);
+    window_->SetAccelerator(kAccelNextTab, 0x22, false, true, false, false);
+    window_->SetAccelerator(kAccelTab1, '1', false, true, false, false);
+    window_->SetAccelerator(kAccelTab2, '2', false, true, false, false);
+    window_->SetAccelerator(kAccelTab3, '3', false, true, false, false);
+    window_->SetAccelerator(kAccelTab4, '4', false, true, false, false);
+    window_->SetAccelerator(kAccelTab5, '5', false, true, false, false);
+    window_->SetAccelerator(kAccelTab6, '6', false, true, false, false);
+    window_->SetAccelerator(kAccelTab7, '7', false, true, false, false);
+    window_->SetAccelerator(kAccelTab8, '8', false, true, false, false);
+    window_->SetAccelerator(kAccelTabLast, '9', false, true, false, false);
     window_->SetAccelerator(kAccelFocusOmnibar, 'L', false, true, false, false);
     window_->SetAccelerator(kAccelFocusOmnibar, 'D', false, false, true, false);
+    window_->SetAccelerator(kAccelFocusOmnibar, 0x75, false, false, false, false);
     window_->SetAccelerator(kAccelFind, 'F', false, true, false, false);
+    window_->SetAccelerator(kAccelFindNext, 'G', false, true, false, false);
+    window_->SetAccelerator(kAccelFindPrev, 'G', true, true, false, false);
+    window_->SetAccelerator(kAccelFindNext, 0x72, false, false, false, false);
+    window_->SetAccelerator(kAccelFindPrev, 0x72, true, false, false, false);
     window_->SetAccelerator(kAccelReload, 'R', false, true, false, false);
     window_->SetAccelerator(kAccelHardReload, 'R', true, true, false, false);
     window_->SetAccelerator(kAccelReload, 0x74, false, false, false, false);
+    window_->SetAccelerator(kAccelHardReload, 0x74, true, false, false, false);
     window_->SetAccelerator(kAccelBack, 0x25, false, false, true, false);
     window_->SetAccelerator(kAccelForward, 0x27, false, false, true, false);
+    window_->SetAccelerator(kAccelHome, 0x24, false, false, true, false);
+    window_->SetAccelerator(kAccelMute, 'M', false, true, false, false);
+    window_->SetAccelerator(kAccelDownloads, 'J', false, true, false, false);
+    window_->SetAccelerator(kAccelSiteSettings, 0x2E, true, true, false, false);
     window_->SetAccelerator(kAccelZoomIn, 0xBB, false, true, false, false);
     window_->SetAccelerator(kAccelZoomIn, 0xBB, true, true, false, false);
     window_->SetAccelerator(kAccelZoomIn, 0x6B, false, true, false, false);
@@ -439,15 +499,13 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
 
     const bool is_app_mode = !cfg_.app_mode_url.empty();
 
-    if (!is_app_mode) {
-        CefBrowserSettings chrome_settings;
-        chrome_settings.background_color = theme::kBgBezel;
-        chrome_client_ = new ChromeUiClient(this, false);
-        chrome_view_ = CefBrowserView::CreateBrowserView(
-            chrome_client_, topChromeHtmlDataUrl(), chrome_settings,
-            makeTrustedChromeExtraInfo(), nullptr, new TopChromeViewDelegate(this));
-        root_panel_->AddChildView(chrome_view_);
-    }
+    CefBrowserSettings chrome_settings;
+    chrome_settings.background_color = theme::kBgBezel;
+    chrome_client_ = new ChromeUiClient(this, false);
+    chrome_view_ = CefBrowserView::CreateBrowserView(
+        chrome_client_, topChromeHtmlDataUrl(), chrome_settings,
+        makeTrustedChromeExtraInfo(), nullptr, new TopChromeViewDelegate(this));
+    root_panel_->AddChildView(chrome_view_);
 
     content_panel_ = CefPanel::CreatePanel(nullptr);
     content_panel_->SetBackgroundColor(theme::kBgCanvas);
@@ -456,6 +514,9 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
     root_layout->SetFlexForView(content_panel_, 1);
 
     window_->AddChildView(root_panel_);
+
+    // Apply initial system/user color scheme before opening tabs.
+    syncColorScheme();
 
     // Control Panel HUD (hud_view_ / hud_overlay_) is created LAZILY on first open:
     // saves 1 Chromium renderer process + ~40-50 MiB RAM + ~40ms cold startup time!
@@ -503,12 +564,16 @@ void BrowserWindow::handleWindowCreated(CefRefPtr<CefWindow> window) {
                 CefPostTask(TID_UI, new GuardedUiTask(tok, [this]() { syncSystemPower(); }));
             }
         });
+        services_.display_ctrl->startThemeChangedWatcher([this, tok](bool is_dark) {
+            if (tok->load()) {
+                CefPostTask(TID_UI, new GuardedUiTask(tok, [this, is_dark]() {
+                    onSystemThemeChanged(is_dark);
+                }));
+            }
+        });
     }
 
-    // Skip periodic telemetry polling in pure chromeless --app= mode (zero bezel/HUD).
-    if (!is_app_mode) {
-        CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 2000);
-    }
+    CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 2000);
 }
 
 void BrowserWindow::handleWindowDestroyed() {
@@ -594,14 +659,30 @@ bool BrowserWindow::handleAccelerator(int command_id) {
     switch (command_id) {
         case kAccelNewTab: onTabShortcut(A::NewTab); return true;
         case kAccelCloseTab: onTabShortcut(A::CloseTab); return true;
+        case kAccelReopenTab: onTabShortcut(A::ReopenClosedTab); return true;
         case kAccelNextTab: onTabShortcut(A::NextTab); return true;
         case kAccelPrevTab: onTabShortcut(A::PrevTab); return true;
+        case kAccelTab1: onTabShortcut(A::SelectTab1); return true;
+        case kAccelTab2: onTabShortcut(A::SelectTab2); return true;
+        case kAccelTab3: onTabShortcut(A::SelectTab3); return true;
+        case kAccelTab4: onTabShortcut(A::SelectTab4); return true;
+        case kAccelTab5: onTabShortcut(A::SelectTab5); return true;
+        case kAccelTab6: onTabShortcut(A::SelectTab6); return true;
+        case kAccelTab7: onTabShortcut(A::SelectTab7); return true;
+        case kAccelTab8: onTabShortcut(A::SelectTab8); return true;
+        case kAccelTabLast: onTabShortcut(A::SelectLastTab); return true;
         case kAccelFocusOmnibar: onTabShortcut(A::FocusOmnibar); return true;
         case kAccelFind: onTabShortcut(A::FindInPage); return true;
+        case kAccelFindNext: onTabShortcut(A::FindNext); return true;
+        case kAccelFindPrev: onTabShortcut(A::FindPrev); return true;
         case kAccelReload: onTabShortcut(A::Reload); return true;
         case kAccelHardReload: onTabShortcut(A::HardReload); return true;
         case kAccelBack: onTabShortcut(A::GoBack); return true;
         case kAccelForward: onTabShortcut(A::GoForward); return true;
+        case kAccelHome: onTabShortcut(A::GoHome); return true;
+        case kAccelMute: onTabShortcut(A::ToggleMute); return true;
+        case kAccelDownloads: onTabShortcut(A::OpenDownloads); return true;
+        case kAccelSiteSettings: onTabShortcut(A::OpenSiteSettings); return true;
         case kAccelZoomIn: onTabShortcut(A::ZoomIn); return true;
         case kAccelZoomOut: onTabShortcut(A::ZoomOut); return true;
         case kAccelZoomReset: onTabShortcut(A::ZoomReset); return true;
@@ -631,6 +712,11 @@ void BrowserWindow::openNewTab(const std::string& url, bool activate) {
     entry.zoom_factor = cfg_.default_zoom;
     entry.client = client;
     entry.view = bview;
+
+    std::string init_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(url);
+    if (!init_origin.empty()) {
+        syncCefContentSettingsForOrigin(init_origin);
+    }
 
     bview->SetVisible(false);
     content_panel_->AddChildView(bview);
@@ -668,7 +754,23 @@ void BrowserWindow::activateTab(uint64_t tab_id) {
     updateChromeLayout();
     pushChromeState();
     reconcileRendererPriorities();
+    updateModuleSleepState();
     scheduleSessionSave();
+}
+
+void BrowserWindow::activateTabByIndex(size_t index) {
+    CEF_REQUIRE_UI_THREAD();
+    if (tabs_.empty()) return;
+    size_t bounded = std::min(index, tabs_.size() - 1);
+    activateTab(tabs_[bounded].id);
+}
+
+void BrowserWindow::reopenClosedTab() {
+    CEF_REQUIRE_UI_THREAD();
+    if (closed_tab_urls_.empty()) return;
+    std::string url = std::move(closed_tab_urls_.back());
+    closed_tab_urls_.pop_back();
+    openNewTab(url, true);
 }
 
 void BrowserWindow::closeTab(uint64_t tab_id) {
@@ -681,6 +783,13 @@ void BrowserWindow::closeTab(uint64_t tab_id) {
     if (tabs_.size() == 1) {
         if (window_ && !window_->IsClosed()) window_->Close();
         return;
+    }
+
+    if (!it->url.empty() && it->url.rfind("data:", 0) != 0) {
+        closed_tab_urls_.push_back(it->url);
+        if (closed_tab_urls_.size() > 16) {
+            closed_tab_urls_.erase(closed_tab_urls_.begin());
+        }
     }
 
     const size_t idx = static_cast<size_t>(std::distance(tabs_.begin(), it));
@@ -714,6 +823,7 @@ void BrowserWindow::closeTab(uint64_t tab_id) {
     } else {
         finishRetireTab(tab_id);
     }
+    trimProcessMemoryAsync();
 }
 
 void BrowserWindow::finishRetireTab(uint64_t tab_id) {
@@ -751,7 +861,7 @@ void BrowserWindow::updateChromeLayout(bool force) {
 
 void BrowserWindow::ensureHudCreated() {
     CEF_REQUIRE_UI_THREAD();
-    if (hud_overlay_ || !window_ || !cfg_.app_mode_url.empty()) return;
+    if (hud_overlay_ || !window_) return;
 
     CefBrowserSettings hud_settings;
     hud_settings.background_color = CefColorSetARGB(255, 14, 21, 36);
@@ -794,13 +904,21 @@ void BrowserWindow::setHudVisible(bool visible, const std::string& tab) {
         }
         if (hud_view_) hud_view_->RequestFocus();
     } else if (changed) {
-        if (hud_ready_ && hud_view_ && hud_view_->GetBrowser()) {
+        cached_webapps_.clear();
+        cached_webapps_.shrink_to_fit();
+        webapps_cache_valid_ = false;
+        if (hud_ready_ && hud_view_ && hud_view_->GetBrowser() && hud_view_->GetBrowser()->GetMainFrame()) {
             hud_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
                 "if(typeof clearRevealedPasswords==='function')clearRevealedPasswords();"
-                "if(typeof cancelVaultAuth==='function')cancelVaultAuth();",
+                "if(typeof cancelVaultAuth==='function')cancelVaultAuth();"
+                "window.__lastHudData=null;",
                 "explorer://hud", 0);
+            hud_view_->GetBrowser()->GetMainFrame()->SendProcessMessage(
+                PID_RENDERER, CefProcessMessage::Create("explorer.deep-sleep"));
         }
         if (auto* t = activeTabEntry(); t && t->view) t->view->RequestFocus();
+        updateModuleSleepState();
+        trimProcessMemoryAsync();
     }
 }
 
@@ -827,7 +945,7 @@ void BrowserWindow::setFindBarVisible(bool visible) {
 
 void BrowserWindow::setStatusBanner(const std::string& msg) {
     status_msg_ = msg;
-    if (hud_visible_) pushHudState(last_snap_);
+    if (hud_ready_) pushHudState(last_snap_);
 }
 
 void BrowserWindow::pushChromeState() {
@@ -872,40 +990,69 @@ void BrowserWindow::pushChromeState() {
 
     bool adblock_on = services_.shield ? services_.shield->isEnabled() : false;
     uint64_t blocked = services_.shield ? services_.shield->blockedCount() : 0;
-
-    std::ostringstream js;
-    js << "window.__updateChrome({"
-       << "\"url\":\"" << jsonEscape(shown_url) << "\","
-       << "\"canBack\":" << (can_back ? "true" : "false") << ","
-       << "\"canFwd\":" << (can_fwd ? "true" : "false") << ","
-       << "\"loading\":" << (loading ? "true" : "false") << ","
-       << "\"progress\":" << progress << ","
-       << "\"zoomPct\":" << zoom_pct << ","
-       << "\"adblockOn\":" << (adblock_on ? "true" : "false") << ","
-       << "\"blocked\":" << blocked << ","
-       << "\"siteCreds\":" << site_creds << ","
-       << "\"hasPendingLogin\":" << (pending_login_.has_value() ? "true" : "false") << ","
-       << "\"activeDownloads\":" << active_dls << ","
-       << "\"batteryMode\":" << (power_policy_.isBatteryMode() ? "true" : "false") << ","
-       << "\"pillText\":\"" << jsonEscape(power_policy_.formatPillText(last_snap_)) << "\","
-       << "\"findVisible\":" << (find_visible_ ? "true" : "false") << ","
-       << "\"tabs\":[";
-    for (size_t i = 0; i < tabs_.size(); ++i) {
-        if (i > 0) js << ",";
-        js << "{\"id\":" << tabs_[i].id
-           << ",\"title\":\"" << jsonEscape(tabs_[i].title) << "\""
-           << ",\"favicon\":\"" << jsonEscape(tabs_[i].favicon) << "\""
-           << ",\"active\":" << (tabs_[i].id == active_tab_id_ ? "true" : "false") << "}";
+    std::string media_access;
+    if (active) {
+        if (active->mic_active && active->cam_active) media_access = "Mic · Cam";
+        else if (active->mic_active) media_access = "Mic";
+        else if (active->cam_active) media_access = "Cam";
     }
-    js << "]});";
-    std::string payload = js.str();
+
+    // Single pre-reserved string builder eliminates std::ostringstream + 15 temporary jsonEscape heap allocations!
+    std::string payload;
+    payload.reserve(512 + tabs_.size() * 160);
+    payload += "window.__updateChrome({\"url\":\"";
+    appendJsonEscaped(payload, shown_url);
+    payload += "\",\"canBack\":";
+    payload += (can_back ? "true" : "false");
+    payload += ",\"canFwd\":";
+    payload += (can_fwd ? "true" : "false");
+    payload += ",\"loading\":";
+    payload += (loading ? "true" : "false");
+    {
+        char num_buf[192];
+        std::snprintf(num_buf, sizeof(num_buf),
+                      ",\"progress\":%.3f,\"zoomPct\":%d,\"darkTheme\":%s,\"mediaAccess\":\"",
+                      progress, zoom_pct, isEffectiveDarkTheme() ? "true" : "false");
+        payload += num_buf;
+    }
+    appendJsonEscaped(payload, media_access);
+    {
+        char num_buf[256];
+        std::snprintf(num_buf, sizeof(num_buf),
+                      "\",\"adblockOn\":%s,\"blocked\":%llu,\"siteCreds\":%zu,"
+                      "\"hasPendingLogin\":%s,\"activeDownloads\":%d,\"batteryMode\":%s,\"pillText\":\"",
+                      adblock_on ? "true" : "false",
+                      static_cast<unsigned long long>(blocked),
+                      site_creds,
+                      pending_login_.has_value() ? "true" : "false",
+                      active_dls,
+                      power_policy_.isBatteryMode() ? "true" : "false");
+        payload += num_buf;
+    }
+    appendJsonEscaped(payload, power_policy_.formatPillText(last_snap_));
+    payload += "\",\"findVisible\":";
+    payload += (find_visible_ ? "true" : "false");
+    payload += ",\"tabs\":[";
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+        if (i > 0) payload.push_back(',');
+        char id_buf[48];
+        std::snprintf(id_buf, sizeof(id_buf), "{\"id\":%llu,\"title\":\"",
+                      static_cast<unsigned long long>(tabs_[i].id));
+        payload += id_buf;
+        appendJsonEscaped(payload, tabs_[i].title);
+        payload += "\",\"favicon\":\"";
+        appendJsonEscaped(payload, tabs_[i].favicon);
+        payload += "\",\"active\":";
+        payload += (tabs_[i].id == active_tab_id_ ? "true}" : "false}");
+    }
+    payload += "]});";
     if (payload == last_chrome_sig_) return;  // Zero redundant Chrome JS IPC when state is unchanged!
     last_chrome_sig_ = std::move(payload);
     chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(last_chrome_sig_, "explorer://chrome", 0);
 }
 
 void BrowserWindow::pushChromeTelemetry() {
-    if (!chrome_ready_ || !chrome_view_ || !chrome_view_->GetBrowser()) return;
+    if (!chrome_ready_ || !chrome_view_ || !chrome_view_->GetBrowser() || desiredChromeHeight() == 0) return;
     bool adblock_on = services_.shield ? services_.shield->isEnabled() : false;
     uint64_t blocked = services_.shield ? services_.shield->blockedCount() : 0;
     std::string pill = power_policy_.formatPillText(last_snap_);
@@ -915,25 +1062,28 @@ void BrowserWindow::pushChromeTelemetry() {
     if (sig == last_telemetry_sig_) return;  // Zero idle JS IPC when nothing changed!
     last_telemetry_sig_ = std::move(sig);
 
-    std::ostringstream js;
-    js << "window.__updateTelemetry("
-       << (batt ? "true" : "false") << ",\""
-       << jsonEscape(pill) << "\","
-       << (adblock_on ? "true" : "false") << ","
-       << blocked << ");";
-    chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js.str(), "explorer://chrome-telemetry", 0);
+    std::string js;
+    js.reserve(128);
+    js += "window.__updateTelemetry(";
+    js += (batt ? "true,\"" : "false,\"");
+    appendJsonEscaped(js, pill);
+    js += (adblock_on ? "\",true," : "\",false,");
+    js += std::to_string(blocked);
+    js += ");";
+    chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js, "explorer://chrome-telemetry", 0);
 }
 
 void BrowserWindow::pushChromeProgress(bool loading, double progress) {
-    if (!chrome_ready_ || !chrome_view_ || !chrome_view_->GetBrowser()) return;
+    if (!chrome_ready_ || !chrome_view_ || !chrome_view_->GetBrowser() || desiredChromeHeight() == 0) return;
     if (loading && progress > 0.05 && progress < 0.99 &&
         std::abs(progress - last_pushed_progress_) < 0.05) {
         return;
     }
     last_pushed_progress_ = loading ? progress : -1.0;
-    std::ostringstream js;
-    js << "window.__updateProgress(" << (loading ? "true" : "false") << "," << progress << ");";
-    chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js.str(), "explorer://chrome-progress", 0);
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "window.__updateProgress(%s,%.3f);",
+                  loading ? "true" : "false", progress);
+    chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript(buf, "explorer://chrome-progress", 0);
 }
 
 void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
@@ -1003,9 +1153,24 @@ void BrowserWindow::pushHudState(const explorer::hal::TelemetrySnapshot& snap) {
     bool adblock_on = services_.shield ? services_.shield->isEnabled() : false;
     uint64_t blocked = services_.shield ? services_.shield->blockedCount() : 0;
     size_t rules = services_.shield ? services_.shield->ruleCount() : 0;
+    SitePermissions sp = perms_store_.getForOrigin(cur_origin.empty() ? "*" : cur_origin);
 
     std::ostringstream js;
     js << "window.__updateHud({"
+       << "\"darkTheme\":" << (isEffectiveDarkTheme() ? "true" : "false") << ","
+       << "\"themeMode\":\"" << jsonEscape(prefs_.theme_mode) << "\","
+       << "\"themeLabel\":\"" << jsonEscape(formatThemeModeLabel()) << "\","
+       << "\"saveCookies\":" << (prefs_.save_cookies ? "true" : "false") << ","
+       << "\"sitePerms\":{"
+       << "\"mic\":" << (sp.microphone ? "true" : "false") << ","
+       << "\"camera\":" << (sp.camera ? "true" : "false") << ","
+       << "\"location\":" << (sp.location ? "true" : "false") << ","
+       << "\"notifications\":" << (sp.notifications ? "true" : "false") << ","
+       << "\"clipboard\":" << (sp.clipboard ? "true" : "false") << ","
+       << "\"screen\":" << (sp.screen_capture ? "true" : "false") << ","
+       << "\"storage\":" << (sp.storage ? "true" : "false") << ","
+       << "\"sound\":" << (sp.sound ? "true" : "false") << ","
+       << "\"popups\":" << (sp.popups ? "true" : "false") << "},"
        << "\"adblockOn\":" << (adblock_on ? "true" : "false") << ","
        << "\"autohide\":" << (prefs_.autohide_topbar ? "true" : "false") << ","
        << "\"batteryMode\":" << (power_policy_.isBatteryMode() ? "true" : "false") << ","
@@ -1159,6 +1324,55 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
         power_policy_.setCinema60Hz(!power_policy_.cinema60Hz());
         syncSystemPower();
         pushHudState(last_snap_);
+    } else if (cmd == "cycle_theme" || cmd == "set_theme") {
+        if (cmd == "set_theme" && (arg == "system" || arg == "dark" || arg == "light")) {
+            prefs_.theme_mode = arg;
+        } else {
+            if (prefs_.theme_mode == "system") prefs_.theme_mode = "dark";
+            else if (prefs_.theme_mode == "dark") prefs_.theme_mode = "light";
+            else prefs_.theme_mode = "system";
+        }
+        prefs_store_.save(prefs_);
+        syncColorScheme();
+        pushChromeState();
+        setStatusBanner("Theme set to " + formatThemeModeLabel());
+    } else if (cmd == "toggle_perm") {
+        std::string cur_origin = (t && !t->url.empty())
+                                     ? explorer::vault::AesGcmPasswordVault::normalizeOrigin(t->url)
+                                     : "";
+        std::string target_key = cur_origin.empty() ? "*" : cur_origin;
+        bool allowed = perms_store_.togglePermission(target_key, arg);
+        synced_cef_perms_.erase(target_key);
+        syncCefContentSettingsForOrigin(target_key);
+        if (arg == "sound" && b && b->GetHost()) {
+            b->GetHost()->SetAudioMuted(!allowed);
+        }
+        if ((arg == "microphone" || arg == "mic") && !allowed && t) {
+            t->mic_active = false;
+        }
+        if (arg == "camera" && !allowed && t) {
+            t->cam_active = false;
+        }
+        pushChromeState();
+        setStatusBanner(std::string(allowed ? "Allowed " : "Blocked ") + arg +
+                        " for " + (cur_origin.empty() ? "all sites" : cur_origin));
+    } else if (cmd == "reset_site_perms") {
+        std::string cur_origin = (t && !t->url.empty())
+                                     ? explorer::vault::AesGcmPasswordVault::normalizeOrigin(t->url)
+                                     : "";
+        std::string target_key = cur_origin.empty() ? "*" : cur_origin;
+        perms_store_.resetForOrigin(target_key);
+        synced_cef_perms_.erase(target_key);
+        syncCefContentSettingsForOrigin(target_key);
+        if (b && b->GetHost()) b->GetHost()->SetAudioMuted(false);
+        pushChromeState();
+        setStatusBanner("Reset permissions to default for " +
+                        (cur_origin.empty() ? "all sites" : cur_origin));
+    } else if (cmd == "toggle_cookies") {
+        prefs_.save_cookies = !prefs_.save_cookies;
+        prefs_store_.save(prefs_);
+        setStatusBanner(prefs_.save_cookies ? "Persistent cookies & sign-ins enabled"
+                                            : "Session-only cookies enabled");
     } else if (cmd == "open_devtools") {
         setHudVisible(false);
         onTabShortcut(explorer::engine::ShortcutAction::ToggleDevTools);
@@ -1317,25 +1531,53 @@ void BrowserWindow::onChromeCommand(const std::string& cmd, const std::string& a
             cm->DeleteCookies(t->url, "", nullptr);
         }
         b->GetMainFrame()->ExecuteJavaScript(
-            "try{localStorage.clear();sessionStorage.clear();}catch(e){}", "", 0);
-        setStatusBanner("Cleared cookies & storage for current site");
+            "(() => {"
+            " try { localStorage.clear(); } catch (e) {}"
+            " try { sessionStorage.clear(); } catch (e) {}"
+            " try { if (window.indexedDB && indexedDB.databases) { indexedDB.databases().then(dbs => dbs.forEach(d => { if (d && d.name) indexedDB.deleteDatabase(d.name); })); } } catch (e) {}"
+            " try { if (window.caches && caches.keys) { caches.keys().then(ks => ks.forEach(k => caches.delete(k))); } } catch (e) {}"
+            " try { if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) { navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())); } } catch (e) {}"
+            "})();",
+            "explorer://clear-site-data", 0);
+        setStatusBanner("Cleared cookies, LocalStorage, IndexedDB & CacheStorage for current site");
+    } else if (cmd == "clear_http_cache") {
+        if (auto ctx = CefRequestContext::GetGlobalContext()) {
+            ctx->ClearHttpCache(new NoopCompletionCallback());
+        }
+        setStatusBanner("Cleared HTTP disk & memory cache");
     } else if (cmd == "clear_all_data") {
         if (auto cm = CefCookieManager::GetGlobalManager(nullptr)) {
             cm->DeleteCookies("", "", nullptr);
         }
-        if (b) {
-            b->GetMainFrame()->ExecuteJavaScript(
-                "try{localStorage.clear();sessionStorage.clear();}catch(e){}", "", 0);
+        if (auto ctx = CefRequestContext::GetGlobalContext()) {
+            ctx->ClearHttpCache(new NoopCompletionCallback());
+            ctx->ClearHttpAuthCredentials(new NoopCompletionCallback());
         }
-        setStatusBanner("Cleared all cookies & site data");
+        for (auto& tab : tabs_) {
+            if (tab.view && tab.view->GetBrowser() && tab.view->GetBrowser()->GetMainFrame()) {
+                tab.view->GetBrowser()->GetMainFrame()->ExecuteJavaScript(
+                    "(() => {"
+                    " try { localStorage.clear(); } catch (e) {}"
+                    " try { sessionStorage.clear(); } catch (e) {}"
+                    " try { if (window.indexedDB && indexedDB.databases) { indexedDB.databases().then(dbs => dbs.forEach(d => { if (d && d.name) indexedDB.deleteDatabase(d.name); })); } } catch (e) {}"
+                    " try { if (window.caches && caches.keys) { caches.keys().then(ks => ks.forEach(k => caches.delete(k))); } } catch (e) {}"
+                    " try { if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) { navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())); } } catch (e) {}"
+                    "})();",
+                    "explorer://clear-all-data", 0);
+            }
+        }
+        setStatusBanner("Cleared all cookies, HTTP cache & site storage");
     } else if (cmd == "find_input" && b) {
+        last_find_query_ = arg;
         if (arg.empty()) b->GetHost()->StopFinding(true);
         else b->GetHost()->Find(arg, true, false, false);
     } else if (cmd == "find_next" && b) {
-        if (arg.empty()) b->GetHost()->StopFinding(true);
-        else b->GetHost()->Find(arg, true, false, true);
+        if (!arg.empty()) last_find_query_ = arg;
+        if (last_find_query_.empty()) b->GetHost()->StopFinding(true);
+        else b->GetHost()->Find(last_find_query_, true, false, true);
     } else if (cmd == "find_prev" && b) {
-        if (!arg.empty()) b->GetHost()->Find(arg, false, false, true);
+        if (!arg.empty()) last_find_query_ = arg;
+        if (!last_find_query_.empty()) b->GetHost()->Find(last_find_query_, false, false, true);
     } else if (cmd == "find_close") {
         setFindBarVisible(false);
     } else if (cmd == "win_min" && window_) {
@@ -1438,15 +1680,98 @@ void BrowserWindow::onTabCreated(uint64_t /*tab_id*/) {
     CEF_REQUIRE_UI_THREAD();
 }
 
+uint32_t BrowserWindow::onTabMediaPermissionRequested(uint64_t tab_id,
+                                                      const std::string& requesting_origin,
+                                                      uint32_t requested_permissions) {
+    CEF_REQUIRE_UI_THREAD();
+    std::string norm = explorer::vault::AesGcmPasswordVault::normalizeOrigin(requesting_origin);
+    SitePermissions perms = perms_store_.getForOrigin(norm.empty() ? "*" : norm);
+
+    const bool want_mic = (requested_permissions & CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE) != 0;
+    const bool want_cam = (requested_permissions & CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE) != 0;
+    const bool want_screen = (requested_permissions &
+                              (CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE |
+                               CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE)) != 0;
+
+    if ((want_mic && !perms.microphone) ||
+        (want_cam && !perms.camera) ||
+        (want_screen && !perms.screen_capture)) {
+        return CEF_MEDIA_PERMISSION_NONE;
+    }
+
+    if (auto* t = findTab(tab_id)) {
+        if (want_mic) t->mic_active = true;
+        if (want_cam) t->cam_active = true;
+        if (tab_id == active_tab_id_) pushChromeState();
+    }
+    return requested_permissions;
+}
+
+bool BrowserWindow::onTabPermissionPromptRequested(uint64_t tab_id,
+                                                   const std::string& requesting_origin,
+                                                   uint32_t requested_permissions) {
+    CEF_REQUIRE_UI_THREAD();
+    std::string norm = explorer::vault::AesGcmPasswordVault::normalizeOrigin(requesting_origin);
+    SitePermissions perms = perms_store_.getForOrigin(norm.empty() ? "*" : norm);
+
+    if ((requested_permissions & CEF_PERMISSION_TYPE_MIC_STREAM) && !perms.microphone) return false;
+    if ((requested_permissions & (CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_CAMERA_PAN_TILT_ZOOM)) &&
+        !perms.camera) {
+        return false;
+    }
+    if ((requested_permissions & CEF_PERMISSION_TYPE_GEOLOCATION) && !perms.location) return false;
+    if ((requested_permissions & CEF_PERMISSION_TYPE_NOTIFICATIONS) && !perms.notifications) return false;
+    if ((requested_permissions & CEF_PERMISSION_TYPE_CLIPBOARD) && !perms.clipboard) return false;
+    if ((requested_permissions & (CEF_PERMISSION_TYPE_CAPTURED_SURFACE_CONTROL | CEF_PERMISSION_TYPE_WINDOW_MANAGEMENT)) &&
+        !perms.screen_capture) {
+        return false;
+    }
+    if ((requested_permissions & (CEF_PERMISSION_TYPE_STORAGE_ACCESS |
+                                  CEF_PERMISSION_TYPE_TOP_LEVEL_STORAGE_ACCESS |
+                                  CEF_PERMISSION_TYPE_DISK_QUOTA |
+                                  CEF_PERMISSION_TYPE_FILE_SYSTEM_ACCESS)) &&
+        !perms.storage) {
+        return false;
+    }
+
+    if (auto* t = findTab(tab_id)) {
+        bool changed = false;
+        if ((requested_permissions & CEF_PERMISSION_TYPE_MIC_STREAM) && !t->mic_active) {
+            t->mic_active = true;
+            changed = true;
+        }
+        if ((requested_permissions & CEF_PERMISSION_TYPE_CAMERA_STREAM) && !t->cam_active) {
+            t->cam_active = true;
+            changed = true;
+        }
+        if (changed && tab_id == active_tab_id_) pushChromeState();
+    }
+    return true;
+}
+
 void BrowserWindow::onTabAddressChanged(uint64_t tab_id, const std::string& url) {
     CEF_REQUIRE_UI_THREAD();
     if (auto* t = findTab(tab_id)) {
+        std::string next_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(url);
+        if (!next_origin.empty()) {
+            syncCefContentSettingsForOrigin(next_origin);
+            SitePermissions sp = perms_store_.getForOrigin(next_origin);
+            if (t->view && t->view->GetBrowser() && t->view->GetBrowser()->GetHost()) {
+                t->view->GetBrowser()->GetHost()->SetAudioMuted(!sp.sound);
+            }
+        }
         if (t->url == url) return;
+        std::string prev_origin = explorer::vault::AesGcmPasswordVault::normalizeOrigin(t->url);
         t->url = url;
+        if (prev_origin != next_origin) {
+            t->mic_active = false;
+            t->cam_active = false;
+        }
         if (tab_id == active_tab_id_) {
             scroll_hidden_ = false;
             updateChromeLayout();
             pushChromeState();
+            if (hud_visible_) pushHudState(last_snap_);
         }
         scheduleSessionSave();
     }
@@ -1458,11 +1783,8 @@ void BrowserWindow::onTabTitleChanged(uint64_t tab_id, const std::string& title)
         std::string clean = title.empty() ? "New Tab" : title;
         if (t->title == clean) return;
         t->title = std::move(clean);
-        if (!cfg_.app_mode_url.empty() && window_) {
-            window_->SetTitle(t->title);
-        } else {
-            pushChromeState();
-        }
+        pushChromeState();
+        if (hud_visible_) pushHudState(last_snap_);
     }
 }
 
@@ -1512,6 +1834,8 @@ void BrowserWindow::onTabFullscreenChanged(uint64_t tab_id, bool fullscreen) {
     }
     updateChromeLayout();
     if (window_) window_->SetFullscreen(fullscreen);
+    reconcileRendererPriorities();
+    updateModuleSleepState();
 }
 
 void BrowserWindow::onTabPopupRequested(const std::string& url) {
@@ -1520,11 +1844,13 @@ void BrowserWindow::onTabPopupRequested(const std::string& url) {
     if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) {
         return;
     }
-    if (!cfg_.app_mode_url.empty()) {
-        if (auto* t = activeTabEntry(); t && t->view && t->view->GetBrowser()) {
-            t->view->GetBrowser()->GetMainFrame()->LoadURL(url);
+    if (auto* t = activeTabEntry()) {
+        std::string orig = explorer::vault::AesGcmPasswordVault::normalizeOrigin(t->url);
+        SitePermissions sp = perms_store_.getForOrigin(orig.empty() ? "*" : orig);
+        if (!sp.popups) {
+            setStatusBanner("Blocked popup from " + (orig.empty() ? "current site" : orig));
+            return;
         }
-        return;
     }
     openNewTab(url, true);
 }
@@ -1567,12 +1893,13 @@ void BrowserWindow::onTabDownloadUpdated(const explorer::engine::DownloadRecord&
 
 void BrowserWindow::onTabScrollRevealTopBar(uint64_t tab_id, bool reveal) {
     CEF_REQUIRE_UI_THREAD();
-    if (!prefs_.autohide_topbar || !cfg_.app_mode_url.empty() || tab_id != active_tab_id_) return;
+    if (!prefs_.autohide_topbar || tab_id != active_tab_id_) return;
     if (hud_visible_ || find_visible_) return;
     bool want_hidden = !reveal;
     if (scroll_hidden_ != want_hidden) {
         scroll_hidden_ = want_hidden;
         updateChromeLayout();
+        updateModuleSleepState();
     }
 }
 
@@ -1582,6 +1909,7 @@ void BrowserWindow::onTabMediaStateChanged(uint64_t tab_id, bool playing) {
         if (t->playing_media == playing) return;
         t->playing_media = playing;
         reconcileRendererPriorities();
+        updateModuleSleepState();
     }
 }
 
@@ -1607,30 +1935,50 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
 
     switch (action) {
         case A::NewTab:
-            if (cfg_.app_mode_url.empty()) onChromeCommand("new_tab", "");
+            onChromeCommand("new_tab", "");
             break;
         case A::CloseTab:
             if (t) closeTab(t->id);
             break;
+        case A::ReopenClosedTab:
+            reopenClosedTab();
+            break;
         case A::NextTab:
-            if (cfg_.app_mode_url.empty()) cycleTab(+1);
+            cycleTab(+1);
             break;
         case A::PrevTab:
-            if (cfg_.app_mode_url.empty()) cycleTab(-1);
+            cycleTab(-1);
+            break;
+        case A::SelectTab1: activateTabByIndex(0); break;
+        case A::SelectTab2: activateTabByIndex(1); break;
+        case A::SelectTab3: activateTabByIndex(2); break;
+        case A::SelectTab4: activateTabByIndex(3); break;
+        case A::SelectTab5: activateTabByIndex(4); break;
+        case A::SelectTab6: activateTabByIndex(5); break;
+        case A::SelectTab7: activateTabByIndex(6); break;
+        case A::SelectTab8: activateTabByIndex(7); break;
+        case A::SelectLastTab:
+            if (!tabs_.empty()) activateTab(tabs_.back().id);
             break;
         case A::FocusOmnibar:
-            if (cfg_.app_mode_url.empty()) {
-                setHudVisible(false);
-                scroll_hidden_ = false;
-                updateChromeLayout();
-                if (chrome_view_ && chrome_view_->GetBrowser()) {
-                    chrome_view_->RequestFocus();
-                    chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.__focusOmnibar()", "", 0);
-                }
+            wakeSleepingModules(true);
+            setHudVisible(false);
+            if (chrome_view_ && chrome_view_->GetBrowser()) {
+                chrome_view_->RequestFocus();
+                chrome_view_->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.__focusOmnibar()", "", 0);
             }
             break;
         case A::FindInPage:
-            if (cfg_.app_mode_url.empty()) setFindBarVisible(true);
+            wakeSleepingModules(true);
+            setFindBarVisible(true);
+            break;
+        case A::FindNext:
+            if (!find_visible_) setFindBarVisible(true);
+            else if (b && !last_find_query_.empty()) b->GetHost()->Find(last_find_query_, true, false, true);
+            break;
+        case A::FindPrev:
+            if (!find_visible_) setFindBarVisible(true);
+            else if (b && !last_find_query_.empty()) b->GetHost()->Find(last_find_query_, false, false, true);
             break;
         case A::Reload:
             if (b) b->Reload();
@@ -1643,6 +1991,12 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
             break;
         case A::GoForward:
             if (b && b->CanGoForward()) b->GoForward();
+            break;
+        case A::GoHome:
+            if (b && b->GetMainFrame()) {
+                setHudVisible(false);
+                b->GetMainFrame()->LoadURL(startPageDataUrl());
+            }
             break;
         case A::ZoomIn:
             if (t && b && b->GetHost()) {
@@ -1674,12 +2028,24 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
                 if (hud_visible_) pushHudState(last_snap_);
             }
             break;
+        case A::ToggleMute:
+            onChromeCommand("toggle_perm", "sound");
+            break;
+        case A::OpenDownloads:
+            wakeSleepingModules(true);
+            onChromeCommand("open_panel", "downloads");
+            break;
+        case A::OpenSiteSettings:
+            wakeSleepingModules(true);
+            onChromeCommand("open_panel", "apps");
+            break;
         case A::ToggleFullscreen:
             if (window_) {
                 bool next_full = !window_->IsFullscreen();
                 if (!next_full) html_fullscreen_ = false;
                 window_->SetFullscreen(next_full);
                 updateChromeLayout();
+                updateModuleSleepState();
             }
             break;
         case A::ToggleDevTools:
@@ -1697,8 +2063,20 @@ void BrowserWindow::onTabShortcut(explorer::engine::ShortcutAction action) {
             if (window_) window_->Close();
             break;
         case A::Escape:
-            if (hud_visible_) setHudVisible(false);
-            if (find_visible_) setFindBarVisible(false);
+            if (hud_visible_) {
+                setHudVisible(false);
+            }
+            if (find_visible_) {
+                setFindBarVisible(false);
+            }
+            if (html_fullscreen_ || (window_ && window_->IsFullscreen())) {
+                html_fullscreen_ = false;
+                if (window_ && window_->IsFullscreen()) window_->SetFullscreen(false);
+            }
+            wakeSleepingModules(true);
+            if (t && t->loading && b) {
+                b->StopLoad();
+            }
             break;
     }
 }
@@ -1795,6 +2173,64 @@ void BrowserWindow::onPowerSourceChangedFromThread(bool on_battery) {
     if (hud_visible_) pushHudState(last_snap_);
 }
 
+void BrowserWindow::onSystemThemeChanged(bool is_dark) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!life_token_->load()) return;
+    if (system_prefers_dark_ == is_dark) return;
+    system_prefers_dark_ = is_dark;
+    syncColorScheme();
+    pushChromeState();
+    if (hud_visible_) pushHudState(last_snap_);
+}
+
+bool BrowserWindow::isEffectiveDarkTheme() const {
+    if (prefs_.theme_mode == "dark") return true;
+    if (prefs_.theme_mode == "light") return false;
+    return system_prefers_dark_;
+}
+
+std::string BrowserWindow::formatThemeModeLabel() const {
+    if (prefs_.theme_mode == "dark") return "Dark";
+    if (prefs_.theme_mode == "light") return "Light";
+    return std::string("System (") + (system_prefers_dark_ ? "Dark" : "Light") + ")";
+}
+
+void BrowserWindow::syncColorScheme() {
+    CEF_REQUIRE_UI_THREAD();
+    const bool dark = isEffectiveDarkTheme();
+    if (auto ctx = CefRequestContext::GetGlobalContext()) {
+        ctx->SetChromeColorScheme(dark ? CEF_COLOR_VARIANT_DARK : CEF_COLOR_VARIANT_LIGHT, 0);
+    }
+}
+
+void BrowserWindow::syncCefContentSettingsForOrigin(const std::string& origin) {
+    CEF_REQUIRE_UI_THREAD();
+    if (origin.empty() || origin == "*") return;
+    if (origin.rfind("https://", 0) != 0 && origin.rfind("http://", 0) != 0) return;
+
+    SitePermissions p = perms_store_.getForOrigin(origin);
+    auto it = synced_cef_perms_.find(origin);
+    if (it != synced_cef_perms_.end() && it->second == p) {
+        return;  // Already synced for this origin — skip 7 redundant HostContentSettingsMap calls!
+    }
+    auto ctx = CefRequestContext::GetGlobalContext();
+    if (!ctx) return;
+    synced_cef_perms_[origin] = p;
+
+    auto toVal = [](bool allow) {
+        return allow ? CEF_CONTENT_SETTING_VALUE_ALLOW : CEF_CONTENT_SETTING_VALUE_BLOCK;
+    };
+
+    // Only set ContentSettingsTypes registered in Chromium's ContentSettingsRegistry with a valid GURL.
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC, toVal(p.microphone));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA, toVal(p.camera));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_GEOLOCATION, toVal(p.location));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_NOTIFICATIONS, toVal(p.notifications));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_CLIPBOARD_READ_WRITE, toVal(p.clipboard));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_SOUND, toVal(p.sound));
+    ctx->SetContentSetting(origin, origin, CEF_CONTENT_SETTING_TYPE_POPUPS, toVal(p.popups));
+}
+
 void BrowserWindow::syncSystemPower() {
     CEF_REQUIRE_UI_THREAD();
     if (!life_token_->load() || services_.hw.tuning_disabled) return;
@@ -1831,11 +2267,92 @@ void BrowserWindow::reconcileRendererPriorities() {
     for (const auto& t : tabs_) {
         if (t.playing_media) media.insert(t.id);
     }
-    auto actions = throttle_planner_.reconcile(active, media, power_policy_.isBatteryMode());
+    // Deep-sleep background tab processes on battery OR whenever video/media or fullscreen is active!
+    const bool throttle_bg = power_policy_.isBatteryMode() || !media.empty() || html_fullscreen_;
+    auto actions = throttle_planner_.reconcile(active, media, throttle_bg);
     for (const auto& act : actions) {
         pending_pid_throttles_[act.pid] = act.throttle;
     }
     drainPendingThrottleActions();
+}
+
+bool BrowserWindow::shouldSleepBackgroundModules() const {
+    if (hud_visible_) return false;
+    if (html_fullscreen_ || (window_ && window_->IsFullscreen())) return true;
+    if (window_ && window_->IsMinimized()) return true;
+    if (scroll_hidden_ && !find_visible_) return true;
+    for (const auto& t : tabs_) {
+        if (t.id == active_tab_id_ && t.playing_media) return true;
+    }
+    return false;
+}
+
+void BrowserWindow::updateModuleSleepState() {
+    CEF_REQUIRE_UI_THREAD();
+    if (!life_token_->load()) return;
+    const bool want_sleep = shouldSleepBackgroundModules();
+    if (want_sleep && !telemetry_sleeping_) {
+        telemetry_sleeping_ = true;
+        trimProcessMemoryAsync();
+    } else if (!want_sleep && telemetry_sleeping_) {
+        telemetry_sleeping_ = false;
+        pushChromeState();
+        pushChromeTelemetry();
+        auto tok = life_token_;
+        CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 250);
+    }
+}
+
+void BrowserWindow::wakeSleepingModules(bool reveal_topbar) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!life_token_->load()) return;
+    bool layout_changed = false;
+    if (reveal_topbar && scroll_hidden_) {
+        scroll_hidden_ = false;
+        layout_changed = true;
+    }
+    if (layout_changed) {
+        updateChromeLayout();
+    }
+    if (telemetry_sleeping_) {
+        telemetry_sleeping_ = false;
+        pushChromeState();
+        pushChromeTelemetry();
+        auto tok = life_token_;
+        CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 200);
+    } else if (layout_changed) {
+        pushChromeState();
+    }
+}
+
+void BrowserWindow::trimProcessMemoryAsync() {
+    CEF_REQUIRE_UI_THREAD();
+    if (mem_trim_in_flight_ || !life_token_->load()) return;
+    mem_trim_in_flight_ = true;
+
+    // Notify non-active background tab renderers and closed HUD renderer to compact their heaps too.
+    for (auto& t : tabs_) {
+        if (t.id != active_tab_id_ && !t.playing_media && t.view && t.view->GetBrowser() &&
+            t.view->GetBrowser()->GetMainFrame()) {
+            t.view->GetBrowser()->GetMainFrame()->SendProcessMessage(
+                PID_RENDERER, CefProcessMessage::Create("explorer.deep-sleep"));
+        }
+    }
+    if (!hud_visible_ && hud_ready_ && hud_view_ && hud_view_->GetBrowser() &&
+        hud_view_->GetBrowser()->GetMainFrame()) {
+        hud_view_->GetBrowser()->GetMainFrame()->SendProcessMessage(
+            PID_RENDERER, CefProcessMessage::Create("explorer.deep-sleep"));
+    }
+
+    auto tok = life_token_;
+    CefPostTask(TID_FILE_BACKGROUND, new GuardedUiTask(tok, [this, tok]() {
+        ::malloc_trim(0);
+        if (tok->load()) {
+            CefPostTask(TID_UI, new GuardedUiTask(tok, [this]() {
+                mem_trim_in_flight_ = false;
+            }));
+        }
+    }));
 }
 
 void BrowserWindow::drainPendingThrottleActions() {
@@ -1909,7 +2426,7 @@ void BrowserWindow::onTelemetrySampleReady(explorer::hal::TelemetrySnapshot snap
         requestTelemetrySampleAsync(true, false);
     }
 
-    if (from_tick) {
+    if (from_tick && !telemetry_sleeping_) {
         int next_ms = power_policy_.telemetryIntervalMs(hud_visible_);
         auto tok = life_token_;
         CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), next_ms);
@@ -1919,12 +2436,13 @@ void BrowserWindow::onTelemetrySampleReady(explorer::hal::TelemetrySnapshot snap
 void BrowserWindow::onTelemetryTick() {
     CEF_REQUIRE_UI_THREAD();
     if (!life_token_->load()) return;
-    // Skip sysfs/hwmon polling while window is minimized and HUD is closed (UPower D-Bus still handles power events).
-    if (window_ && window_->IsMinimized() && !hud_visible_) {
-        auto tok = life_token_;
-        CefPostDelayedTask(TID_UI, new GuardedUiTask(tok, [this]() { onTelemetryTick(); }), 5000);
+    // Deep sleep: stop all periodic sysfs/hwmon timer ticks while watching video, fullscreen,
+    // auto-hidden top bar, or minimized with HUD closed (0% idle CPU / 0 timer wakeups!).
+    if (shouldSleepBackgroundModules()) {
+        telemetry_sleeping_ = true;
         return;
     }
+    telemetry_sleeping_ = false;
     if (services_.telemetry) {
         requestTelemetrySampleAsync(hud_visible_, true);
     } else {

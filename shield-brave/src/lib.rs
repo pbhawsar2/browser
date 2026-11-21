@@ -5,14 +5,57 @@
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
 use adblock::Engine;
+use std::cell::RefCell;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
+static NEXT_ENGINE_ID: AtomicUsize = AtomicUsize::new(1);
+
 pub struct BraveShieldHandle {
     engine: RwLock<Engine>,
     rule_count: AtomicUsize,
+    engine_id: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct CacheSlot {
+    eid: usize,
+    hash: u64,
+    url_len: u32,
+    src_len: u32,
+    decision: i8,
+}
+
+impl Default for CacheSlot {
+    fn default() -> Self {
+        Self {
+            eid: 0,
+            hash: 0,
+            url_len: 0,
+            src_len: 0,
+            decision: -1,
+        }
+    }
+}
+
+const TL_CACHE_SIZE: usize = 256;
+
+thread_local! {
+    static TL_DECISION_CACHE: RefCell<[CacheSlot; TL_CACHE_SIZE]> =
+        RefCell::new([CacheSlot::default(); TL_CACHE_SIZE]);
+}
+
+#[inline]
+fn hash_request(eid: usize, url: &[u8], source: &[u8], rtype: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    eid.hash(&mut h);
+    url.hash(&mut h);
+    source.hash(&mut h);
+    rtype.hash(&mut h);
+    h.finish()
 }
 
 fn build_engine_from_rules(rules_text: &str) -> (Engine, usize) {
@@ -37,6 +80,7 @@ pub extern "C" fn explorer_brave_shield_new(rules_utf8: *const c_char) -> *mut B
     Box::into_raw(Box::new(BraveShieldHandle {
         engine: RwLock::new(engine),
         rule_count: AtomicUsize::new(count),
+        engine_id: AtomicUsize::new(NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed)),
     }))
 }
 
@@ -59,6 +103,7 @@ pub extern "C" fn explorer_brave_shield_new_from_dat(
     Box::into_raw(Box::new(BraveShieldHandle {
         engine: RwLock::new(engine),
         rule_count: AtomicUsize::new(rule_count),
+        engine_id: AtomicUsize::new(NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed)),
     }))
 }
 
@@ -100,6 +145,7 @@ pub extern "C" fn explorer_brave_shield_reload(
         *guard = new_engine;
     }
     h.rule_count.store(count, Ordering::Relaxed);
+    h.engine_id.store(NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
     count
 }
 
@@ -169,32 +215,65 @@ pub extern "C" fn explorer_brave_shield_check_slices(
     if handle.is_null() || url_ptr.is_null() || url_len == 0 {
         return 0;
     }
-    let url = unsafe {
-        std::str::from_utf8(std::slice::from_raw_parts(url_ptr, url_len)).unwrap_or("")
-    };
-    let source = if source_ptr.is_null() || source_len == 0 {
-        ""
+    let h = unsafe { &*handle };
+    let eid = h.engine_id.load(Ordering::Relaxed);
+    let url_bytes = unsafe { std::slice::from_raw_parts(url_ptr, url_len) };
+    let src_bytes = if source_ptr.is_null() || source_len == 0 {
+        &[][..]
     } else {
-        unsafe { std::str::from_utf8(std::slice::from_raw_parts(source_ptr, source_len)).unwrap_or("") }
+        unsafe { std::slice::from_raw_parts(source_ptr, source_len) }
     };
-    let rtype = if rtype_ptr.is_null() || rtype_len == 0 {
-        "other"
+    let rtype_bytes = if rtype_ptr.is_null() || rtype_len == 0 {
+        b"other"
     } else {
-        unsafe { std::str::from_utf8(std::slice::from_raw_parts(rtype_ptr, rtype_len)).unwrap_or("other") }
+        unsafe { std::slice::from_raw_parts(rtype_ptr, rtype_len) }
     };
+
+    let req_hash = hash_request(eid, url_bytes, src_bytes, rtype_bytes);
+    let idx = (req_hash as usize) & (TL_CACHE_SIZE - 1);
+    let cached = TL_DECISION_CACHE.with(|cache| {
+        let slots = cache.borrow();
+        let slot = slots[idx];
+        if slot.eid == eid
+            && slot.hash == req_hash
+            && slot.url_len == (url_len as u32)
+            && slot.src_len == (source_len as u32)
+            && slot.decision >= 0
+        {
+            Some(slot.decision as i32)
+        } else {
+            None
+        }
+    });
+    if let Some(ans) = cached {
+        return ans;
+    }
+
+    let url = std::str::from_utf8(url_bytes).unwrap_or("");
+    let source = std::str::from_utf8(src_bytes).unwrap_or("");
+    let rtype = std::str::from_utf8(rtype_bytes).unwrap_or("other");
 
     let Ok(req) = Request::new(url, source, rtype, "GET") else {
         return 0;
     };
-    let h = unsafe { &*handle };
     let Ok(guard) = h.engine.read() else {
         return 0;
     };
-    if guard.check_network_request(&req).should_block() {
+    let ans = if guard.check_network_request(&req).should_block() {
         1
     } else {
         0
-    }
+    };
+    TL_DECISION_CACHE.with(|cache| {
+        cache.borrow_mut()[idx] = CacheSlot {
+            eid,
+            hash: req_hash,
+            url_len: url_len as u32,
+            src_len: source_len as u32,
+            decision: ans as i8,
+        };
+    });
+    ans
 }
 
 #[unsafe(no_mangle)]

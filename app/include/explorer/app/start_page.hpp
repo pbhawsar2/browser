@@ -13,7 +13,7 @@ inline std::string startPageDataUrl() {
 <meta charset="utf-8">
 <title>New Tab — Explorer</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: light dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   ::-webkit-scrollbar { width: 8px; height: 8px; background: #080C14; }
   ::-webkit-scrollbar-track { background: #080C14; }
@@ -115,6 +115,21 @@ inline std::string startPageDataUrl() {
     transition: border-color .14s, color .14s, background-color .14s;
   }
   a:hover { background: #18273F; border-color: #38BDF8; color: #FFFFFF; }
+  @media (prefers-color-scheme: light) {
+    ::-webkit-scrollbar, ::-webkit-scrollbar-track { background: #F1F5F9; }
+    ::-webkit-scrollbar-thumb { border-color: #F1F5F9; background: rgba(2,132,199,0.45); }
+    body { background: radial-gradient(circle at 50% 18%, #E0F2FE 0%, #F8FAFC 68%); color: #0F172A; }
+    .brand { color: #0F172A; }
+    .badge { color: #334155; background: #FFFFFF; border-color: #CBD5E1; }
+    form { background: #FFFFFF; border-color: #CBD5E1; box-shadow: 0 10px 28px rgba(15,23,42,0.08); }
+    form:focus-within { background: #FFFFFF; border-color: #0284C7; }
+    input { color: #0F172A; caret-color: #0284C7; }
+    input::placeholder { color: #64748B; }
+    button { background: #0284C7; color: #FFFFFF; }
+    button:hover { background: #0369A1; }
+    a { color: #1E293B; background: #FFFFFF; border-color: #CBD5E1; }
+    a:hover { background: #E0F2FE; border-color: #0284C7; color: #0F172A; }
+  }
 </style>
 </head>
 <body>

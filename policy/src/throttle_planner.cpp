@@ -1,5 +1,7 @@
 #include "explorer/policy/throttle_planner.hpp"
 
+#include <algorithm>
+
 namespace explorer::policy {
 
 void PidThrottlePlanner::pruneOrphanedPid(pid_t pid) {
@@ -34,18 +36,29 @@ std::vector<PidTransition> PidThrottlePlanner::reconcile(
     const std::unordered_set<uint64_t>& active_tabs,
     const std::unordered_set<uint64_t>& media_tabs,
     bool battery_mode) {
-    std::unordered_set<pid_t> keep_awake_pids;
-    std::unordered_set<pid_t> all_pids;
+    // Contiguous cache-line vectors avoid per-reconcile std::unordered_set bucket & node allocations.
+    std::vector<pid_t> keep_awake_pids;
+    std::vector<pid_t> all_pids;
+    keep_awake_pids.reserve(tab_pids_.size());
+    all_pids.reserve(tab_pids_.size());
+
+    auto pushUnique = [](std::vector<pid_t>& vec, pid_t p) {
+        if (std::find(vec.begin(), vec.end(), p) == vec.end()) {
+            vec.push_back(p);
+        }
+    };
+
     for (const auto& [tab_id, pid] : tab_pids_) {
-        all_pids.insert(pid);
+        pushUnique(all_pids, pid);
         if (!battery_mode || active_tabs.count(tab_id) || media_tabs.count(tab_id)) {
-            keep_awake_pids.insert(pid);
+            pushUnique(keep_awake_pids, pid);
         }
     }
 
     std::vector<PidTransition> out;
     for (pid_t pid : all_pids) {
-        const bool want_throttled = (keep_awake_pids.count(pid) == 0);
+        const bool want_throttled =
+            (std::find(keep_awake_pids.begin(), keep_awake_pids.end(), pid) == keep_awake_pids.end());
         const bool is_throttled = (throttled_pids_.count(pid) != 0);
         if (is_throttled != want_throttled) {
             if (want_throttled) throttled_pids_.insert(pid);

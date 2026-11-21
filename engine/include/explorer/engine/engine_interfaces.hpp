@@ -10,17 +10,33 @@ namespace explorer::engine {
 enum class ShortcutAction {
     NewTab,
     CloseTab,
+    ReopenClosedTab,
     NextTab,
     PrevTab,
+    SelectTab1,
+    SelectTab2,
+    SelectTab3,
+    SelectTab4,
+    SelectTab5,
+    SelectTab6,
+    SelectTab7,
+    SelectTab8,
+    SelectLastTab,
     FocusOmnibar,
     FindInPage,
+    FindNext,
+    FindPrev,
     Reload,
     HardReload,
     GoBack,
     GoForward,
+    GoHome,
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleMute,
+    OpenDownloads,
+    OpenSiteSettings,
     ToggleFullscreen,
     ToggleDevTools,
     QuitApp,
@@ -59,6 +75,20 @@ public:
                                      const std::string& username,
                                      const std::string& password) = 0;
     virtual void onTabCreated(uint64_t tab_id) = 0;
+    /// Called by CefPermissionHandler::OnRequestMediaAccessPermission on UI thread.
+    /// Returns the bitmask of allowed cef_media_access_permission_types_t (0 to deny).
+    virtual uint32_t onTabMediaPermissionRequested(uint64_t /*tab_id*/,
+                                                   const std::string& /*requesting_origin*/,
+                                                   uint32_t requested_permissions) {
+        return requested_permissions;
+    }
+    /// Called by CefPermissionHandler::OnShowPermissionPrompt on UI thread.
+    /// Returns true to ACCEPT, false to DENY.
+    virtual bool onTabPermissionPromptRequested(uint64_t /*tab_id*/,
+                                                const std::string& /*requesting_origin*/,
+                                                uint32_t /*requested_permissions*/) {
+        return true;
+    }
     /// Called by CefLifeSpanHandler::DoClose. Return true to suppress top-level window close
     /// when closing a single tab cleanly inside a multi-tab window.
     virtual bool onTabDoClose(uint64_t tab_id) = 0;
